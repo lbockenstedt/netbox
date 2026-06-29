@@ -632,6 +632,19 @@ class NetboxEngine:
             for ip in rows:
                 status = ip.get("status") or {}
                 ao = ip.get("assigned_object")
+                # Parent device/virtual-machine of the assigned interface, so the
+                # IPAM IP Addresses table can show which device an IP lives on.
+                # assigned_object is a nested interface (dcim.interface carries a
+                # `device` dict; virtualization.vminterface carries a
+                # `virtual_machine` dict). Best-effort: empty when NetBox doesn't
+                # nest the parent on this endpoint.
+                device_name = ""
+                if isinstance(ao, dict):
+                    parent = ao.get("device") or ao.get("virtual_machine")
+                    if isinstance(parent, dict):
+                        device_name = parent.get("display") or parent.get("name") or ""
+                    elif isinstance(parent, str) and parent:
+                        device_name = parent
                 ips.append({
                     "id": ip["id"],
                     "address": ip["address"],
@@ -639,6 +652,7 @@ class NetboxEngine:
                     "dns_name": ip.get("dns_name") or "",
                     "description": ip.get("description") or "",
                     "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
+                    "device": device_name,
                 })
             return {"status": "SUCCESS", "ip_addresses": ips}
         except Exception as e:
