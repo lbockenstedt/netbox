@@ -653,6 +653,10 @@ class NetboxEngine:
                     "description": ip.get("description") or "",
                     "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
                     "device": device_name,
+                    # Forward custom_fields so the hub can read mac_address for
+                    # IPAM→ClearPass endpoint sync (without this, mac is always
+                    # empty at the hub and every record skips in CPPM).
+                    "custom_fields": ip.get("custom_fields") or {},
                 })
             return {"status": "SUCCESS", "ip_addresses": ips}
         except Exception as e:
