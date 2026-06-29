@@ -319,6 +319,18 @@ class NetboxSpoke(BaseSpoke):
             await self.start_kea_sync()
             return {"status": "SUCCESS", "message": "DHCP sync triggered"}
 
+        if normalized == "NETBOX_SYNC_VMS":
+            # Hypervisor → NetBox VM sync. The hub relays a tenant's Proxmox VM
+            # set (pulled from the pxmx spoke) here for an authoritative replace
+            # into NetBox virtualization records. Blocking pynetbox calls run
+            # off the event loop via _run_sync, like every other engine method.
+            return await self._run_sync(
+                self.engine.sync_vms,
+                vms=data.get("vms", []),
+                tenant_slug=data.get("tenant_slug", ""),
+                replace=bool(data.get("replace", False)),
+            )
+
         if normalized == "NETBOX_SEARCH":
             return await self._run_sync(self.engine.search,
                                         query=data.get("q", ""), tenant=data.get("tenant"))

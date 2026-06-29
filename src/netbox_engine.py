@@ -893,6 +893,219 @@ class NetboxEngine:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
+    # ─── Virtualization – Proxmox VM sync ──────────────────────────────────────
+    # The hub's VmSyncMixin pulls a tenant's VMs from the pxmx (Proxmox) spoke
+    # and relays them here via NETBOX_SYNC_VMS so NetBox's virtualization
+    # records mirror the live hypervisor inventory. VMs are matched by the
+    # `proxmox_unique_id` custom field (created if missing, updated if present),
+    # clusters are auto-created under a 'Proxmox' cluster type, and primary_ip4
+    # is set from each VM's first IP. Authoritative replace-with-delete runs only
+    # when tenant-scoped (a NetBox tenant slug is provided) so a global sync
+    # can't delete another tenant's VM records.
+    @staticmethod
+    def _vm_status_map(s: str) -> str:
+        """Proxmox VM status → NetBox VM status value."""
+        s = str(s or "").lower()
+        if s == "running":
+            return "active"
+        if s in ("stopped", "paused", "suspended"):
+            return "offline"
+        return "active"
+
+    def _ensure_cluster_type(self, name: str = "Proxmox", slug: str = "proxmox"):
+        """Return the 'Proxmox' cluster type (creating it if missing). Best-effort."""
+        try:
+            ct = self.nb.virtualization.cluster_types.get(name=name)
+            if ct:
+                return ct
+            return self.nb.virtualization.cluster_types.create(name=name, slug=slug)
+        except Exception as e:
+            logger.debug("ensure_cluster_type failed: %s", e)
+            return None
+
+    def _ensure_vm_cluster(self, name: str, tenant=None) -> Optional[int]:
+        """Return a NetBox cluster id for ``name``, auto-creating it under the
+        'Proxmox' cluster type. None if it can't be resolved/created."""
+        if not name:
+            return None
+        try:
+            c = self.nb.virtualization.clusters.get(name=name)
+            if c:
+                return c.id
+            ctype = self._ensure_cluster_type()
+            kwargs: Dict[str, Any] = {"name": name}
+            if ctype:
+                kwargs["type"] = ctype.id
+            if tenant:
+                kwargs["tenant"] = tenant.id
+            c = self.nb.virtualization.clusters.create(**kwargs)
+            return c.id
+        except Exception as e:
+            logger.debug("ensure_vm_cluster %s failed: %s", name, e)
+            return None
+
+    def _assign_vm_primary_ip4(self, vm_obj, ips: list, tenant=None) -> None:
+        """Best-effort: set ``vm.primary_ip4`` from the first IP in ``ips``.
+
+        NetBox requires primary_ip4 to be assigned to one of the VM's
+        interfaces, so a vminterface is reused (or created) and the IP is
+        created against it. Never raises — a missing/unassignable IP must not
+        break the VM record it follows."""
+        if not ips:
+            return
+        ip_str = str(ips[0]).split("/")[0].strip()
+        if not ip_str:
+            return
+        try:
+            ifaces = list(self.nb.virtualization.vminterfaces.filter(virtual_machine_id=vm_obj.id))
+            iface = ifaces[0] if ifaces else None
+            if not iface:
+                iface = self.nb.virtualization.vminterfaces.create(
+                    virtual_machine=vm_obj.id, name="eth0")
+            full = ip_str if "/" in ip_str else f"{ip_str}/32"
+            ip_kwargs: Dict[str, Any] = {
+                "address": full,
+                "assigned_object_type": "virtualization.vminterface",
+                "assigned_object_id": iface.id,
+            }
+            if tenant:
+                ip_kwargs["tenant"] = tenant.id
+            ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
+            vm_obj.primary_ip4 = ip_obj.id
+            vm_obj.save()
+        except Exception as e:
+            logger.debug("assign_vm_primary_ip4 %s failed: %s", ip_str, e)
+
+    def sync_vms(self, vms: list, tenant_slug: str = "",
+                 replace: bool = False) -> Dict[str, Any]:
+        """Push a tenant's Proxmox VM set into NetBox virtualization records.
+
+        Each incoming VM is matched by ``custom_fields.proxmox_unique_id`` —
+        created if missing, updated if present. Clusters are auto-created.
+        ``primary_ip4`` is set from the first IP in each VM's ``ips`` list.
+        When ``replace`` AND a NetBox tenant slug are provided, NetBox VMs of
+        that tenant (carrying our unique_id custom field) not in the incoming
+        set are deleted. Replace-delete is skipped when unscoped (global) so a
+        global sync can't delete another tenant's records.
+
+        Returns ``{status, pushed, errors, skipped, deleted, vms_total, message}``.
+        """
+        pushed = 0; errors = 0; skipped = 0; deleted = 0
+        try:
+            tenant = None
+            if tenant_slug:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+
+            incoming: Dict[str, Dict[str, Any]] = {}
+            for vm in (vms or []):
+                uid = str((vm or {}).get("unique_id") or "").strip()
+                if not uid:
+                    skipped += 1
+                    continue
+                incoming[uid] = vm or {}
+
+            # Index existing NetBox VMs by proxmox_unique_id custom field.
+            existing: Dict[str, dict] = {}  # uid -> raw row dict (carries "id")
+            list_params: Dict[str, Any] = {"limit": 500}
+            if tenant_slug:
+                list_params["tenant"] = tenant_slug
+            try:
+                rows = self._api_get_all("/api/virtualization/virtual-machines/", list_params)
+            except Exception as e:
+                return {"status": "ERROR",
+                        "message": f"failed to list NetBox VMs: {e}",
+                        "pushed": 0, "errors": 0, "skipped": skipped,
+                        "deleted": 0, "vms_total": len(incoming)}
+            for row in rows:
+                cf = row.get("custom_fields") or {}
+                uid = str((cf.get("proxmox_unique_id") or "").strip())
+                if uid:
+                    existing[uid] = row
+
+            # Replace-with-delete — only when tenant-scoped (a global list
+            # would mix other tenants' records into the delete set).
+            if replace and tenant_slug:
+                for uid, row in list(existing.items()):
+                    if uid in incoming:
+                        continue
+                    try:
+                        obj = self.nb.virtualization.virtual_machines.get(row["id"])
+                        if obj:
+                            obj.delete()
+                            deleted += 1
+                    except Exception as e:
+                        errors += 1
+                        logger.debug("sync_vms: delete stale %s failed: %s", uid, e)
+
+            for uid, vm in incoming.items():
+                try:
+                    cluster_id = self._ensure_vm_cluster(
+                        str(vm.get("cluster") or "").strip(), tenant)
+                    name = str(vm.get("name") or "").strip() or f"vm-{vm.get('vmid') or uid}"
+                    status = self._vm_status_map(vm.get("status"))
+                    vcpus = int(vm.get("vcpus") or 0)
+                    disk_gb = round(float(vm.get("disk_gb") or 0), 1)
+                    mem_mb = int(vm.get("mem_mb") or 0)
+                    cf = {
+                        "proxmox_unique_id": uid,
+                        "proxmox_vmid": str(vm.get("vmid") or ""),
+                        "proxmox_node": str(vm.get("node") or ""),
+                        "proxmox_type": str(vm.get("type") or ""),
+                    }
+                    if uid in existing:
+                        obj = self.nb.virtualization.virtual_machines.get(existing[uid]["id"])
+                        if not obj:
+                            errors += 1
+                            continue
+                        obj.name = name
+                        if cluster_id:
+                            obj.cluster = cluster_id
+                        obj.status = status
+                        if vcpus:
+                            obj.vcpus = vcpus
+                        if disk_gb:
+                            obj.disk = int(disk_gb)
+                        if mem_mb:
+                            obj.memory = mem_mb
+                        if tenant:
+                            obj.tenant = tenant.id
+                        merged = dict(obj.custom_fields or {})
+                        merged.update(cf)
+                        obj.custom_fields = merged
+                        obj.save()
+                    else:
+                        create_kwargs: Dict[str, Any] = {
+                            "name": name, "status": status, "custom_fields": cf}
+                        if cluster_id:
+                            create_kwargs["cluster"] = cluster_id
+                        if vcpus:
+                            create_kwargs["vcpus"] = vcpus
+                        if disk_gb:
+                            create_kwargs["disk"] = int(disk_gb)
+                        if mem_mb:
+                            create_kwargs["memory"] = mem_mb
+                        if tenant:
+                            create_kwargs["tenant"] = tenant.id
+                        obj = self.nb.virtualization.virtual_machines.create(**create_kwargs)
+                    # primary_ip4 (best-effort) — needs a vminterface + IP assigned to it
+                    self._assign_vm_primary_ip4(obj, vm.get("ips") or [], tenant)
+                    pushed += 1
+                except Exception as e:
+                    errors += 1
+                    logger.debug("sync_vms: upsert %s failed: %s", uid, e)
+
+            msg = (f"{pushed} VM(s) upserted, {deleted} deleted, "
+                   f"{skipped} skipped, {errors} errors")
+            logger.info("sync_vms tenant=%s: %s", tenant_slug or "<global>", msg)
+            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
+                    "skipped": skipped, "deleted": deleted,
+                    "vms_total": len(incoming), "message": msg}
+        except Exception as e:
+            logger.error("sync_vms failed: %s", e)
+            return {"status": "ERROR", "message": str(e), "pushed": pushed,
+                    "errors": errors, "skipped": skipped, "deleted": deleted,
+                    "vms_total": len(vms or [])}
+
     def search(self, query: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """
         Universal search across devices, IPs, and prefixes.
