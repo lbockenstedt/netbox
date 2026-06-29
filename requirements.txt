@@ -1,0 +1,7 @@
+pynetbox
+websockets
+fastapi
+uvicorn
+httpx
+gitpython
+python-dotenv
