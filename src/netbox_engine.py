@@ -113,23 +113,23 @@ class NetboxEngine:
 
     def get_sites(self) -> Dict[str, Any]:
         try:
-            data = self._api_get("/api/dcim/sites/", {"limit": 500})
+            rows = self._api_get_all("/api/dcim/sites/")
             sites = [{"id": s["id"], "name": s["name"], "slug": s["slug"]}
-                     for s in data.get("results", [])]
+                     for s in rows]
             return {"status": "SUCCESS", "sites": sites}
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
     def get_racks(self, site: Optional[str] = None, tenant: Optional[str] = None) -> Dict[str, Any]:
         try:
-            params: Dict[str, Any] = {"limit": 500}
+            params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
             if tenant:
                 params["tenant"] = tenant
-            data = self._api_get("/api/dcim/racks/", params)
+            rows = self._api_get_all("/api/dcim/racks/", params)
             racks = []
-            for r in data.get("results", []):
+            for r in rows:
                 racks.append({
                     "id": r["id"],
                     "name": r["name"],
@@ -144,16 +144,16 @@ class NetboxEngine:
     def get_devices(self, site: Optional[str] = None, rack: Optional[str] = None,
                     tenant: Optional[str] = None) -> Dict[str, Any]:
         try:
-            params: Dict[str, Any] = {"limit": 500}
+            params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
             if rack:
                 params["rack_id"] = rack
             if tenant:
                 params["tenant"] = tenant
-            data = self._api_get("/api/dcim/devices/", params)
+            rows = self._api_get_all("/api/dcim/devices/", params)
             devices = []
-            for d in data.get("results", []):
+            for d in rows:
                 status = d.get("status") or {}
                 devices.append({
                     "id": d["id"],
@@ -221,7 +221,7 @@ class NetboxEngine:
         rather than typing slugs blind."""
         try:
             sites = [{"id": s["id"], "name": s["name"], "slug": s["slug"]}
-                     for s in self._api_get("/api/dcim/sites/", {"limit": 500}).get("results", [])]
+                     for s in self._api_get_all("/api/dcim/sites/")]
             dt_data = self._api_get("/api/dcim/device-types/", {"limit": 500})
             device_types = []
             for d in dt_data.get("results", []):
@@ -236,7 +236,7 @@ class NetboxEngine:
             device_roles = [{"id": r["id"], "name": r["name"], "slug": r.get("slug", "")}
                             for r in dr_data.get("results", [])]
             tenants = [{"id": t["id"], "name": t["name"], "slug": t["slug"]}
-                       for t in self._api_get("/api/tenancy/tenants/", {"limit": 500}).get("results", [])]
+                       for t in self._api_get_all("/api/tenancy/tenants/")]
             return {"status": "SUCCESS", "sites": sites, "device_types": device_types,
                     "device_roles": device_roles, "tenants": tenants}
         except Exception as e:
@@ -350,16 +350,16 @@ class NetboxEngine:
     def get_prefixes(self, site: Optional[str] = None, vrf: Optional[str] = None,
                      tenant: Optional[str] = None) -> Dict[str, Any]:
         try:
-            params: Dict[str, Any] = {"limit": 500}
+            params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
             if vrf:
                 params["vrf"] = vrf
             if tenant:
                 params["tenant"] = tenant
-            data = self._api_get("/api/ipam/prefixes/", params)
+            rows = self._api_get_all("/api/ipam/prefixes/", params)
             prefixes = []
-            for p in data.get("results", []):
+            for p in rows:
                 status = p.get("status") or {}
                 prefixes.append({
                     "id": p["id"],
@@ -615,16 +615,21 @@ class NetboxEngine:
     def get_ip_addresses(self, prefix: Optional[str] = None, device: Optional[str] = None,
                          tenant: Optional[str] = None) -> Dict[str, Any]:
         try:
-            params: Dict[str, Any] = {"limit": 500}
+            # Paginated: follow NetBox ``next`` links so a tenant with >500 IPs
+            # (routine at thousands-of-VMs scale) isn't silently truncated in
+            # the IPAM→CPPM endpoint sync. _api_get_all returns the full flat
+            # results list (not a dict), capped at max_pages=200 as a runaway
+            # guard.
+            params: Dict[str, Any] = {}
             if tenant:
                 params["tenant"] = tenant
             if prefix:
                 params["parent"] = prefix
             if device:
                 params["device"] = device
-            data = self._api_get("/api/ipam/ip-addresses/", params)
+            rows = self._api_get_all("/api/ipam/ip-addresses/", params)
             ips = []
-            for ip in data.get("results", []):
+            for ip in rows:
                 status = ip.get("status") or {}
                 ao = ip.get("assigned_object")
                 ips.append({
@@ -942,11 +947,11 @@ class NetboxEngine:
 
     def get_tenants(self) -> Dict[str, Any]:
         try:
-            data = self._api_get("/api/tenancy/tenants/", {"limit": 500})
+            rows = self._api_get_all("/api/tenancy/tenants/")
             tenants = [
                 {"id": t["id"], "name": t["name"], "slug": t["slug"],
                  "description": t.get("description") or ""}
-                for t in data.get("results", [])
+                for t in rows
             ]
             return {"status": "SUCCESS", "tenants": tenants}
         except Exception as e:
@@ -954,11 +959,11 @@ class NetboxEngine:
 
     def get_dhcp_prefixes(self) -> Dict[str, Any]:
         try:
-            data = self._api_get("/api/ipam/prefixes/", {"limit": 500})
+            rows = self._api_get_all("/api/ipam/prefixes/")
             scopes = [
                 {"prefix": p["prefix"], "gateway": p.get("custom_fields", {}).get("gateway"),
                  "mask": None, "id": p["id"]}
-                for p in data.get("results", [])
+                for p in rows
             ]
             return {"status": "SUCCESS", "scopes": scopes}
         except Exception as e:
