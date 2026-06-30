@@ -1020,7 +1020,9 @@ class NetboxEngine:
             return self.nb.dcim.device_roles.create(
                 name=slug.capitalize(), slug=slug, color="9e9e9e")
         except Exception as e:
-            logger.debug("ensure_device_role failed: %s", e)
+            # WARNING (not debug): a None role cascades into per-device create
+            # failures (device_type/role unresolved), so surface the reason.
+            logger.warning("ensure_device_role '%s' failed (creates will error): %s", slug, e)
             return None
 
     def _ensure_device_type(self, slug: str = "discovered"):
@@ -1041,7 +1043,9 @@ class NetboxEngine:
             return self.nb.dcim.device_types.create(
                 model="Discovered Device", slug=slug, manufacturer=mfr.id)
         except Exception as e:
-            logger.debug("ensure_device_type failed: %s", e)
+            # WARNING (not debug): a None device_type cascades into per-device
+            # create 400s (device_type is required), so surface the reason.
+            logger.warning("ensure_device_type '%s' failed (creates will error): %s", slug, e)
             return None
 
     def _resolve_site(self, slug: str = "", tenant=None):
@@ -1055,13 +1059,15 @@ class NetboxEngine:
                 if s:
                     return s
             except Exception as e:
-                logger.debug("resolve_site %s failed: %s", slug, e)
+                logger.warning("resolve_site '%s' failed: %s", slug, e)
         try:
             sites = list(self.nb.dcim.sites.filter(limit=1))
             if sites:
                 return sites[0]
         except Exception as e:
-            logger.debug("resolve_site first-site fallback failed: %s", e)
+            # site is optional for a device, so this stays best-effort — but
+            # warn so a permissions issue is visible rather than silent.
+            logger.warning("resolve_site first-site fallback failed: %s", e)
         return None
 
     # Per-tenant breakdown key used when a VM carries no tenant slug (untagged
@@ -1093,6 +1099,7 @@ class NetboxEngine:
         so the hub can record per-tenant last-sync status from one batch.
         """
         pushed = 0; errors = 0; skipped = 0; deleted = 0
+        first_err: Optional[str] = None   # first per-record failure text (diagnosability)
         per_tenant: Dict[str, Dict[str, int]] = {}
         UNASSIGNED = self._VM_SYNC_UNASSIGNED_KEY
 
@@ -1175,6 +1182,8 @@ class NetboxEngine:
                     except Exception as e:
                         errors += 1
                         _bucket(rslug)["errors"] += 1
+                        if first_err is None:
+                            first_err = f"delete {uid}: {e}"
                         logger.debug("sync_vms: delete stale %s failed: %s", uid, e)
 
             for uid, vm in incoming.items():
@@ -1240,11 +1249,17 @@ class NetboxEngine:
                 except Exception as e:
                     errors += 1
                     b["errors"] += 1
+                    if first_err is None:
+                        first_err = f"upsert {uid}: {e}"
                     logger.debug("sync_vms: upsert %s failed: %s", uid, e)
 
             msg = (f"{pushed} VM(s) upserted, {deleted} deleted, "
                    f"{skipped} skipped, {errors} errors")
-            logger.info("sync_vms: %s", msg)
+            if errors and first_err:
+                msg += f" — first error: {first_err}"
+                logger.warning("sync_vms: %s", msg)
+            else:
+                logger.info("sync_vms: %s", msg)
             return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
                     "skipped": skipped, "deleted": deleted,
                     "vms_total": len(incoming), "message": msg,
@@ -1347,6 +1362,7 @@ class NetboxEngine:
         Returns ``{status, pushed, errors, skipped, deleted, devices_total, message}``.
         """
         pushed = 0; errors = 0; skipped = 0; deleted = 0
+        first_err: Optional[str] = None   # first per-record failure text (diagnosability)
         defaults = defaults or {}
         try:
             tenant = None
@@ -1416,6 +1432,8 @@ class NetboxEngine:
                             deleted += 1
                     except Exception as e:
                         errors += 1
+                        if first_err is None:
+                            first_err = f"delete {ip_str}: {e}"
                         logger.debug("sync_devices: delete stale %s failed: %s", ip_str, e)
 
             role = self._ensure_device_role(defaults.get("role") or "discovered")
@@ -1509,11 +1527,20 @@ class NetboxEngine:
                         pushed += 1
                 except Exception as e:
                     errors += 1
+                    if first_err is None:
+                        first_err = f"upsert {ip_str}: {e}"
                     logger.debug("sync_devices: upsert %s failed: %s", ip_str, e)
 
             msg = (f"{pushed} device(s) upserted, {deleted} deleted, "
                    f"{skipped} skipped, {errors} errors")
-            logger.info("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
+            if errors and first_err:
+                # Surface the first failure in the returned message (the hub
+                # status UI shows it) + a WARNING, so the cause is visible
+                # without digging through DEBUG logs.
+                msg += f" — first error: {first_err}"
+                logger.warning("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
+            else:
+                logger.info("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
             return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
                     "skipped": skipped, "deleted": deleted,
                     "devices_total": len(incoming), "message": msg}
