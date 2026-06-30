@@ -453,3 +453,82 @@ def test_sync_devices_journals_created_device_and_ip_with_module_and_timestamp()
         assert c.kwargs["kind"] == "info"
         assert "firewall-discovery" in c.kwargs["comment"]      # module
         assert " at " in c.kwargs["comment"]                     # timestamp
+
+
+# ── source-tag generalization (nw sync → "Network Devices" ownership tag) ────
+
+def test_sync_devices_default_source_tags_opnsense():
+    # No source passed → legacy "opnsense" tag (unchanged firewall behavior).
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert dev.custom_fields.get("discovered_from") == "opnsense"
+
+
+def test_sync_devices_firewall_synonyms_normalize_to_opnsense():
+    # "fw" / "firewall" / "OPNsense" (any case) all collapse to the legacy
+    # "opnsense" tag so existing firewall deployments stay byte-identical.
+    for src in ("fw", "firewall", "OPNsense", "Firewall"):
+        eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+        dev = _Obj(id=42)
+        eng.nb.dcim.devices.create.return_value = dev
+        eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+        eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+        eng.sync_devices(
+            devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+            tenant_slug="lrb", replace=False, defaults={}, source=src)
+        assert dev.custom_fields.get("discovered_from") == "opnsense", src
+
+
+def test_sync_devices_nw_source_tags_network_devices():
+    # The nw sync passes source="Network Devices" → created devices are tagged
+    # verbatim "Network Devices" (the nw ownership tag), NOT "opnsense".
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+        tenant_slug="lrb", replace=False, defaults={}, source="Network Devices")
+
+    assert dev.custom_fields.get("discovered_from") == "Network Devices"
+
+
+def test_sync_devices_nw_replace_delete_skips_opnsense_owned():
+    # CRITICAL cross-source invariant: a nw sync (source="Network Devices") with
+    # replace=True must replace-delete ONLY nw-owned records — it must NEVER
+    # touch an opnsense-tagged device in the same tenant, even though the
+    # opnsense device's IP is absent from the nw incoming set. owned_ips is
+    # scoped to the nw tag, so the firewall record stays put.
+    rows = [
+        {"id": 11, "primary_ip4": {"id": 111, "address": "10.0.0.5/24"},
+         "custom_fields": {"discovered_from": "opnsense"}},        # firewall's
+        {"id": 22, "primary_ip4": {"id": 222, "address": "10.0.0.6/24"},
+         "custom_fields": {"discovered_from": "Network Devices"}},  # nw's
+    ]
+    eng = _engine_with(existing_rows=rows, tenant_obj=_Obj(id=1))
+    dev22 = _Obj(id=22)
+    eng.nb.dcim.devices.get.return_value = dev22   # the nw-owned absent fetch
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=222, custom_fields={})
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:01", "hostname": "ws-05"}],
+        tenant_slug="lrb", replace=True, defaults={}, source="Network Devices")
+
+    assert res["status"] == "SUCCESS", res
+    assert res["deleted"] == 1           # the nw-owned device 22 (10.0.0.6) gone
+    dev22.delete.assert_called_once()
+    # The firewall-owned device 11 (10.0.0.5, opnsense) is present in the
+    # incoming set so it's refreshed, NOT deleted — its devices.get is never
+    # fetched for delete. (devices.get.return_value is a single shared mock; the
+    # delete path fetched exactly once, for 22.)
+    assert eng.nb.dcim.devices.get.call_count == 1

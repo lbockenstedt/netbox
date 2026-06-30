@@ -1595,11 +1595,13 @@ class NetboxEngine:
 
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
-                     defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Push a tenant's firewall-discovered device set into NetBox DCIM.
+                     defaults: Optional[Dict[str, Any]] = None,
+                     source: str = "opnsense") -> Dict[str, Any]:
+        """Push a tenant's discovery-source device set into NetBox DCIM.
 
-        Source = OPNsense DHCP leases + ARP table (relayed by the hub). Each
-        incoming record ``{ip, mac, hostname}`` is matched to an existing
+        Source = a discovery feed relayed by the hub (OPNsense DHCP leases +
+        ARP for the firewall sync; switch/gateway ARP tables for the nw sync).
+        Each incoming record ``{ip, mac, hostname}`` is matched to an existing
         device by its primary IPv4; missing devices are created (mirroring
         ``claim_device``: tenant-owned device + ``mgmt`` interface + IP with
         ``custom_fields.mac_address`` + ``primary_ip4``). Writing the MAC onto
@@ -1607,8 +1609,17 @@ class NetboxEngine:
         ``mac_address``) — so static-IP devices the ARP table sees start flowing
         to ClearPass too.
 
+        ``source`` is the ownership tag stamped onto created devices'
+        ``custom_fields.discovered_from`` AND the scope key for replace-delete:
+        ``"opnsense"`` / ``"fw"`` / ``"firewall"`` all normalize to the legacy
+        ``"opnsense"`` tag (unchanged firewall behavior); any other value (e.g.
+        the nw sync's ``"Network Devices"``) is used verbatim, so nw-created
+        records are tagged ``Network Devices`` and replace-delete only ever
+        touches nw-owned records — never the firewall's ``opnsense``-tagged
+        ones, even within the same tenant.
+
         Ownership / replace-delete: devices this sync CREATES are tagged
-        ``custom_fields.discovered_from = "opnsense"`` (best-effort; mirrors
+        ``custom_fields.discovered_from = <source>`` (best-effort; mirrors
         ``proxmox_unique_id`` on VMs). When ``replace`` AND a tenant slug are
         provided, tagged devices of that tenant whose primary IP is absent from
         the incoming set are deleted. Pre-existing devices matched by IP are
@@ -1623,6 +1634,16 @@ class NetboxEngine:
         pushed = 0; errors = 0; skipped = 0; deleted = 0
         first_err: Optional[str] = None   # first per-record failure text (diagnosability)
         defaults = defaults or {}
+        # Normalize the ownership tag: firewall synonyms collapse to the legacy
+        # "opnsense" tag (so existing firewall deployments are byte-identical);
+        # anything else (nw's "Network Devices") is used verbatim. Comparison +
+        # replace-delete scoping are case-insensitive against this tag.
+        source_tag = str(source or "opnsense").strip()
+        if source_tag.lower() in ("opnsense", "fw", "firewall"):
+            source_tag = "opnsense"
+        source_tag_l = source_tag.lower()
+        def _owns(cf: dict) -> bool:
+            return str(((cf or {}).get("discovered_from") or "")).lower() == source_tag_l
         try:
             # Self-heal custom fields (discovered_from on dcim.device,
             # mac_address on ipam.ipaddress) so the ownership tag + MAC writes
@@ -1698,7 +1719,7 @@ class NetboxEngine:
                     continue
                 existing_by_ip[addr] = row
                 cf = row.get("custom_fields") or {}
-                if str((cf.get("discovered_from") or "")).lower() == "opnsense":
+                if _owns(cf):
                     owned_ips.add(addr)
 
             # Replace-with-delete — only when tenant-scoped, only owned devices.
@@ -1746,7 +1767,7 @@ class NetboxEngine:
                         pip = row.get("primary_ip4") or {}
                         ip_id = pip.get("id") if isinstance(pip, dict) else None
                         cf = row.get("custom_fields") or {}
-                        we_own = str((cf.get("discovered_from") or "")).lower() == "opnsense"
+                        we_own = _owns(cf)
                         if ip_id:
                             try:
                                 ipobj = self.nb.ipam.ip_addresses.get(ip_id)
@@ -1790,7 +1811,7 @@ class NetboxEngine:
                         byname = existing_by_name.get(name.lower())
                         if byname and byname["id"] not in refreshed_ids:
                             bcf = byname.get("custom_fields") or {}
-                            b_own = str((bcf.get("discovered_from") or "")).lower() == "opnsense"
+                            b_own = _owns(bcf)
                             # Reclaim the name only for a stale OWNED device that
                             # is NOT being refreshed this batch (refreshed_ids) and
                             # whose name no earlier record this batch took
@@ -1839,7 +1860,7 @@ class NetboxEngine:
                         # Ownership tag (best-effort; missing custom field => no-op).
                         try:
                             merged = dict(devobj.custom_fields or {})
-                            merged["discovered_from"] = "opnsense"
+                            merged["discovered_from"] = source_tag
                             devobj.custom_fields = merged
                             devobj.save()
                         except Exception as e:

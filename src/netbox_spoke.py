@@ -336,17 +336,22 @@ class NetboxSpoke(BaseSpoke):
             )
 
         if normalized == "NETBOX_SYNC_DEVICES":
-            # Firewall → NetBox device discovery sync. The hub relays a tenant's
-            # firewall-discovered devices (DHCP leases + ARP from the OPNsense
-            # spoke, attributed to the tenant by prefix) for an authoritative
-            # replace into NetBox DCIM devices + IP records. ``defaults`` carries
-            # the role/device_type/site slugs for creation.
+            # Discovery-source → NetBox device sync. The hub relays a tenant's
+            # discovered devices (OPNsense DHCP leases + ARP for the firewall
+            # sync, or switch/gateway ARP for the nw sync, attributed to the
+            # tenant by prefix) for an authoritative replace into NetBox DCIM
+            # devices + IP records. ``source`` is the ownership tag stamped on
+            # created devices + the replace-delete scope key (opnsense/fw/
+            # firewall → legacy "opnsense"; else verbatim, e.g. nw's
+            # "Network Devices" so nw replace-delete never touches firewall
+            # records). ``defaults`` carries the role/device_type/site slugs.
             return await self._run_sync(
                 self.engine.sync_devices,
                 devices=data.get("devices", []),
                 tenant_slug=data.get("tenant_slug", ""),
                 replace=bool(data.get("replace", False)),
                 defaults=data.get("defaults", {}),
+                source=data.get("source", "opnsense"),
             )
 
         if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
