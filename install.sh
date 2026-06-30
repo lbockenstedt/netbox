@@ -739,6 +739,61 @@ KEA_CTRL_URL=http://localhost:8000
 DOTENV
 chmod 600 "$LM_DIR/netbox/.env"
 
+# ── Provision Lab Manager custom fields via the REST API ──────────────
+# Idempotent get-or-create for the custom fields the Proxmox/Hypervisor→IPAM
+# and Firewall→IPAM syncs write to. Runs whenever we have a NETBOX_URL +
+# NETBOX_TOKEN (local OR external NetBox), so it works in --spoke-only mode
+# against the external NetBox — unlike the Django manage.py shell step above,
+# which only runs on the full-app install path and is skipped when
+# install_all.sh invokes us with --spoke-only. The spoke also self-heals these
+# at startup (_ensure_custom_fields); this installer step is the durable
+# provision-on-install the user asked for. Best-effort: a transient API
+# failure warns and continues — it must never abort the spoke install.
+if [ -n "${NETBOX_URL:-}" ] && [ -n "${NETBOX_TOKEN:-}" ] && command -v python3 >/dev/null 2>&1; then
+    step "Ensuring Lab Manager custom fields via NetBox REST API"
+    set +e
+    "$LM_DIR/netbox/venv/bin/python3" - "$NETBOX_URL" "$NETBOX_TOKEN" <<'LMCF' | sed 's/^/   /'
+import json, sys, urllib.request, urllib.error
+url, token = sys.argv[1].rstrip("/"), sys.argv[2]
+FIELDS = [
+    ("proxmox_unique_id", "text", "Proxmox unique id", "virtualization.virtualmachine"),
+    ("proxmox_vmid",      "text", "Proxmox VMID",       "virtualization.virtualmachine"),
+    ("proxmox_node",      "text", "Proxmox node",       "virtualization.virtualmachine"),
+    ("proxmox_type",      "text", "Proxmox type",       "virtualization.virtualmachine"),
+    ("discovered_from",   "text", "Discovered from",    "dcim.device"),
+    ("mac_address",       "text", "MAC address",        "ipam.ipaddress"),
+    ("vmid_start",        "integer", "Proxmox VMID range start", "tenancy.tenant"),
+    ("vmid_end",          "integer", "Proxmox VMID range end",   "tenancy.tenant"),
+]
+hdr = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
+def _req(method, path, body=None):
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(f"{url}{path}", data=data, headers=hdr, method=method)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.status, json.loads(r.read().decode() or "{}")
+ok = miss = 0
+for name, ftype, label, ct in FIELDS:
+    try:
+        st, resp = _req("GET", f"/api/extras/custom-fields/?name={name}")
+        if resp.get("count", 0) > 0:
+            ok += 1
+            continue
+        st, resp = _req("POST", "/api/extras/custom-fields/",
+                        {"name": name, "type": ftype, "label": label, "content_types": [ct]})
+        print(f"created {name} on {ct}")
+        miss += 1
+    except urllib.error.HTTPError as e:
+        print(f"SKIP {name}: HTTP {e.code} {e.reason}")
+    except Exception as e:
+        print(f"SKIP {name}: {e}")
+print(f"custom fields: {ok} present, {miss} created, {len(FIELDS)-ok-miss} skipped")
+LMCF
+    set -e
+    ok "Lab Manager custom fields ensured (see lines above)"
+else
+    ok "Skipping REST custom-field provisioning (no NETBOX_URL/TOKEN or no python3) — spoke will self-heal at startup"
+fi
+
 # systemd unit
 HUB_SECRET_ARG=""
 [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret ${HUB_SECRET}"

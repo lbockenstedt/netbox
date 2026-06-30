@@ -24,6 +24,9 @@ class NetboxSpoke(BaseSpoke):
         )
         self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8000"))
         self._sync_task = None
+        # Self-heal the custom fields the syncs depend on (idempotent, best-effort;
+        # a restricted token never breaks the spoke — failures are DEBUG-logged).
+        self.engine._ensure_custom_fields()
 
     def _persist_env(self, key: str, value: str):
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
@@ -115,6 +118,7 @@ class NetboxSpoke(BaseSpoke):
                     url or self.engine.url,
                     token or self.engine.token,
                 )
+                self.engine._ensure_custom_fields()
                 if token:
                     self._persist_env("NETBOX_API_TOKEN", token)
                 if url:

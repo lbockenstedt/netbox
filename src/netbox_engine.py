@@ -913,6 +913,46 @@ class NetboxEngine:
             return "offline"
         return "active"
 
+    # Custom fields the Lab Manager syncs write to. Provisioned idempotently
+    # at spoke startup by _ensure_custom_fields() so the Proxmox/Hypervisor→IPAM
+    # and Firewall→IPAM syncs don't 400 on a missing custom field (the
+    # installer also provisions these via the REST API, but the deployed
+    # external NetBox is reached spoke-only where the installer's Django-shell
+    # step doesn't run — this is the self-healing safety net). (name, type,
+    # label, content_type) — type is the NetBox REST custom-field type string.
+    _REQUIRED_CUSTOM_FIELDS = [
+        ("proxmox_unique_id", "text", "Proxmox unique id", "virtualization.virtualmachine"),
+        ("proxmox_vmid", "text", "Proxmox VMID", "virtualization.virtualmachine"),
+        ("proxmox_node", "text", "Proxmox node", "virtualization.virtualmachine"),
+        ("proxmox_type", "text", "Proxmox type", "virtualization.virtualmachine"),
+        ("discovered_from", "text", "Discovered from", "dcim.device"),
+        ("mac_address", "text", "MAC address", "ipam.ipaddress"),
+        ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
+        ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
+    ]
+
+    def _ensure_custom_fields(self) -> None:
+        """Create any of _REQUIRED_CUSTOM_FIELDS that are missing on NetBox.
+
+        Idempotent (get-or-create by name) and best-effort: a permission / API
+        error is logged at DEBUG and swallowed so a restricted token never
+        breaks a sync. Safe to call at startup and on reconnect."""
+        try:
+            cf_api = self.nb.extras.custom_fields
+            existing = {str(f.name) for f in cf_api.all()}
+        except Exception as e:
+            logger.debug("ensure_custom_fields: list failed: %s", e)
+            return
+        for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
+            if name in existing:
+                continue
+            try:
+                cf_api.create(name=name, type=ftype, label=label,
+                              content_types=[content_type])
+                logger.info("ensure_custom_fields: created %s on %s", name, content_type)
+            except Exception as e:
+                logger.debug("ensure_custom_fields: create %s failed: %s", name, e)
+
     def _ensure_cluster_type(self, name: str = "Proxmox", slug: str = "proxmox"):
         """Return the 'Proxmox' cluster type (creating it if missing). Best-effort."""
         try:
@@ -1394,8 +1434,13 @@ class NetboxEngine:
                 incoming[ip] = {"mac": mac, "hostname": hostname}
 
             # Index existing tenant devices by primary IPv4 (all) + track which
-            # of those we own (discovered_from tag) for replace-delete.
+            # of those we own (discovered_from tag) for replace-delete. Also
+            # index by name (lowercased) for ALL rows — including devices with
+            # no primary_ip4, which the IP index skips below but whose name can
+            # still collide on the (name, site, tenant) unique constraint when
+            # the create branch re-uses device-<mac> after a DHCP IP move.
             existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
+            existing_by_name: Dict[str, dict] = {}  # name.lower() -> raw device row
             owned_ips: set = set()                   # primary IPs of tagged devices
             list_params: Dict[str, Any] = {"limit": 500}
             if tenant_slug:
@@ -1408,6 +1453,9 @@ class NetboxEngine:
                         "pushed": 0, "errors": 0, "skipped": skipped, "deleted": 0,
                         "devices_total": len(incoming)}
             for row in rows:
+                rname = str(row.get("name") or "").strip().lower()
+                if rname:
+                    existing_by_name.setdefault(rname, row)  # first row wins
                 pip = row.get("primary_ip4")
                 addr = ""
                 if isinstance(pip, dict):
@@ -1482,6 +1530,38 @@ class NetboxEngine:
                         name = (hostname if hostname and hostname.lower() != "unknown"
                                 else (f"device-{mac.replace(':', '')}" if mac
                                       else f"device-{real_ip or 'unknown'}"))
+                        # The (name, site, tenant) unique constraint: a device
+                        # we own (discovered_from=opnsense) whose IP moved
+                        # (DHCP renewal, same MAC) is absent from existing_by_ip
+                        # but still present under the same device-<mac> name → a
+                        # plain create re-uses that name and 400s. If the name
+                        # collides with an OWNED device, delete the stale record
+                        # first (it's ours; replace-delete already nukes owned
+                        # devices wholesale, so this is consistent) then create
+                        # fresh with the new IP. If it collides with a device we
+                        # do NOT own (human / pre-existing), uniquify the name
+                        # instead of clobbering a hand-managed device.
+                        byname = existing_by_name.get(name.lower())
+                        if byname:
+                            bcf = byname.get("custom_fields") or {}
+                            b_own = str((bcf.get("discovered_from") or "")).lower() == "opnsense"
+                            if b_own:
+                                try:
+                                    old = self.nb.dcim.devices.get(byname["id"])
+                                    if old:
+                                        old.delete()
+                                        deleted += 1
+                                except Exception as e:
+                                    errors += 1
+                                    if first_err is None:
+                                        first_err = f"delete-stale {name}: {e}"
+                                    logger.debug("sync_devices: delete stale by-name %s failed: %s", name, e)
+                            else:
+                                suffix = (mac.replace(":", "")[-4:] if mac
+                                          else (real_ip or "x"))
+                                name = f"{name}-{suffix}"
+                                logger.debug("sync_devices: name %s taken by unowned device; "
+                                             "creating as %s to avoid clobbering it", name[:-len(suffix)-1], name)
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                         if role:
                             create_kwargs["role"] = role.id

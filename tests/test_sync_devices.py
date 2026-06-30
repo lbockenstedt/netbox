@@ -7,6 +7,7 @@ helpers with fakes). Uses lightweight mock objects because sync_devices does
 """
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -174,3 +175,115 @@ def test_sync_devices_missing_custom_field_is_graceful():
 
     assert res["status"] == "SUCCESS"
     assert res["pushed"] == 1  # device still counts as pushed despite the tag failure
+
+
+# ── name + tenant unique-constraint fix (DHCP IP-move collision) ────────────
+
+def test_sync_devices_owned_name_collision_deletes_stale_then_creates():
+    # A device we own (discovered_from=opnsense) named device-<mac> at an OLD
+    # IP; the same MAC now reports a NEW IP. The new IP is absent from
+    # existing_by_ip → create branch → the same device-<mac> name collides on
+    # (name, tenant). We must delete the stale owned record and re-create with
+    # the new IP instead of 400-ing on the unique constraint. replace=False so
+    # replace-delete doesn't pre-empt the collision path.
+    row = {"id": 77, "name": "device-aabbccddeeff",
+           "primary_ip4": {"id": 901, "address": "10.0.0.9/24"},
+           "custom_fields": {"discovered_from": "opnsense"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    stale = _Obj(id=77, custom_fields={"discovered_from": "opnsense"})
+    new_dev = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = stale      # the by-name stale fetch
+    eng.nb.dcim.devices.create.return_value = new_dev
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    # The stale owned device was deleted, then a fresh one created with the
+    # same name (now freed) + the new IP — no 400.
+    stale.delete.assert_called_once()
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["name"] == "device-aabbccddeeff"
+    assert ck["tenant"] == 1
+    # New IP created against the new device.
+    ik = eng.nb.ipam.ip_addresses.create.call_args.kwargs
+    assert ik["address"] == "10.0.0.5/32"
+
+
+def test_sync_devices_unowned_name_collision_uniquifies_does_not_clobber():
+    # A HUMAN device owns the name device-<mac> (no discovered_from tag). We
+    # must NOT delete it; instead create our device under a uniquified name.
+    row = {"id": 88, "name": "device-aabbccddeeff",
+           "primary_ip4": {"id": 902, "address": "10.0.0.9/24"},
+           "custom_fields": {}}   # unowned
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    new_dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = new_dev
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    # The human device was NOT touched (no devices.get for a delete).
+    eng.nb.dcim.devices.get.assert_not_called()
+    # We created under a uniquified name (mac suffix), not the colliding one.
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["name"] != "device-aabbccddeeff"
+    assert ck["name"].startswith("device-aabbccddeeff-")
+    assert ck["name"].endswith("eeff")  # last 4 of normalized mac
+
+
+def test_sync_devices_no_ip_owned_device_indexed_by_name():
+    # An owned device with NO primary_ip4 is skipped from existing_by_ip but
+    # MUST still be indexed by name — otherwise a re-create with the same
+    # device-<mac> name 400s on the unique constraint.
+    row = {"id": 99, "name": "device-aabbccddeeff",
+           "primary_ip4": None, "custom_fields": {"discovered_from": "opnsense"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    stale = _Obj(id=99, custom_fields={"discovered_from": "opnsense"})
+    eng.nb.dcim.devices.get.return_value = stale
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["errors"] == 0
+    stale.delete.assert_called_once()  # the no-IP stale owned device was freed
+
+
+# ── _ensure_custom_fields (spoke-side self-heal) ────────────────────────────
+
+def test_ensure_custom_fields_creates_missing_skips_present():
+    eng = NetboxEngine("http://localhost", "tok")
+    eng.nb = MagicMock()
+    # proxmox_node already exists → skip; the other 7 must be created.
+    eng.nb.extras.custom_fields.all.return_value = [SimpleNamespace(name="proxmox_node")]
+    eng._ensure_custom_fields()
+    created = {c.kwargs["name"] for c in eng.nb.extras.custom_fields.create.call_args_list}
+    assert "proxmox_node" not in created
+    assert {"proxmox_unique_id", "proxmox_vmid", "proxmox_type",
+            "discovered_from", "mac_address", "vmid_start", "vmid_end"} <= created
+    # Each create carries the NetBox REST shape.
+    sample = eng.nb.extras.custom_fields.create.call_args_list[0].kwargs
+    assert sample["type"] in ("text", "integer")
+    assert isinstance(sample["content_types"], list)
+
+
+def test_ensure_custom_fields_swallows_api_error():
+    eng = NetboxEngine("http://localhost", "tok")
+    eng.nb = MagicMock()
+    eng.nb.extras.custom_fields.all.side_effect = Exception("403 forbidden")
+    # Must not raise — a restricted token must never break the spoke.
+    eng._ensure_custom_fields()
+    eng.nb.extras.custom_fields.create.assert_not_called()
