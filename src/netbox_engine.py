@@ -927,6 +927,7 @@ class NetboxEngine:
         ("proxmox_vmid", "text", "Proxmox VMID", "virtualization.virtualmachine"),
         ("proxmox_node", "text", "Proxmox node", "virtualization.virtualmachine"),
         ("proxmox_type", "text", "Proxmox type", "virtualization.virtualmachine"),
+        ("proxmox_labels", "text", "Proxmox labels", "virtualization.virtualmachine"),
         ("discovered_from", "text", "Discovered from", "dcim.device"),
         ("mac_address", "text", "MAC address", "ipam.ipaddress"),
         # mac_address attached to dcim.device too — the access-tracker sync keys
@@ -1545,6 +1546,12 @@ class NetboxEngine:
                         "proxmox_vmid": str(vm.get("vmid") or ""),
                         "proxmox_node": str(vm.get("node") or ""),
                         "proxmox_type": str(vm.get("type") or ""),
+                        # Proxmox tags/labels (semicolon-joined) — the pxmx agent
+                        # emits tags as a list; join back to Proxmox's native
+                        # ';' separation so the field round-trips with the GUI.
+                        "proxmox_labels": ";".join(
+                            str(t).strip() for t in (vm.get("tags") or [])
+                            if str(t).strip()),
                         # last_seen clocks the staleness sweep from this detection
                         # (folded into the cf PATCH so it rides the same save — no
                         # extra write per VM). Best-effort: a missing field is

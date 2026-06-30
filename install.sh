@@ -596,6 +596,32 @@ print('LM_CF_OK')
         warn "VMID-range custom field creation did not report OK (continuing)"
     fi
 
+    # 4) Ensure proxmox_vmid + proxmox_labels text custom fields on
+    #    virtualization.virtualmachine so the Hypervisor→NetBox VM sync can
+    #    surface each VM's Proxmox VMID and its tags/labels (semicolon-joined).
+    #    The netbox spoke's _ensure_custom_fields() also self-heals these over
+    #    the REST API on the external NetBox (spoke-only deploys where this
+    #    Django-shell step doesn't run) — this is the official provisioning on
+    #    the NetBox host. Idempotent via get_or_create; content_types set each
+    #    run so an existing-but-unattached field is repaired (the "does not
+    #    exist for this object type" trap).
+    LM_VM_CF_OUT=$("$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
+from extras.models import CustomField
+from extras.choices import CustomFieldTypeChoices
+from django.contrib.contenttypes.models import ContentType
+from virtualization.models import VirtualMachine
+vct = ContentType.objects.get_for_model(VirtualMachine)
+for name, label in (('proxmox_vmid', 'Proxmox VMID'), ('proxmox_labels', 'Proxmox labels')):
+    cf, created = CustomField.objects.get_or_create(name=name, defaults={'type': CustomFieldTypeChoices.TYPE_TEXT, 'label': label, 'description': 'Proxmox VM attribute (Lab Manager VM sync)'})
+    cf.content_types.set([vct])
+print('LM_VM_CF_OK')
+" 2>/dev/null | tail -1 || echo "LM_VM_CF_FAIL")
+    if [ "$LM_VM_CF_OUT" = "LM_VM_CF_OK" ]; then
+        ok "Proxmox VMID + labels custom fields ensured on virtualization.virtualmachine"
+    else
+        warn "VM VMID/labels custom field creation did not report OK (continuing)"
+    fi
+
     chown -R "$SVC_USER:$SVC_USER" "$NB_APP_DIR"
 
     # ── gunicorn service ─────────────────────────────────────

@@ -163,6 +163,34 @@ def test_sync_vms_uid_match_takes_precedence_over_name_cluster():
     eng.nb.virtualization.virtual_machines.create.assert_not_called()
 
 
+def test_sync_vms_writes_proxmox_labels_from_tags():
+    # The pxmx agent emits per-VM tags as a list; sync_vms joins them with ';'
+    # (Proxmox's native separator) into the proxmox_labels custom field so the
+    # VM's labels round-trip with the Proxmox GUI. Empty/blank tags are dropped.
+    eng = _engine()
+    vm_obj = _Obj(id=42, custom_fields={})
+    eng.nb.virtualization.virtual_machines.create.return_value = vm_obj
+
+    res = eng.sync_vms(
+        vms=[{**_VM, "tags": ["prod", "web", "  ", ""]}],
+        tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert vm_obj.custom_fields.get("proxmox_labels") == "prod;web"
+
+
+def test_sync_vms_proxmox_labels_empty_when_no_tags():
+    eng = _engine()
+    vm_obj = _Obj(id=42, custom_fields={})
+    eng.nb.virtualization.virtual_machines.create.return_value = vm_obj
+
+    res = eng.sync_vms(vms=[_VM], tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert vm_obj.custom_fields.get("proxmox_labels") == ""
+
+
 # ── VM IP/MAC gathering: _assign_vm_primary_ip4 builds vminterfaces + IPs ─────
 
 def _engine_real_assign():
