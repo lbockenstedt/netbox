@@ -1325,6 +1325,25 @@ class NetboxEngine:
             return ":".join(hexonly[i:i + 2] for i in range(0, 12, 2))
         return m
 
+    @staticmethod
+    def _row_has_ip_or_mac(row: dict) -> bool:
+        """Whether a raw NetBox device row carries a primary IP OR a mac_address
+        custom field — i.e. it is identifiable by something other than its name.
+
+        Used by ``sync_devices`` to decide a hostname match: a device that is
+        "bare" (neither IP nor MAC) sharing the incoming hostname is the same
+        machine → adopt/update it in place; a device that already has an IP or
+        MAC sharing a hostname is a DIFFERENT machine (the feed regularly sends
+        one hostname across distinct MACs — ks205, sonoszp, iphone) → leave it
+        and uniquify the new record instead of merging distinct devices.
+        """
+        pip = row.get("primary_ip4") or {}
+        has_ip = isinstance(pip, dict) and bool(
+            (pip.get("address") or "").split("/")[0].strip())
+        cf = row.get("custom_fields") or {}
+        has_mac = bool(NetboxEngine._norm_mac(cf.get("mac_address", "")))
+        return has_ip or has_mac
+
     def _mask_for_ip(self, ip_str: str) -> str:
         """Derive the mask from the most specific containing prefix; /32 if none.
 
@@ -1839,6 +1858,7 @@ class NetboxEngine:
             # the create branch re-uses device-<mac> after a DHCP IP move.
             existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
             existing_by_name: Dict[str, dict] = {}  # name.lower() -> raw device row
+            existing_by_mac: Dict[str, dict] = {}   # norm_mac(cf.mac_address) -> row
             owned_ips: set = set()                   # primary IPs of tagged devices
             # Intra-batch dedup: many discovery records share a hostname across
             # distinct MACs (ks205, sonoszp, iphone…). existing_by_name is a
@@ -1865,6 +1885,15 @@ class NetboxEngine:
                 rname = str(row.get("name") or "").strip().lower()
                 if rname:
                     existing_by_name.setdefault(rname, row)  # first row wins
+                cf = row.get("custom_fields") or {}
+                # Index by the device's mac_address custom field (normalized) so
+                # a record can match an existing device by MAC — catches DHCP
+                # IP-moves + MAC-only records and (with the bare-hostname adopt
+                # below) stops the duplicate a no-MAC/no-IP device spawned on
+                # every sync. first row wins per MAC.
+                rmac = self._norm_mac(cf.get("mac_address", ""))
+                if rmac:
+                    existing_by_mac.setdefault(rmac, row)
                 pip = row.get("primary_ip4")
                 addr = ""
                 if isinstance(pip, dict):
@@ -1872,7 +1901,6 @@ class NetboxEngine:
                 if not addr:
                     continue
                 existing_by_ip[addr] = row
-                cf = row.get("custom_fields") or {}
                 if _owns(cf):
                     owned_ips.add(addr)
 
@@ -1903,31 +1931,46 @@ class NetboxEngine:
                 is_mac_key = ip_str.startswith("mac:")
                 real_ip = "" if is_mac_key else ip_str
                 try:
+                    # Resolve the existing NetBox device for this record. A
+                    # record is the SAME machine if its IP, MAC, OR (for a bare
+                    # name-only device) hostname matches an existing device —
+                    # matching any one updates that device in place instead of
+                    # creating a duplicate (the bug where a device added with no
+                    # MAC/IP spawned a second copy on every sync because the
+                    # sync could only compare one property). IP is the strongest
+                    # key; MAC catches DHCP IP-moves + MAC-only records; hostname
+                    # adopts ONLY a bare device (no IP AND no mac_address cf) so
+                    # two genuinely distinct machines sharing a hostname in the
+                    # feed (ks205, sonoszp, iphone…) still get separate rows.
                     row = existing_by_ip.get(ip_str) if not is_mac_key else None
+                    if row is None and mac:
+                        row = existing_by_mac.get(mac)
+                    if row is None and hostname and hostname.lower() != "unknown":
+                        cand = existing_by_name.get(hostname.lower())
+                        if cand is not None and not self._row_has_ip_or_mac(cand):
+                            row = cand
                     if row:
-                        # Existing device matched by IP — refresh its IP's MAC +
-                        # dns_name (the goal: populate mac_address so the endpoint
-                        # sync can match). Rename only if we own it. Remember its
-                        # id so the create branch never reclaims/clobbers a device
-                        # we just refreshed when a duplicate hostname shows up.
+                        # Existing device matched (by IP / MAC / bare hostname) —
+                        # update it in place. Remember its id so the create
+                        # branch never reclaims/clobbers a device we just updated
+                        # when a duplicate hostname shows up.
                         refreshed_ids.add(row["id"])
-                        # The refreshed device keeps (or is renamed to) a name
-                        # that's now occupied in NetBox — track it so a later
-                        # duplicate-hostname create this batch uniquifies instead
-                        # of colliding on (name, site, tenant).
                         rname = str(row.get("name") or "").strip().lower()
                         if rname:
                             used_names.add(rname)
                         pip = row.get("primary_ip4") or {}
                         ip_id = pip.get("id") if isinstance(pip, dict) else None
+                        match_addr = ((pip.get("address") or "").split("/")[0].strip()
+                                      if isinstance(pip, dict) else "")
                         cf = row.get("custom_fields") or {}
                         we_own = _owns(cf)
                         # source_of_truth=="netbox" → NetBox is the source of truth
                         # for this device: only-add-missing. The device already
-                        # exists, so do NOT overwrite its IP's mac_address/dns_name
-                        # or rename it — only refresh last_seen (a staleness signal,
-                        # not a truth field). "external" (the discovery feed is the
-                        # source of truth) overwrites as before.
+                        # exists, so do NOT overwrite its IP's mac_address/dns_name,
+                        # assign it a primary IP, or rename it — only refresh
+                        # last_seen (a staleness signal, not a truth field).
+                        # "external" (the discovery feed is the source of truth)
+                        # updates as below.
                         if source_of_truth == "netbox":
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
@@ -1938,7 +1981,13 @@ class NetboxEngine:
                                               ip_str, e)
                             pushed += 1
                             continue
-                        if ip_id:
+                        # Primary IP: refresh the existing IP when it already
+                        # equals the incoming IP (or the record is MAC-only with
+                        # no IP to assign); otherwise ASSIGN the incoming IP as
+                        # primary_ip4 (bare-device adoption, or a DHCP IP-move
+                        # caught by MAC match) — creating the mgmt interface + IP
+                        # the create branch uses, via _reuse_or_create_ip.
+                        if ip_id and (not real_ip or match_addr == real_ip):
                             try:
                                 ipobj = self.nb.ipam.ip_addresses.get(ip_id)
                                 if ipobj:
@@ -1952,6 +2001,57 @@ class NetboxEngine:
                                     self._stamp_last_seen(ipobj)
                             except Exception as e:
                                 logger.debug("sync_devices: refresh IP %s failed: %s", ip_str, e)
+                        elif real_ip:
+                            try:
+                                iface = self.nb.dcim.interfaces.create(
+                                    device=row["id"], name="mgmt", type="other")
+                                mask = self._mask_for_ip(real_ip)
+                                ip_kwargs: Dict[str, Any] = {
+                                    "address": f"{real_ip}/{mask}",
+                                    "assigned_object_type": "dcim.interface",
+                                    "assigned_object_id": iface.id,
+                                }
+                                if tenant:
+                                    ip_kwargs["tenant"] = tenant.id
+                                if hostname and hostname.lower() != "unknown":
+                                    ip_kwargs["dns_name"] = hostname
+                                ipobj = self._reuse_or_create_ip(
+                                    f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id,
+                                    tenant=tenant, hostname=hostname, mac=mac,
+                                    source="firewall-discovery")
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    devobj.primary_ip4 = ipobj.id
+                                    devobj.save()
+                                self._journal("ipam.ipaddress", ipobj.id,
+                                              "firewall-discovery",
+                                              note=f"IP {real_ip}/{mask} → adopted")
+                                self._stamp_last_seen(ipobj)
+                                # We moved/assigned the device's primary IP away
+                                # from match_addr — stop replace-delete from
+                                # reaping this device because its OLD primary IP
+                                # isn't in the incoming set (same device, now at a
+                                # new address, not a stale one).
+                                if match_addr and match_addr != real_ip and match_addr in owned_ips:
+                                    owned_ips.discard(match_addr)
+                            except Exception as e:
+                                logger.debug("sync_devices: assign IP %s failed: %s", real_ip, e)
+                        # Stamp the device's mac_address custom field (best-effort)
+                        # so a future MAC-match finds this device even after a DHCP
+                        # IP move, and the endpoint sync can match it by MAC.
+                        if mac:
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    merged = dict(devobj.custom_fields or {})
+                                    if merged.get("mac_address") != mac:
+                                        merged["mac_address"] = mac
+                                        devobj.custom_fields = merged
+                                        devobj.save()
+                            except Exception as e:
+                                logger.debug("sync_devices: device mac stamp %s: %s", ip_str, e)
+                        # Rename only if we own it (don't clobber a human device's
+                        # name); then mark the device seen.
                         if we_own and hostname and hostname.lower() != "unknown":
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
@@ -1963,7 +2063,6 @@ class NetboxEngine:
                             except Exception as e:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
                         else:
-                            # Not renaming, but still mark the device seen.
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
                                 if devobj:

@@ -542,8 +542,137 @@ def test_sync_devices_nw_replace_delete_skips_opnsense_owned():
     assert res["deleted"] == 1           # the nw-owned device 22 (10.0.0.6) gone
     dev22.delete.assert_called_once()
     # The firewall-owned device 11 (10.0.0.5, opnsense) is present in the
-    # incoming set so it's refreshed, NOT deleted. devices.get is fetched
-    # exactly twice: once for the replace-delete of 22, once for the refresh
-    # of 11 (the refresh stamps last_seen on the device so the staleness sweep
-    # sees it as recently active). Neither fetch is a delete of device 11.
-    assert eng.nb.dcim.devices.get.call_count == 2
+    # incoming set so it's refreshed, NOT deleted. devices.get is fetched for:
+    # the replace-delete of 22, then the refresh of 11 — which now stamps the
+    # device's mac_address custom field (so future MAC-matching works) AND
+    # last_seens it so the staleness sweep sees it as recently active. The only
+    # DELETE is on dev22; device 11 is only ever fetched, never deleted.
+    assert eng.nb.dcim.devices.get.call_count == 3
+    # No second delete call — device 11 was not reaped.
+    assert dev22.delete.call_count == 1
+
+
+# ── multi-property dedup: IP OR MAC OR bare-hostname → same machine ─────────
+#
+# A device added to NetBox with no MAC and no IP used to spawn a SECOND copy on
+# every firewall sync: the only property left to compare was the hostname, but
+# the sync only used the hostname for collision-avoidance (uniquify → create a
+# suffixed duplicate) instead of recognizing it as the same machine. The fix
+# resolves an existing device by IP first, then MAC, then hostname (ONLY when
+# the existing device is bare — no IP AND no mac_address cf, so two distinct
+# machines sharing a hostname still get separate rows) and updates it in place.
+
+def test_sync_devices_mac_match_no_duplicate_on_ip_move():
+    # Existing OWNED device at 10.0.0.5 carrying mac_address=aa:bb:cc:dd:ee:ff.
+    # The same machine later reports in from a DHCP'd 10.0.0.9 (same MAC). The
+    # IP index misses (different IP), but the MAC index matches → the existing
+    # device is adopted, given the new primary IP, and NOT duplicated.
+    row = {"id": 77, "name": "printer-x",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "mac_address": "aa:bb:cc:dd:ee:ff"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    existing = _Obj(id=77, custom_fields={"discovered_from": "opnsense",
+                                          "mac_address": "aa:bb:cc:dd:ee:ff"})
+    eng.nb.dcim.devices.get.return_value = existing
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None  # new IP → create
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "printer-x"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    # No new device created — the existing one was adopted by MAC.
+    eng.nb.dcim.devices.create.assert_not_called()
+    # The existing device was repointed at the new primary IP 10.0.0.9.
+    assert existing.primary_ip4 == 555
+
+
+def test_sync_devices_bare_hostname_match_adopts_in_place_assigns_ip():
+    # The reported bug: an existing device with NO IP and NO MAC (only a name).
+    # A discovery record for the same hostname arrives with an IP + MAC. The
+    # sync used to uniquify-create a second device; now it adopts the bare
+    # device by hostname, assigns it the primary IP + MAC, no duplicate.
+    row = {"id": 77, "name": "printer-x", "primary_ip4": None,
+           "custom_fields": {}}   # bare: no IP, no mac_address
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    existing = _Obj(id=77, custom_fields={})
+    eng.nb.dcim.devices.get.return_value = existing
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "printer-x"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    eng.nb.dcim.devices.create.assert_not_called()   # adopted, not duplicated
+    # The bare device now has a primary IP + a stamped MAC.
+    assert existing.primary_ip4 == 555
+    assert existing.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+
+
+def test_sync_devices_hostname_match_against_non_bare_device_uniquifies():
+    # An UNOWNED (human) device at 10.0.0.5 (HAS an IP — not bare) is named
+    # "ks205". A DIFFERENT machine (different MAC) reports in from 10.0.0.9 with
+    # the SAME hostname "ks205". This is the shared-hostname case (ks205 across
+    # distinct MACs): the existing device is NOT bare, so hostname does NOT
+    # adopt it → the new machine gets its own uniquified device, and the human
+    # device is left untouched (no merge of distinct machines).
+    row = {"id": 77, "name": "ks205",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {}}   # unowned + has IP → not bare, don't adopt
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    new_dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = new_dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:01", "hostname": "ks205"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    # A NEW device was created (distinct machine) — under a uniquified name, not
+    # clobbering device 77's "ks205".
+    eng.nb.dcim.devices.create.assert_called_once()
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["name"] != "ks205"
+    assert ck["name"].startswith("ks205-")
+    # The human device 77 was NOT deleted (no reclaim of an unowned name).
+    eng.nb.dcim.devices.get.assert_not_called()
+
+
+def test_sync_devices_mac_only_record_matches_existing_by_mac_no_duplicate():
+    # A MAC-only record (no IP) for a device that already exists at 10.0.0.5
+    # with mac_address=aa:bb:cc:dd:ee:ff. The MAC index matches → the existing
+    # device's IP gets its MAC refreshed; no duplicate is created.
+    row = {"id": 77, "name": "ws-05",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "mac_address": "aa:bb:cc:dd:ee:ff"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ipobj = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = ipobj
+    existing = _Obj(id=77, custom_fields={"discovered_from": "opnsense",
+                                          "mac_address": "aa:bb:cc:dd:ee:ff"})
+    eng.nb.dcim.devices.get.return_value = existing
+
+    res = eng.sync_devices(
+        devices=[{"ip": "", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-05"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()   # matched by MAC, no new device
+    # The existing IP's mac_address was refreshed.
+    assert ipobj.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
