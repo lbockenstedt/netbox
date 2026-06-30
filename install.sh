@@ -770,6 +770,15 @@ FIELDS = [
     ("switch_ip",         "text", "Switch IP",          "dcim.device"),
     ("switch_port",       "text", "Switch port",        "dcim.device"),
     ("last_seen",         "text", "Last seen",          "dcim.device"),
+    # last_seen also on VMs + IP addresses for the staleness sweep. The GET-skip
+    # below leaves an already-existing field as-is; the spoke self-heals the
+    # extra content-type at startup (_ensure_custom_fields).
+    ("last_seen",         "text", "Last seen",          "virtualization.virtualmachine"),
+    ("last_seen",         "text", "Last seen",          "ipam.ipaddress"),
+    # Decommission clock set by staleness_sweep when it flips an object offline
+    # (7d unseen); aged past 30d the object is deleted + its IPs free.
+    ("decommissioned_at", "text", "Decommissioned at",  "dcim.device"),
+    ("decommissioned_at", "text", "Decommissioned at",  "virtualization.virtualmachine"),
     ("vmid_start",        "integer", "Proxmox VMID range start", "tenancy.tenant"),
     ("vmid_end",          "integer", "Proxmox VMID range end",   "tenancy.tenant"),
 ]

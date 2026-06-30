@@ -387,8 +387,22 @@ def test_ensure_custom_fields_attaches_existing_unattached_field():
     assert "ipam.ipaddress" in mac.content_types
     assert "dcim.device" in mac.content_types
     assert mac.save.call_count == 1
-    # Other already-attached fields were not re-saved.
-    others = [c for c in cfs if c.name not in ("proxmox_node", "mac_address")]
+    # last_seen spans three content types (dcim.device already attached above;
+    # virtualization.virtualmachine + ipam.ipaddress each attach via a save).
+    ls = by_required["last_seen"]
+    assert "dcim.device" in ls.content_types
+    assert "virtualization.virtualmachine" in ls.content_types
+    assert "ipam.ipaddress" in ls.content_types
+    assert ls.save.call_count == 2
+    # decommissioned_at spans two content types (dcim.device attached;
+    # virtualization.virtualmachine attaches via one save).
+    dc = by_required["decommissioned_at"]
+    assert "dcim.device" in dc.content_types
+    assert "virtualization.virtualmachine" in dc.content_types
+    assert dc.save.call_count == 1
+    # Other (single-content-type) already-attached fields were not re-saved.
+    multi = ("proxmox_node", "mac_address", "last_seen", "decommissioned_at")
+    others = [c for c in cfs if c.name not in multi]
     assert all(c.save.call_count == 0 for c in others)
 
 
@@ -528,7 +542,8 @@ def test_sync_devices_nw_replace_delete_skips_opnsense_owned():
     assert res["deleted"] == 1           # the nw-owned device 22 (10.0.0.6) gone
     dev22.delete.assert_called_once()
     # The firewall-owned device 11 (10.0.0.5, opnsense) is present in the
-    # incoming set so it's refreshed, NOT deleted — its devices.get is never
-    # fetched for delete. (devices.get.return_value is a single shared mock; the
-    # delete path fetched exactly once, for 22.)
-    assert eng.nb.dcim.devices.get.call_count == 1
+    # incoming set so it's refreshed, NOT deleted. devices.get is fetched
+    # exactly twice: once for the replace-delete of 22, once for the refresh
+    # of 11 (the refresh stamps last_seen on the device so the staleness sweep
+    # sees it as recently active). Neither fetch is a delete of device 11.
+    assert eng.nb.dcim.devices.get.call_count == 2

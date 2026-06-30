@@ -328,11 +328,15 @@ class NetboxSpoke(BaseSpoke):
             # set (pulled from the pxmx spoke) here for an authoritative replace
             # into NetBox virtualization records. Blocking pynetbox calls run
             # off the event loop via _run_sync, like every other engine method.
+            # ``source_of_truth``: "external" (Proxmox owns VMs → overwrite) or
+            # "netbox" (NetBox owns VMs → only-add-missing). Hub default config is
+            # proxmox/external; the WebUI Source-of-Truth selector sets it.
             return await self._run_sync(
                 self.engine.sync_vms,
                 vms=data.get("vms", []),
                 tenant_slug=data.get("tenant_slug", ""),
                 replace=bool(data.get("replace", False)),
+                source_of_truth=data.get("source_of_truth", "external"),
             )
 
         if normalized == "NETBOX_SYNC_DEVICES":
@@ -345,6 +349,9 @@ class NetboxSpoke(BaseSpoke):
             # firewall → legacy "opnsense"; else verbatim, e.g. nw's
             # "Network Devices" so nw replace-delete never touches firewall
             # records). ``defaults`` carries the role/device_type/site slugs.
+            # ``source_of_truth``: "external" (discovery feed owns the device →
+            # overwrite IP mac/dns_name + rename) or "netbox" (NetBox owns the
+            # device → only-add-missing: refresh last_seen only).
             return await self._run_sync(
                 self.engine.sync_devices,
                 devices=data.get("devices", []),
@@ -352,6 +359,7 @@ class NetboxSpoke(BaseSpoke):
                 replace=bool(data.get("replace", False)),
                 defaults=data.get("defaults", {}),
                 source=data.get("source", "opnsense"),
+                source_of_truth=data.get("source_of_truth", "external"),
             )
 
         if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
@@ -362,11 +370,27 @@ class NetboxSpoke(BaseSpoke):
             # present, with a NIC interface (native MAC) + framed IP + a cable to
             # a switch device's port interface. NetBox stays source of truth →
             # replace is always False. See lm core/src/realtime_ipam_nac_sync.py.
+            # ``source_of_truth`` is accepted for parity (always only-add-missing
+            # here; an "external" owner that would overwrite isn't exposed in v1).
             return await self._run_sync(
                 self.engine.sync_access_tracker,
                 sessions=data.get("sessions", []),
                 tenant_slug=data.get("tenant_slug", ""),
                 defaults=data.get("defaults", {}),
+                source_of_truth=data.get("source_of_truth", "netbox"),
+            )
+
+        if normalized == "NETBOX_STALENESS_SWEEP":
+            # Cluster-wide staleness sweep: devices/VMs/IPs not seen for
+            # ``stale_days`` → offline + decommissioned_at; offline + aged past
+            # ``delete_days`` → deleted (IPs free automatically). The hub runs
+            # this on a schedule + on-demand (StalenessSweepMixin). See
+            # lm core/src/staleness_sweep.py. Defaults mirror the hub config
+            # defaults so a sweep without explicit thresholds is safe.
+            return await self._run_sync(
+                self.engine.staleness_sweep,
+                stale_days=int(data.get("stale_days", 7)),
+                delete_days=int(data.get("delete_days", 30)),
             )
 
         if normalized == "NETBOX_SEARCH":

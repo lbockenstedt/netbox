@@ -938,6 +938,17 @@ class NetboxEngine:
         ("switch_ip", "text", "Switch IP", "dcim.device"),
         ("switch_port", "text", "Switch port", "dcim.device"),
         ("last_seen", "text", "Last seen", "dcim.device"),
+        # last_seen also on VMs + IP addresses so the staleness sweep can age
+        # every sync-owned object uniformly. Re-uses the same global field;
+        # _ensure_custom_fields attaches the extra content types (a duplicate-
+        # name row resolves to the existing field, never a second create).
+        ("last_seen", "text", "Last seen", "virtualization.virtualmachine"),
+        ("last_seen", "text", "Last seen", "ipam.ipaddress"),
+        # Decommission clock: set when staleness_sweep flips an object to
+        # offline (7d unseen); when it then ages past delete_days (30d) the
+        # object is deleted and its IPs free automatically. Text ISO timestamp.
+        ("decommissioned_at", "text", "Decommissioned at", "dcim.device"),
+        ("decommissioned_at", "text", "Decommissioned at", "virtualization.virtualmachine"),
         ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
         ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
     ]
@@ -1090,7 +1101,8 @@ class NetboxEngine:
     def _reuse_or_create_ip(self, addr: str, create_kwargs: Dict[str, Any],
                             bare_ip: str, iface_id: int, tenant: Any = None,
                             hostname: str = "", mac: str = "",
-                            source: str = "sync") -> Any:
+                            source: str = "sync",
+                            iface_type: str = "dcim.interface") -> Any:
         """Return an ``ipam.ip_address`` for ``addr`` (``host/prefix``), reusing
         an existing **global** record when one already exists and reassigning it
         to ``iface_id``, else creating a new one.
@@ -1114,7 +1126,8 @@ class NetboxEngine:
         except Exception as e:
             logger.debug("%s: existing-IP lookup %s failed: %s", source, addr, e)
         if ipobj:
-            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, addr)
+            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, addr,
+                             iface_type)
             return ipobj
 
         # 2) No existing record — create one.
@@ -1134,17 +1147,19 @@ class NetboxEngine:
             if not matches:
                 raise create_err
             ipobj = matches[0]
-            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, bare_ip)
+            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, bare_ip,
+                             iface_type)
             return ipobj
 
     def _reassign_ip(self, ipobj: Any, iface_id: int, tenant: Any,
-                     hostname: str, mac: str, source: str, addr: str) -> None:
+                     hostname: str, mac: str, source: str, addr: str,
+                     iface_type: str = "dcim.interface") -> None:
         """Reassign an existing ipam.ip_address to ``iface_id`` and best-effort
         tag tenant/dns_name/MAC. Never raises (reuse is best-effort)."""
         try:
             changed = False
             if getattr(ipobj, "assigned_object_id", None) != iface_id:
-                ipobj.assigned_object_type = "dcim.interface"
+                ipobj.assigned_object_type = iface_type
                 ipobj.assigned_object_id = iface_id
                 changed = True
             if tenant and getattr(ipobj, "tenant", None) != tenant.id:
@@ -1174,37 +1189,115 @@ class NetboxEngine:
         except Exception as e:
             logger.debug("%s: mac_address on IP %s skipped: %s", source, addr, e)
 
-    def _assign_vm_primary_ip4(self, vm_obj, ips: list, tenant=None) -> None:
-        """Best-effort: set ``vm.primary_ip4`` from the first IP in ``ips``.
+    def _stamp_last_seen(self, obj: Any, when: str = "") -> None:
+        """Write the ``last_seen`` custom field (ISO UTC) on ``obj`` so the
+        staleness sweep can age it. Best-effort: a missing field / save failure
+        is logged at DEBUG and swallowed — a staleness signal must never break
+        the sync that produced it. ``when`` defaults to now (UTC)."""
+        try:
+            ts = when or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            m = dict(obj.custom_fields or {})
+            if m.get("last_seen") != ts:
+                m["last_seen"] = ts
+                obj.custom_fields = m
+                obj.save()
+        except Exception as e:
+            logger.debug("stamp_last_seen on %r failed: %s", obj, e)
 
-        NetBox requires primary_ip4 to be assigned to one of the VM's
-        interfaces, so a vminterface is reused (or created) and the IP is
-        created against it. Never raises — a missing/unassignable IP must not
-        break the VM record it follows."""
-        if not ips:
-            return
-        ip_str = str(ips[0]).split("/")[0].strip()
-        if not ip_str:
+    def _assign_vm_primary_ip4(self, vm_obj, vm: dict, tenant=None) -> None:
+        """Build the VM's interfaces in NetBox from the per-interface records
+        the pxmx agent gathers, set ``primary_ip4`` from the first IP, and
+        journal-stamp each created vminterface + IP.
+
+        ``vm["interfaces"]`` is ``[{name, mac, ips:[..]}, ...]`` (pxmx agent
+        ``_vm_interfaces``). For each interface a vminterface is reused-by-name
+        (or created) carrying the native ``mac_address``; each guest IP becomes
+        an ``ipam.ip_address`` assigned to that vminterface via
+        ``_reuse_or_create_ip`` (global-IP uniqueness respected) and tagged with
+        the interface MAC. Falls back to a single ``eth0`` vminterface + the
+        legacy flat ``vm["ips"]`` list when the agent sent no interface records
+        (older spoke). Never raises — a missing/unassignable IP must not break
+        the VM record it follows."""
+        ifaces_in = list((vm or {}).get("interfaces") or [])
+        # Back-compat: an older pxmx agent that sent only a flat ``ips`` list
+        # (no per-interface MAC) → one eth0 vminterface holding those IPs.
+        if not ifaces_in:
+            flat_ips = list((vm or {}).get("ips") or [])
+            if flat_ips:
+                ifaces_in = [{"name": "eth0", "mac": "", "ips": flat_ips}]
+        if not ifaces_in:
             return
         try:
-            ifaces = list(self.nb.virtualization.vminterfaces.filter(virtual_machine_id=vm_obj.id))
-            iface = ifaces[0] if ifaces else None
-            if not iface:
-                iface = self.nb.virtualization.vminterfaces.create(
-                    virtual_machine=vm_obj.id, name="eth0")
-            full = ip_str if "/" in ip_str else f"{ip_str}/32"
-            ip_kwargs: Dict[str, Any] = {
-                "address": full,
-                "assigned_object_type": "virtualization.vminterface",
-                "assigned_object_id": iface.id,
-            }
-            if tenant:
-                ip_kwargs["tenant"] = tenant.id
-            ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
-            vm_obj.primary_ip4 = ip_obj.id
-            vm_obj.save()
+            existing = list(self.nb.virtualization.vminterfaces.filter(
+                virtual_machine_id=vm_obj.id))
         except Exception as e:
-            logger.debug("assign_vm_primary_ip4 %s failed: %s", ip_str, e)
+            logger.debug("assign_vm_primary_ip4: list vminterfaces %s failed: %s",
+                         vm_obj.id, e)
+            existing = []
+        by_name = {getattr(i, "name", ""): i for i in existing}
+        first_ip_id = None
+        for ifc in ifaces_in:
+            name = str(ifc.get("name") or "").strip() or "eth0"
+            mac = self._norm_mac(str(ifc.get("mac") or ""))
+            ips = [str(x).split("/")[0].strip() for x in (ifc.get("ips") or [])
+                   if str(x or "").strip()]
+            if not ips and not mac:
+                continue
+            try:
+                iface = by_name.get(name)
+                if iface is None:
+                    kw: Dict[str, Any] = {"virtual_machine": vm_obj.id, "name": name}
+                    if mac:
+                        kw["mac_address"] = mac
+                    iface = self.nb.virtualization.vminterfaces.create(**kw)
+                    self._journal("virtualization.vminterface", iface.id,
+                                   "hypervisor-vm-sync",
+                                   note=f"vminterface {name} for VM "
+                                        f"{getattr(vm_obj, 'name', '')}")
+                else:
+                    # Refresh the MAC if the interface exists but is MAC-less.
+                    if mac and not getattr(iface, "mac_address", None):
+                        try:
+                            iface.mac_address = mac
+                            iface.save()
+                        except Exception as e:
+                            logger.debug("assign_vm_primary_ip4: mac refresh %s: %s",
+                                         name, e)
+            except Exception as e:
+                logger.debug("assign_vm_primary_ip4: vminterface %s failed: %s", name, e)
+                continue
+            for ip_str in ips:
+                if not ip_str:
+                    continue
+                try:
+                    mask = self._mask_for_ip(ip_str)
+                    full = ip_str if "/" in ip_str else f"{ip_str}/{mask}"
+                    ip_kwargs: Dict[str, Any] = {
+                        "address": full,
+                        "assigned_object_type": "virtualization.vminterface",
+                        "assigned_object_id": iface.id,
+                    }
+                    if tenant:
+                        ip_kwargs["tenant"] = tenant.id
+                    ip_obj = self._reuse_or_create_ip(
+                        full, ip_kwargs, ip_str, iface.id, tenant,
+                        hostname=str(getattr(vm_obj, "name", "") or ""),
+                        mac=mac, source="hypervisor-vm-sync",
+                        iface_type="virtualization.vminterface")
+                    self._journal("ipam.ipaddress", ip_obj.id,
+                                   "hypervisor-vm-sync",
+                                   note=f"VM {getattr(vm_obj, 'name', '')} {name}")
+                    if first_ip_id is None:
+                        first_ip_id = getattr(ip_obj, "id", None)
+                except Exception as e:
+                    logger.debug("assign_vm_primary_ip4: IP %s on %s failed: %s",
+                                 ip_str, name, e)
+        if first_ip_id is not None:
+            try:
+                vm_obj.primary_ip4 = first_ip_id
+                vm_obj.save()
+            except Exception as e:
+                logger.debug("assign_vm_primary_ip4: set primary_ip4 failed: %s", e)
 
     # ---- firewall→NetBox device discovery sync helpers ---------------------
 
@@ -1304,7 +1397,8 @@ class NetboxEngine:
     _VM_SYNC_UNASSIGNED_KEY = "__unassigned__"
 
     def sync_vms(self, vms: list, tenant_slug: str = "",
-                 replace: bool = False) -> Dict[str, Any]:
+                 replace: bool = False,
+                 source_of_truth: str = "external") -> Dict[str, Any]:
         """Push a set of Proxmox VMs into NetBox virtualization records (grab-all).
 
         Each incoming VM carries its own ``tenant_slug`` (None/'' → created with
@@ -1436,12 +1530,30 @@ class NetboxEngine:
                         "proxmox_vmid": str(vm.get("vmid") or ""),
                         "proxmox_node": str(vm.get("node") or ""),
                         "proxmox_type": str(vm.get("type") or ""),
+                        # last_seen clocks the staleness sweep from this detection
+                        # (folded into the cf PATCH so it rides the same save — no
+                        # extra write per VM). Best-effort: a missing field is
+                        # swallowed by the cf-PATCH try/except below.
+                        "last_seen": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"),
                     }
                     if uid in existing:
                         obj = self.nb.virtualization.virtual_machines.get(existing[uid]["id"])
                         if not obj:
                             errors += 1
                             b["errors"] += 1
+                            continue
+                        # source_of_truth=="netbox" → NetBox is the source of truth
+                        # for VMs: only-add-missing. The VM already exists, so do
+                        # NOT overwrite any field Proxmox would otherwise clobber
+                        # (name/cluster/status/vcpus/disk/memory/tenant/proxmox_*).
+                        # We still refresh last_seen (a staleness signal, not a
+                        # truth field) so a seen VM isn't swept. "external"
+                        # (Proxmox is the source of truth) overwrites as before.
+                        if source_of_truth == "netbox":
+                            self._stamp_last_seen(obj)
+                            pushed += 1
+                            b["pushed"] += 1
                             continue
                         obj.name = name
                         if cluster_id:
@@ -1470,6 +1582,7 @@ class NetboxEngine:
                         except Exception as e:
                             logger.warning("sync_vms: custom_fields update %s skipped "
                                            "(field unprovisioned?): %s", uid, e)
+                        # last_seen is folded into ``cf`` above → rides the cf PATCH.
                     else:
                         # Create WITHOUT inline custom_fields: a create carrying
                         # custom_fields 400s ("Custom field 'proxmox_node' does
@@ -1501,8 +1614,10 @@ class NetboxEngine:
                         self._journal("virtualization.virtualmachine", obj.id,
                                       "hypervisor-vm-sync",
                                       note=f"VM {name} ({uid})")
-                    # primary_ip4 (best-effort) — needs a vminterface + IP assigned to it
-                    self._assign_vm_primary_ip4(obj, vm.get("ips") or [], tenant)
+                        # last_seen folded into ``cf`` above → rides the cf save.
+                    # vminterfaces + all IPs + primary_ip4 (best-effort) — built
+                    # from the per-interface records the pxmx agent gathers.
+                    self._assign_vm_primary_ip4(obj, vm, tenant)
                     pushed += 1
                     b["pushed"] += 1
                 except Exception as e:
@@ -1596,7 +1711,8 @@ class NetboxEngine:
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
                      defaults: Optional[Dict[str, Any]] = None,
-                     source: str = "opnsense") -> Dict[str, Any]:
+                     source: str = "opnsense",
+                     source_of_truth: str = "external") -> Dict[str, Any]:
         """Push a tenant's discovery-source device set into NetBox DCIM.
 
         Source = a discovery feed relayed by the hub (OPNsense DHCP leases +
@@ -1768,6 +1884,22 @@ class NetboxEngine:
                         ip_id = pip.get("id") if isinstance(pip, dict) else None
                         cf = row.get("custom_fields") or {}
                         we_own = _owns(cf)
+                        # source_of_truth=="netbox" → NetBox is the source of truth
+                        # for this device: only-add-missing. The device already
+                        # exists, so do NOT overwrite its IP's mac_address/dns_name
+                        # or rename it — only refresh last_seen (a staleness signal,
+                        # not a truth field). "external" (the discovery feed is the
+                        # source of truth) overwrites as before.
+                        if source_of_truth == "netbox":
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    self._stamp_last_seen(devobj)
+                            except Exception as e:
+                                logger.debug("sync_devices: last_seen refresh %s: %s",
+                                              ip_str, e)
+                            pushed += 1
+                            continue
                         if ip_id:
                             try:
                                 ipobj = self.nb.ipam.ip_addresses.get(ip_id)
@@ -1779,6 +1911,7 @@ class NetboxEngine:
                                     if hostname and hostname.lower() != "unknown":
                                         ipobj.dns_name = hostname
                                     ipobj.save()
+                                    self._stamp_last_seen(ipobj)
                             except Exception as e:
                                 logger.debug("sync_devices: refresh IP %s failed: %s", ip_str, e)
                         if we_own and hostname and hostname.lower() != "unknown":
@@ -1788,8 +1921,17 @@ class NetboxEngine:
                                     devobj.name = hostname
                                     devobj.save()
                                     used_names.add(hostname.strip().lower())
+                                    self._stamp_last_seen(devobj)
                             except Exception as e:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
+                        else:
+                            # Not renaming, but still mark the device seen.
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    self._stamp_last_seen(devobj)
+                            except Exception as e:
+                                logger.debug("sync_devices: last_seen %s: %s", ip_str, e)
                         pushed += 1
                     else:
                         # No existing device for this IP — create one we own.
@@ -1857,10 +1999,14 @@ class NetboxEngine:
                         if tenant:
                             create_kwargs["tenant"] = tenant.id
                         devobj = self.nb.dcim.devices.create(**create_kwargs)
-                        # Ownership tag (best-effort; missing custom field => no-op).
+                        # Ownership tag + last_seen stamp (best-effort; missing
+                        # custom field => no-op). last_seen clocks the staleness
+                        # sweep from the moment NetBox first saw this device.
                         try:
                             merged = dict(devobj.custom_fields or {})
                             merged["discovered_from"] = source_tag
+                            merged["last_seen"] = datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ")
                             devobj.custom_fields = merged
                             devobj.save()
                         except Exception as e:
@@ -1903,6 +2049,7 @@ class NetboxEngine:
                             self._journal("ipam.ipaddress", ipobj.id,
                                           "firewall-discovery",
                                           note=f"IP {real_ip}/{mask} → {name}")
+                            self._stamp_last_seen(ipobj)
                         pushed += 1
                 except Exception as e:
                     errors += 1
@@ -1930,7 +2077,8 @@ class NetboxEngine:
                     "devices_total": len(devices or [])}
 
     def sync_access_tracker(self, sessions: list, tenant_slug: str = "",
-                            defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                            defaults: Optional[Dict[str, Any]] = None,
+                            source_of_truth: str = "netbox") -> Dict[str, Any]:
         """Pull ClearPass Access Tracker / session data INTO NetBox (NAC→IPAM
         reverse sync; the bidirectional counterpart to ``EndpointSyncMixin``).
 
@@ -2223,6 +2371,7 @@ class NetboxEngine:
                         self._journal("ipam.ipaddress", ipobj.id,
                                       "realtime-nac-access-tracker",
                                       note=f"framed IP {ip}/{mask} → {name}")
+                        self._stamp_last_seen(ipobj, when=start_time)
 
                     # Switch topology (best-effort, never breaks the sync).
                     if nas_ip:
@@ -2262,6 +2411,254 @@ class NetboxEngine:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "sessions_total": len(sessions or [])}
+
+    # ── staleness sweep (cluster-wide age-out of sync-owned objects) ──────────
+
+    # Objects with NO ``last_seen`` custom field are NEVER swept — that protects
+    # hand-managed inventory (a human-created device/VM the syncs never touched
+    # has no last_seen, so the sweep can't age it out). Only objects the syncs
+    # stamped (every detection writes last_seen) are eligible.
+    @staticmethod
+    def _parse_iso_cf(ts: str) -> Optional[datetime]:
+        """Parse a ``last_seen``/``decommissioned_at`` CF timestamp (ISO, Z or
+        offset) into an aware UTC datetime. None on unparseable/empty."""
+        s = str(ts or "").strip()
+        if not s:
+            return None
+        try:
+            # Normalize a trailing Z to +00:00 for fromisoformat.
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def staleness_sweep(self, stale_days: int = 7,
+                        delete_days: int = 30) -> Dict[str, Any]:
+        """Cluster-wide age-out of sync-owned NetBox objects.
+
+        For every device / VM / unassigned IP that carries a ``last_seen``
+        custom field (i.e. a sync touched it — hand-managed objects have none
+        and are never swept):
+          • not seen for ``stale_days`` (default 7) and not already offline →
+            set ``status = "offline"`` + ``decommissioned_at = now`` + journal
+            entry ``staleness-sweep: decommissioned: not seen since <last_seen>``.
+          • offline with ``decommissioned_at`` older than ``delete_days``
+            (default 30) → DELETE the object. Deleting a device/VM frees its
+            assigned IPs automatically (assigned_object goes null); an
+            unassigned stale IP record is deleted so the address becomes free.
+
+        Returns ``{status, scanned, decommissioned, deleted, ip_freed,
+        errors, message, per_tenant}``. Never raises — a sweep failure is
+        per-object and recorded in ``errors`` so one bad row can't abort the run.
+        """
+        scanned = 0; decommissioned = 0; deleted = 0; ip_freed = 0; errors = 0
+        first_err: Optional[str] = None
+        per_tenant: Dict[str, Dict[str, int]] = {}
+
+        def _bucket(slug: str) -> Dict[str, int]:
+            key = str(slug or "").strip() or self._VM_SYNC_UNASSIGNED_KEY
+            b = per_tenant.get(key)
+            if b is None:
+                b = {"decommissioned": 0, "deleted": 0, "errors": 0}
+                per_tenant[key] = b
+            return b
+
+        def _tenant_slug(row: dict) -> str:
+            t = row.get("tenant")
+            if isinstance(t, dict):
+                return str(t.get("slug") or "")
+            return ""
+
+        def _age_days(ts: str) -> Optional[float]:
+            dt = self._parse_iso_cf(ts)
+            if dt is None:
+                return None
+            return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            self._ensure_custom_fields()
+            cutoff_stale = float(stale_days)
+            cutoff_delete = float(delete_days)
+
+            # ── devices (cluster-wide, no tenant scope) ──
+            try:
+                dev_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+            except Exception as e:
+                return {"status": "ERROR", "message": f"failed to list devices: {e}",
+                        "scanned": 0, "decommissioned": 0, "deleted": 0,
+                        "ip_freed": 0, "errors": 0, "per_tenant": per_tenant}
+            for row in dev_rows:
+                cf = row.get("custom_fields") or {}
+                ls = str(cf.get("last_seen") or "").strip()
+                if not ls:
+                    continue  # never swept (hand-managed)
+                scanned += 1
+                tslug = _tenant_slug(row)
+                age = _age_days(ls)
+                if age is None:
+                    continue
+                st = row.get("status")
+                status_val = str((st.get("value") if isinstance(st, dict)
+                                  else st) or "")
+                decomm = str(cf.get("decommissioned_at") or "").strip()
+                try:
+                    obj = self.nb.dcim.devices.get(row["id"])
+                    if not obj:
+                        continue
+                    # 30-day delete: already offline + decommissioned_at aged out.
+                    if status_val == "offline" and decomm:
+                        dage = _age_days(decomm)
+                        if dage is not None and dage >= cutoff_delete:
+                            obj.delete()
+                            deleted += 1
+                            _bucket(tslug)["deleted"] += 1
+                            self._journal("dcim.device", row["id"], "staleness-sweep",
+                                           note=f"deleted: offline since {decomm}")
+                            continue
+                    # 7-day decommission: unseen past stale_days + not yet offline.
+                    if age >= cutoff_stale and status_val != "offline":
+                        try:
+                            obj.status = "offline"
+                            m = dict(obj.custom_fields or {})
+                            m["decommissioned_at"] = now_iso
+                            obj.custom_fields = m
+                            obj.save()
+                            decommissioned += 1
+                            _bucket(tslug)["decommissioned"] += 1
+                            self._journal("dcim.device", row["id"], "staleness-sweep",
+                                           note=f"decommissioned: not seen since {ls}")
+                        except Exception as e:
+                            errors += 1
+                            _bucket(tslug)["errors"] += 1
+                            if first_err is None:
+                                first_err = f"decomm device {row['id']}: {e}"
+                except Exception as e:
+                    errors += 1
+                    _bucket(tslug)["errors"] += 1
+                    if first_err is None:
+                        first_err = f"device {row['id']}: {e}"
+                    logger.debug("staleness_sweep: device %s failed: %s", row["id"], e)
+
+            # ── VMs (cluster-wide; only those we own via proxmox_unique_id) ──
+            try:
+                vm_rows = self._api_get_all("/api/virtualization/virtual-machines/",
+                                            {"limit": 500})
+            except Exception as e:
+                logger.warning("staleness_sweep: list VMs failed: %s", e)
+                vm_rows = []
+            for row in vm_rows:
+                cf = row.get("custom_fields") or {}
+                if not str(cf.get("proxmox_unique_id") or "").strip():
+                    continue  # not sync-owned → never swept
+                ls = str(cf.get("last_seen") or "").strip()
+                if not ls:
+                    continue
+                scanned += 1
+                tslug = _tenant_slug(row)
+                age = _age_days(ls)
+                if age is None:
+                    continue
+                status = row.get("status")
+                status_val = str((status.get("value") if isinstance(status, dict)
+                                  else status) or "")
+                decomm = str(cf.get("decommissioned_at") or "").strip()
+                try:
+                    obj = self.nb.virtualization.virtual_machines.get(row["id"])
+                    if not obj:
+                        continue
+                    if status_val == "offline" and decomm:
+                        dage = _age_days(decomm)
+                        if dage is not None and dage >= cutoff_delete:
+                            obj.delete()
+                            deleted += 1
+                            _bucket(tslug)["deleted"] += 1
+                            self._journal("virtualization.virtualmachine", row["id"],
+                                           "staleness-sweep",
+                                           note=f"deleted: offline since {decomm}")
+                            continue
+                    if age >= cutoff_stale and status_val != "offline":
+                        try:
+                            obj.status = "offline"
+                            m = dict(obj.custom_fields or {})
+                            m["decommissioned_at"] = now_iso
+                            obj.custom_fields = m
+                            obj.save()
+                            decommissioned += 1
+                            _bucket(tslug)["decommissioned"] += 1
+                            self._journal("virtualization.virtualmachine", row["id"],
+                                           "staleness-sweep",
+                                           note=f"decommissioned: not seen since {ls}")
+                        except Exception as e:
+                            errors += 1
+                            _bucket(tslug)["errors"] += 1
+                            if first_err is None:
+                                first_err = f"decomm VM {row['id']}: {e}"
+                except Exception as e:
+                    errors += 1
+                    _bucket(tslug)["errors"] += 1
+                    if first_err is None:
+                        first_err = f"VM {row['id']}: {e}"
+                    logger.debug("staleness_sweep: VM %s failed: %s", row["id"], e)
+
+            # ── unassigned stale IPs (free the address) ──
+            # IPs still assigned to a kept device are freed by that device's
+            # delete above; here we only delete IPs that are already unassigned
+            # (assigned_object_id null) + carry our last_seen + aged past
+            # delete_days, so an orphaned IP record releases its address.
+            try:
+                ip_rows = self._api_get_all("/api/ipam/ip-addresses/", {"limit": 500})
+            except Exception as e:
+                logger.warning("staleness_sweep: list IPs failed: %s", e)
+                ip_rows = []
+            for row in ip_rows:
+                cf = row.get("custom_fields") or {}
+                ls = str(cf.get("last_seen") or "").strip()
+                if not ls:
+                    continue
+                # assigned? (a_terminations / assigned_object_id). Skip assigned —
+                # the owning device/VM sweep (or NetBox's cascade on delete)
+                # handles those.
+                assigned = row.get("assigned_object_id")
+                if row.get("assigned_object_type") and assigned is not None:
+                    continue
+                scanned += 1
+                age = _age_days(ls)
+                if age is None or age < cutoff_delete:
+                    continue
+                try:
+                    obj = self.nb.ipam.ip_addresses.get(row["id"])
+                    if obj:
+                        obj.delete()
+                        ip_freed += 1
+                        self._journal("ipam.ipaddress", row["id"], "staleness-sweep",
+                                       note=f"freed: unassigned, last seen {ls}")
+                except Exception as e:
+                    errors += 1
+                    if first_err is None:
+                        first_err = f"IP {row['id']}: {e}"
+                    logger.debug("staleness_sweep: IP %s failed: %s", row["id"], e)
+
+            msg = (f"swept {scanned} object(s): {decommissioned} decommissioned, "
+                   f"{deleted} deleted, {ip_freed} IP(s) freed, {errors} errors")
+            if errors and first_err:
+                msg += f" — first error: {first_err}"
+                logger.warning("staleness_sweep: %s", msg)
+            else:
+                logger.info("staleness_sweep: %s", msg)
+            return {"status": "SUCCESS", "scanned": scanned,
+                    "decommissioned": decommissioned, "deleted": deleted,
+                    "ip_freed": ip_freed, "errors": errors, "message": msg,
+                    "per_tenant": per_tenant}
+        except Exception as e:
+            logger.error("staleness_sweep failed: %s", e)
+            return {"status": "ERROR", "message": str(e), "scanned": scanned,
+                    "decommissioned": decommissioned, "deleted": deleted,
+                    "ip_freed": ip_freed, "errors": errors, "per_tenant": per_tenant}
 
     def search(self, query: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """
