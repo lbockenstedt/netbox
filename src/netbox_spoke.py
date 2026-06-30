@@ -406,6 +406,16 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine.get_tenant_vmid_range,
                                         tenant_slug=data.get("tenant_slug", ""))
 
+        if normalized == "NETBOX_PROVISION_CUSTOM_FIELDS":
+            # WebUI "Apply schema changes" button (Setup/IPAM → edit/add a
+            # NetBox instance). force=True re-runs the full idempotent
+            # verify/attach pass over CUSTOM_FIELDS_SPEC so an existing install
+            # can pick up newly-added fields without a reinstall, and re-running
+            # it never errors when the fields are already present. Returns the
+            # engine's report dict (status/total/present/created/attached/...).
+            return await self._run_sync(self.engine._ensure_custom_fields,
+                                        force=True)
+
         logger.warning(f"Unknown NetBox command: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 

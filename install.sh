@@ -577,50 +577,18 @@ NBCUST
         ok "CUSTOM_VALIDATORS already present in configuration.py"
     fi
 
-    # 3) Ensure vmid_start/vmid_end integer custom fields on tenancy.tenant
-    #    (idempotent via get_or_create; content_types set each run).
-    LM_CF_OUT=$("$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
-from extras.models import CustomField
-from extras.choices import CustomFieldTypeChoices
-from django.contrib.contenttypes.models import ContentType
-from tenancy.models import Tenant
-tct = ContentType.objects.get_for_model(Tenant)
-for name, label in (('vmid_start', 'Proxmox VMID range start'), ('vmid_end', 'Proxmox VMID range end')):
-    cf, created = CustomField.objects.get_or_create(name=name, defaults={'type': CustomFieldTypeChoices.TYPE_INTEGER, 'label': label, 'description': 'Proxmox VMID allocation range (Lab Manager)'})
-    cf.content_types.set([tct])
-print('LM_CF_OK')
-" 2>/dev/null | tail -1 || echo "LM_CF_FAIL")
-    if [ "$LM_CF_OUT" = "LM_CF_OK" ]; then
-        ok "Proxmox VMID-range custom fields ensured on tenancy.tenant"
-    else
-        warn "VMID-range custom field creation did not report OK (continuing)"
-    fi
-
-    # 4) Ensure proxmox_vmid + proxmox_labels text custom fields on
-    #    virtualization.virtualmachine so the Hypervisor→NetBox VM sync can
-    #    surface each VM's Proxmox VMID and its tags/labels (semicolon-joined).
-    #    The netbox spoke's _ensure_custom_fields() also self-heals these over
-    #    the REST API on the external NetBox (spoke-only deploys where this
-    #    Django-shell step doesn't run) — this is the official provisioning on
-    #    the NetBox host. Idempotent via get_or_create; content_types set each
-    #    run so an existing-but-unattached field is repaired (the "does not
-    #    exist for this object type" trap).
-    LM_VM_CF_OUT=$("$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
-from extras.models import CustomField
-from extras.choices import CustomFieldTypeChoices
-from django.contrib.contenttypes.models import ContentType
-from virtualization.models import VirtualMachine
-vct = ContentType.objects.get_for_model(VirtualMachine)
-for name, label in (('proxmox_vmid', 'Proxmox VMID'), ('proxmox_labels', 'Proxmox labels')):
-    cf, created = CustomField.objects.get_or_create(name=name, defaults={'type': CustomFieldTypeChoices.TYPE_TEXT, 'label': label, 'description': 'Proxmox VM attribute (Lab Manager VM sync)'})
-    cf.content_types.set([vct])
-print('LM_VM_CF_OK')
-" 2>/dev/null | tail -1 || echo "LM_VM_CF_FAIL")
-    if [ "$LM_VM_CF_OUT" = "LM_VM_CF_OK" ]; then
-        ok "Proxmox VMID + labels custom fields ensured on virtualization.virtualmachine"
-    else
-        warn "VM VMID/labels custom field creation did not report OK (continuing)"
-    fi
+    # NOTE: Lab Manager custom fields (vmid_start/vmid_end, proxmox_vmid,
+    # proxmox_labels, discovered_from, mac_address, switch_ip/port, last_seen,
+    # decommissioned_at, proxmox_unique_id/node/type) are NO LONGER provisioned
+    # here via the Django manage.py shell. They are provisioned in ONE place —
+    # section E below — over the NetBox REST API, from the shared
+    # custom_fields_spec.CUSTOM_FIELDS_SPEC module (the same spec the netbox
+    # spoke's _ensure_custom_fields self-heals from and the WebUI "Apply schema
+    # changes" button runs). That single source of truth guarantees a fresh
+    # install, an update, and a manual button-apply produce an identical schema
+    # with no drift and no partial change. It runs against NETBOX_URL (the local
+    # NetBox on a full-app install, or the external NetBox on a spoke-only
+    # deploy), and the spoke self-heals at startup as the safety net.
 
     chown -R "$SVC_USER:$SVC_USER" "$NB_APP_DIR"
 
@@ -766,70 +734,68 @@ DOTENV
 chmod 600 "$LM_DIR/netbox/.env"
 
 # ── Provision Lab Manager custom fields via the REST API ──────────────
-# Idempotent get-or-create for the custom fields the Proxmox/Hypervisor→IPAM
-# and Firewall→IPAM syncs write to. Runs whenever we have a NETBOX_URL +
-# NETBOX_TOKEN (local OR external NetBox), so it works in --spoke-only mode
-# against the external NetBox — unlike the Django manage.py shell step above,
-# which only runs on the full-app install path and is skipped when
-# install_all.sh invokes us with --spoke-only. The spoke also self-heals these
-# at startup (_ensure_custom_fields); this installer step is the durable
-# provision-on-install the user asked for. Best-effort: a transient API
-# failure warns and continues — it must never abort the spoke install.
+# THE single source of truth for the Lab Manager custom-field schema is
+# custom_fields_spec.CUSTOM_FIELDS_SPEC (in the cloned spoke repo at
+# $LM_DIR/netbox/src/custom_fields_spec.py). This block imports that spec and
+# provisions every (name, type, label, content_type) entry over the NetBox
+# REST API — the SAME list the netbox spoke's _ensure_custom_fields self-heals
+# from at startup and the WebUI "Apply schema changes" button runs. So a fresh
+# install, an update (re-run), and a manual button-apply all produce an
+# identical schema with no drift and no partial change.
+#
+# Idempotent + re-runnable: for each entry it get-or-creates the field AND
+# verifies the content_type is attached (PATCHing the union if missing) — the
+# "Custom field 'X' does not exist for this object type" trap an
+# existing-but-unattached field causes. Never errors when the fields are
+# already present. Runs whenever we have a NETBOX_URL + NETBOX_TOKEN (local OR
+# external NetBox), so it works in --spoke-only mode against the external
+# NetBox. Best-effort: a transient API failure warns and continues — it must
+# never abort the spoke install (the spoke self-heals at startup as the safety
+# net).
 if [ -n "${NETBOX_URL:-}" ] && [ -n "${NETBOX_TOKEN:-}" ] && command -v python3 >/dev/null 2>&1; then
-    step "Ensuring Lab Manager custom fields via NetBox REST API"
+    step "Ensuring Lab Manager custom fields via NetBox REST API (from custom_fields_spec)"
     set +e
-    "$LM_DIR/netbox/venv/bin/python3" - "$NETBOX_URL" "$NETBOX_TOKEN" <<'LMCF' | sed 's/^/   /'
+    "$LM_DIR/netbox/venv/bin/python3" - "$NETBOX_URL" "$NETBOX_TOKEN" "$LM_DIR/netbox/src" <<'LMCF' | sed 's/^/   /'
 import json, sys, urllib.request, urllib.error
+sys.path.insert(0, sys.argv[3])
+from custom_fields_spec import CUSTOM_FIELDS_SPEC as FIELDS
 url, token = sys.argv[1].rstrip("/"), sys.argv[2]
-FIELDS = [
-    ("proxmox_unique_id", "text", "Proxmox unique id", "virtualization.virtualmachine"),
-    ("proxmox_vmid",      "text", "Proxmox VMID",       "virtualization.virtualmachine"),
-    ("proxmox_node",      "text", "Proxmox node",       "virtualization.virtualmachine"),
-    ("proxmox_type",      "text", "Proxmox type",       "virtualization.virtualmachine"),
-    ("discovered_from",   "text", "Discovered from",    "dcim.device"),
-    ("mac_address",       "text", "MAC address",        "ipam.ipaddress"),
-    # mac_address also attaches to dcim.device (the access-tracker sync keys
-    # existing-device matching off the device's MAC custom field). The GET-skip
-    # below leaves an already-existing field as-is; the spoke self-heals the
-    # extra content-type at startup (_ensure_custom_fields).
-    ("mac_address",       "text", "MAC address",        "dcim.device"),
-    ("switch_ip",         "text", "Switch IP",          "dcim.device"),
-    ("switch_port",       "text", "Switch port",        "dcim.device"),
-    ("last_seen",         "text", "Last seen",          "dcim.device"),
-    # last_seen also on VMs + IP addresses for the staleness sweep. The GET-skip
-    # below leaves an already-existing field as-is; the spoke self-heals the
-    # extra content-type at startup (_ensure_custom_fields).
-    ("last_seen",         "text", "Last seen",          "virtualization.virtualmachine"),
-    ("last_seen",         "text", "Last seen",          "ipam.ipaddress"),
-    # Decommission clock set by staleness_sweep when it flips an object offline
-    # (7d unseen); aged past 30d the object is deleted + its IPs free.
-    ("decommissioned_at", "text", "Decommissioned at",  "dcim.device"),
-    ("decommissioned_at", "text", "Decommissioned at",  "virtualization.virtualmachine"),
-    ("vmid_start",        "integer", "Proxmox VMID range start", "tenancy.tenant"),
-    ("vmid_end",          "integer", "Proxmox VMID range end",   "tenancy.tenant"),
-]
 hdr = {"Authorization": f"Token {token}", "Content-Type": "application/json"}
 def _req(method, path, body=None):
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(f"{url}{path}", data=data, headers=hdr, method=method)
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.status, json.loads(r.read().decode() or "{}")
-ok = miss = 0
+ok = created = attached = skipped = 0
 for name, ftype, label, ct in FIELDS:
     try:
         st, resp = _req("GET", f"/api/extras/custom-fields/?name={name}")
-        if resp.get("count", 0) > 0:
-            ok += 1
-            continue
-        st, resp = _req("POST", "/api/extras/custom-fields/",
-                        {"name": name, "type": ftype, "label": label, "content_types": [ct]})
-        print(f"created {name} on {ct}")
-        miss += 1
+        results = resp.get("results") or []
+        if results:
+            cf = results[0]
+            cts = list(cf.get("content_types") or [])
+            if ct in cts:
+                ok += 1
+            else:
+                # Field exists but isn't attached to this object type — attach
+                # it (union, never replace) so writes don't 400. Same repair the
+                # spoke's _ensure_custom_fields performs at startup.
+                _req("PATCH", f"/api/extras/custom-fields/{cf.get('id')}/",
+                     {"content_types": cts + [ct]})
+                print(f"attached {name} to {ct}")
+                attached += 1
+        else:
+            _req("POST", "/api/extras/custom-fields/",
+                 {"name": name, "type": ftype, "label": label, "content_types": [ct]})
+            print(f"created {name} on {ct}")
+            created += 1
     except urllib.error.HTTPError as e:
-        print(f"SKIP {name}: HTTP {e.code} {e.reason}")
+        print(f"SKIP {name}/{ct}: HTTP {e.code} {e.reason}")
+        skipped += 1
     except Exception as e:
-        print(f"SKIP {name}: {e}")
-print(f"custom fields: {ok} present, {miss} created, {len(FIELDS)-ok-miss} skipped")
+        print(f"SKIP {name}/{ct}: {e}")
+        skipped += 1
+print(f"custom fields: {ok} present, {created} created, {attached} newly attached, {skipped} skipped (of {len(FIELDS)} spec entries)")
 LMCF
     set -e
     ok "Lab Manager custom fields ensured (see lines above)"

@@ -6,6 +6,8 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from custom_fields_spec import CUSTOM_FIELDS_SPEC
+
 # Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
 # when multiple IPAM queries arrive simultaneously.
 _netbox_http_sem = threading.Semaphore(1)
@@ -918,45 +920,20 @@ class NetboxEngine:
     # Custom fields the Lab Manager syncs write to. Provisioned idempotently
     # at spoke startup by _ensure_custom_fields() so the Proxmox/Hypervisor→IPAM
     # and Firewall→IPAM syncs don't 400 on a missing custom field (the
-    # installer also provisions these via the REST API, but the deployed
-    # external NetBox is reached spoke-only where the installer's Django-shell
-    # step doesn't run — this is the self-healing safety net). (name, type,
-    # label, content_type) — type is the NetBox REST custom-field type string.
-    _REQUIRED_CUSTOM_FIELDS = [
-        ("proxmox_unique_id", "text", "Proxmox unique id", "virtualization.virtualmachine"),
-        ("proxmox_vmid", "text", "Proxmox VMID", "virtualization.virtualmachine"),
-        ("proxmox_node", "text", "Proxmox node", "virtualization.virtualmachine"),
-        ("proxmox_type", "text", "Proxmox type", "virtualization.virtualmachine"),
-        ("proxmox_labels", "text", "Proxmox labels", "virtualization.virtualmachine"),
-        ("discovered_from", "text", "Discovered from", "dcim.device"),
-        ("mac_address", "text", "MAC address", "ipam.ipaddress"),
-        # mac_address attached to dcim.device too — the access-tracker sync keys
-        # existing-device matching by MAC (read off the device's custom field), so
-        # it can skip MACs already in NetBox (only-add-missing). Re-uses the same
-        # global custom field; _ensure_custom_fields attaches the extra content type.
-        ("mac_address", "text", "MAC address", "dcim.device"),
-        # Access-tracker (NAC→IPAM reverse sync) topology on the endpoint device:
-        ("switch_ip", "text", "Switch IP", "dcim.device"),
-        ("switch_port", "text", "Switch port", "dcim.device"),
-        ("last_seen", "text", "Last seen", "dcim.device"),
-        # last_seen also on VMs + IP addresses so the staleness sweep can age
-        # every sync-owned object uniformly. Re-uses the same global field;
-        # _ensure_custom_fields attaches the extra content types (a duplicate-
-        # name row resolves to the existing field, never a second create).
-        ("last_seen", "text", "Last seen", "virtualization.virtualmachine"),
-        ("last_seen", "text", "Last seen", "ipam.ipaddress"),
-        # Decommission clock: set when staleness_sweep flips an object to
-        # offline (7d unseen); when it then ages past delete_days (30d) the
-        # object is deleted and its IPs free automatically. Text ISO timestamp.
-        ("decommissioned_at", "text", "Decommissioned at", "dcim.device"),
-        ("decommissioned_at", "text", "Decommissioned at", "virtualization.virtualmachine"),
-        ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
-        ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
-    ]
+    # installer also provisions these, but the deployed external NetBox is
+    # reached spoke-only where the installer's Django-shell step doesn't run —
+    # this is the self-healing safety net). The list itself lives in
+    # ``custom_fields_spec.CUSTOM_FIELDS_SPEC`` — the ONE source of truth shared
+    # with install.sh (Django-shell + REST blocks) and the WebUI "Apply schema
+    # changes" button, so a fresh install, an update, and the button all
+    # provision exactly the same set. (name, type, label, content_type).
+    _REQUIRED_CUSTOM_FIELDS = CUSTOM_FIELDS_SPEC
 
-    def _ensure_custom_fields(self) -> None:
-        """Ensure each of _REQUIRED_CUSTOM_FIELDS exists AND is attached to its
-        content type on NetBox.
+    def _ensure_custom_fields(self, force: bool = False) -> Dict[str, Any]:
+        """Ensure each custom field in CUSTOM_FIELDS_SPEC exists AND is attached
+        to its content type on NetBox. Idempotent + safe to re-run any number
+        of times (the contract the WebUI "Apply schema changes" button relies
+        on: never errors if the changes are already there).
 
         A field can exist globally but be unassigned to the object type — in
         that case NetBox rejects writes with "Custom field 'X' does not exist
@@ -972,16 +949,36 @@ class NetboxEngine:
         clean run (every field present AND attached) sets the flag so subsequent
         syncs skip the list-all; a run with any WARNING leaves it unset so the
         next sync retries (self-healing until the provisioning gap closes).
+
+        ``force=True`` bypasses the per-process cache and re-runs the full
+        verify/attach pass — used by the NETBOX_PROVISION_CUSTOM_FIELDS command
+        (the WebUI button) so a manual apply always re-checks every field.
+
+        Returns a report dict: {status, total, present, created, attached,
+        already_attached, warnings}. ``status`` is "SUCCESS" (everything
+        present+attached, no warnings), "PARTIAL" (some warnings), or "ERROR"
+        (the field list itself couldn't be fetched).
         """
-        if getattr(self, "_cf_ensured", False):
-            return
+        report: Dict[str, Any] = {
+            "status": "SUCCESS", "total": len(self._REQUIRED_CUSTOM_FIELDS),
+            "present": 0, "created": 0, "attached": 0,
+            "already_attached": 0, "warnings": [],
+        }
+        if not force and getattr(self, "_cf_ensured", False):
+            # Cached clean run — everything is already present+attached. Report
+            # it as such rather than re-hitting the API.
+            report["already_attached"] = report["total"]
+            report["present"] = report["total"]
+            return report
         had_failure = False
         try:
             cf_api = self.nb.extras.custom_fields
             by_name = {str(f.name): f for f in cf_api.all()}
         except Exception as e:
             logger.warning("ensure_custom_fields: list failed: %s", e)
-            return  # leave _cf_ensured unset → next sync retries
+            report["status"] = "ERROR"
+            report["warnings"].append(f"list failed: {e}")
+            return report  # leave _cf_ensured unset → next sync retries
         for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
             cf = by_name.get(name)
             if cf is None:
@@ -989,10 +986,14 @@ class NetboxEngine:
                     cf = cf_api.create(name=name, type=ftype, label=label,
                                        content_types=[content_type])
                     logger.info("ensure_custom_fields: created %s on %s", name, content_type)
+                    report["created"] += 1
                 except Exception as e:
                     logger.warning("ensure_custom_fields: create %s failed: %s", name, e)
+                    report["warnings"].append(f"create {name} on {content_type}: {e}")
                     had_failure = True
                     continue
+            else:
+                report["present"] += 1
             # Verify the content type is attached (create may not attach it on
             # every NetBox version; a pre-existing field may be unattached).
             try:
@@ -1002,12 +1003,20 @@ class NetboxEngine:
                     cf.save()
                     logger.info("ensure_custom_fields: attached %s to %s",
                                 name, content_type)
+                    report["attached"] += 1
+                else:
+                    report["already_attached"] += 1
             except Exception as e:
                 logger.warning("ensure_custom_fields: attach %s to %s failed: %s",
                                name, content_type, e)
+                report["warnings"].append(f"attach {name} to {content_type}: {e}")
                 had_failure = True
-        if not had_failure:
+        if had_failure:
+            report["status"] = "PARTIAL"
+            self._cf_ensured = False  # retry next sync
+        else:
             self._cf_ensured = True
+        return report
 
     @staticmethod
     def _uniq_device_name(base: str, mac: str, real_ip: str,
