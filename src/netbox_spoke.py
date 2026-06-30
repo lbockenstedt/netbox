@@ -349,6 +349,15 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine.search,
                                         query=data.get("q", ""), tenant=data.get("tenant"))
 
+        if normalized == "NETBOX_TENANT_VMID_RANGE":
+            # LM hub VMID auto-allocation knob: read a tenant's
+            # vmid_start/vmid_end custom-field range + the proxmox_vmid values
+            # already in use on that tenant's VMs (inside the range), so the
+            # hub can pick the next free VMID. No range set → vmid_start/end
+            # None (caller falls back to Proxmox nextid).
+            return await self._run_sync(self.engine.get_tenant_vmid_range,
+                                        tenant_slug=data.get("tenant_slug", ""))
+
         logger.warning(f"Unknown NetBox command: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 

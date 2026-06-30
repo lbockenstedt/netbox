@@ -1064,68 +1064,124 @@ class NetboxEngine:
             logger.debug("resolve_site first-site fallback failed: %s", e)
         return None
 
+    # Per-tenant breakdown key used when a VM carries no tenant slug (untagged
+    # / no NetBox tenant). Mirrors the hub's VmSyncMixin._VM_SYNC_UNASSIGNED_KEY.
+    _VM_SYNC_UNASSIGNED_KEY = "__unassigned__"
+
     def sync_vms(self, vms: list, tenant_slug: str = "",
                  replace: bool = False) -> Dict[str, Any]:
-        """Push a tenant's Proxmox VM set into NetBox virtualization records.
+        """Push a set of Proxmox VMs into NetBox virtualization records (grab-all).
 
-        Each incoming VM is matched by ``custom_fields.proxmox_unique_id`` —
-        created if missing, updated if present. Clusters are auto-created.
-        ``primary_ip4`` is set from the first IP in each VM's ``ips`` list.
-        When ``replace`` AND a NetBox tenant slug are provided, NetBox VMs of
-        that tenant (carrying our unique_id custom field) not in the incoming
-        set are deleted. Replace-delete is skipped when unscoped (global) so a
-        global sync can't delete another tenant's records.
+        Each incoming VM carries its own ``tenant_slug`` (None/'' → created with
+        no NetBox tenant, i.e. a global/unassigned record). The batch
+        ``tenant_slug`` is only a fallback for VMs that don't carry one (legacy
+        callers). Each VM is matched by ``custom_fields.proxmox_unique_id`` —
+        created if missing, updated if present; a VM that changed tenants just
+        gets its ``tenant`` updated (never deleted-and-recreated). Clusters are
+        auto-created; ``primary_ip4`` is set from the first IP in each VM's
+        ``ips`` list.
 
-        Returns ``{status, pushed, errors, skipped, deleted, vms_total, message}``.
+        When ``replace`` is set, NetBox VMs carrying our ``proxmox_unique_id``
+        custom field whose uid is NOT in the incoming full set are deleted
+        (cluster-wide — the VM was destroyed in Proxmox). Manually-created
+        NetBox VMs (no ``proxmox_unique_id``) are never touched, so a global
+        sync can't delete records it doesn't own.
+
+        Returns ``{status, pushed, errors, skipped, deleted, vms_total,
+        message, per_tenant}`` where ``per_tenant`` maps tenant-slug (or
+        ``__unassigned__``) → ``{pushed, errors, skipped, deleted, vms_total}``
+        so the hub can record per-tenant last-sync status from one batch.
         """
         pushed = 0; errors = 0; skipped = 0; deleted = 0
-        try:
-            tenant = None
-            if tenant_slug:
-                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+        per_tenant: Dict[str, Dict[str, int]] = {}
+        UNASSIGNED = self._VM_SYNC_UNASSIGNED_KEY
 
+        def _bucket(slug: Optional[str]) -> Dict[str, int]:
+            key = str(slug or "").strip() or UNASSIGNED
+            b = per_tenant.get(key)
+            if b is None:
+                b = {"pushed": 0, "errors": 0, "skipped": 0,
+                     "deleted": 0, "vms_total": 0}
+                per_tenant[key] = b
+            return b
+
+        # slug -> tenant object cache (None for unassigned). '' → None.
+        tenant_cache: Dict[str, Any] = {}
+
+        def _resolve_tenant(slug: Optional[str]):
+            s = str(slug or "").strip()
+            if not s:
+                return None
+            if s in tenant_cache:
+                return tenant_cache[s]
+            try:
+                t = self.nb.tenancy.tenants.get(slug=s)
+            except Exception as e:
+                logger.debug("sync_vms: resolve tenant %s failed: %s", s, e)
+                t = None
+            tenant_cache[s] = t
+            return t
+
+        try:
             incoming: Dict[str, Dict[str, Any]] = {}
             for vm in (vms or []):
                 uid = str((vm or {}).get("unique_id") or "").strip()
                 if not uid:
                     skipped += 1
+                    _bucket((vm or {}).get("tenant_slug") or tenant_slug)["skipped"] += 1
                     continue
+                # Backfill a missing per-VM slug from the legacy batch slug.
+                if not str((vm or {}).get("tenant_slug") or "").strip() and tenant_slug:
+                    vm = dict(vm or {})
+                    vm["tenant_slug"] = tenant_slug
                 incoming[uid] = vm or {}
 
-            # Index existing NetBox VMs by proxmox_unique_id custom field.
+            # Index ALL existing NetBox VMs that carry a proxmox_unique_id
+            # (proxmox-sourced) — cluster-wide, so replace-delete can remove
+            # VMs destroyed in Proxmox regardless of which tenant owns them.
             existing: Dict[str, dict] = {}  # uid -> raw row dict (carries "id")
-            list_params: Dict[str, Any] = {"limit": 500}
-            if tenant_slug:
-                list_params["tenant"] = tenant_slug
             try:
-                rows = self._api_get_all("/api/virtualization/virtual-machines/", list_params)
+                rows = self._api_get_all("/api/virtualization/virtual-machines/",
+                                         {"limit": 500})
             except Exception as e:
                 return {"status": "ERROR",
                         "message": f"failed to list NetBox VMs: {e}",
                         "pushed": 0, "errors": 0, "skipped": skipped,
-                        "deleted": 0, "vms_total": len(incoming)}
+                        "deleted": 0, "vms_total": len(incoming),
+                        "per_tenant": per_tenant}
             for row in rows:
                 cf = row.get("custom_fields") or {}
                 uid = str((cf.get("proxmox_unique_id") or "").strip())
                 if uid:
                     existing[uid] = row
 
-            # Replace-with-delete — only when tenant-scoped (a global list
-            # would mix other tenants' records into the delete set).
-            if replace and tenant_slug:
+            # Replace-delete (cluster-wide): drop proxmox-sourced NetBox VMs
+            # whose uid is no longer in the incoming full set. Attribute each
+            # delete to the row's tenant for per-tenant reporting.
+            if replace:
                 for uid, row in list(existing.items()):
                     if uid in incoming:
                         continue
+                    rslug = ""
+                    rten = row.get("tenant")
+                    if isinstance(rten, dict):
+                        rslug = str(rten.get("slug") or "")
                     try:
                         obj = self.nb.virtualization.virtual_machines.get(row["id"])
                         if obj:
                             obj.delete()
                             deleted += 1
+                            _bucket(rslug)["deleted"] += 1
                     except Exception as e:
                         errors += 1
+                        _bucket(rslug)["errors"] += 1
                         logger.debug("sync_vms: delete stale %s failed: %s", uid, e)
 
             for uid, vm in incoming.items():
+                vslug = vm.get("tenant_slug")
+                tenant = _resolve_tenant(vslug)
+                b = _bucket(vslug)
+                b["vms_total"] += 1
                 try:
                     cluster_id = self._ensure_vm_cluster(
                         str(vm.get("cluster") or "").strip(), tenant)
@@ -1144,6 +1200,7 @@ class NetboxEngine:
                         obj = self.nb.virtualization.virtual_machines.get(existing[uid]["id"])
                         if not obj:
                             errors += 1
+                            b["errors"] += 1
                             continue
                         obj.name = name
                         if cluster_id:
@@ -1155,8 +1212,9 @@ class NetboxEngine:
                             obj.disk = int(disk_gb)
                         if mem_mb:
                             obj.memory = mem_mb
-                        if tenant:
-                            obj.tenant = tenant.id
+                        # Set/clear so a VM that changed tags moves tenant
+                        # (or drops to unassigned) without a delete+recreate.
+                        obj.tenant = tenant.id if tenant else None
                         merged = dict(obj.custom_fields or {})
                         merged.update(cf)
                         obj.custom_fields = merged
@@ -1178,21 +1236,88 @@ class NetboxEngine:
                     # primary_ip4 (best-effort) — needs a vminterface + IP assigned to it
                     self._assign_vm_primary_ip4(obj, vm.get("ips") or [], tenant)
                     pushed += 1
+                    b["pushed"] += 1
                 except Exception as e:
                     errors += 1
+                    b["errors"] += 1
                     logger.debug("sync_vms: upsert %s failed: %s", uid, e)
 
             msg = (f"{pushed} VM(s) upserted, {deleted} deleted, "
                    f"{skipped} skipped, {errors} errors")
-            logger.info("sync_vms tenant=%s: %s", tenant_slug or "<global>", msg)
+            logger.info("sync_vms: %s", msg)
             return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
                     "skipped": skipped, "deleted": deleted,
-                    "vms_total": len(incoming), "message": msg}
+                    "vms_total": len(incoming), "message": msg,
+                    "per_tenant": per_tenant}
         except Exception as e:
             logger.error("sync_vms failed: %s", e)
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
-                    "vms_total": len(vms or [])}
+                    "vms_total": len(vms or []), "per_tenant": per_tenant}
+
+    def get_tenant_vmid_range(self, tenant_slug: str = "") -> Dict[str, Any]:
+        """Read a NetBox tenant's Proxmox VMID allocation range + in-use VMIDs.
+
+        Returns ``{status, vmid_start, vmid_end, used_vmids}`` where
+        ``vmid_start``/``vmid_end`` come from the tenant's
+        ``vmid_start``/``vmid_end`` custom fields (None when the tenant has no
+        range set), and ``used_vmids`` is the sorted list of ``proxmox_vmid``
+        custom-field values on that tenant's VMs (only those inside the range,
+        when a range is set). Used by the LM hub's VMID auto-allocation knob
+        to pick the next free VMID inside a tenant's range.
+
+        ``status`` is ``SUCCESS`` with ``vmid_start``/``vmid_end`` = None when
+        the tenant exists but has no range (→ caller falls back to Proxmox
+        nextid), or ``ERROR`` when the tenant can't be resolved / the read
+        fails (→ caller also falls back).
+        """
+        try:
+            slug = str(tenant_slug or "").strip()
+            if not slug:
+                return {"status": "ERROR", "message": "no tenant_slug",
+                        "vmid_start": None, "vmid_end": None, "used_vmids": []}
+            tenant = self.nb.tenancy.tenants.get(slug=slug)
+            if not tenant:
+                return {"status": "ERROR",
+                        "message": f"NetBox tenant '{slug}' not found",
+                        "vmid_start": None, "vmid_end": None, "used_vmids": []}
+            cf = tenant.custom_fields or {}
+            start = cf.get("vmid_start")
+            end = cf.get("vmid_end")
+
+            def _as_int(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+
+            start_i, end_i = _as_int(start), _as_int(end)
+
+            used: List[int] = []
+            try:
+                rows = self._api_get_all("/api/virtualization/virtual-machines/",
+                                         {"limit": 500, "tenant": slug})
+            except Exception as e:
+                logger.debug("get_tenant_vmid_range: list VMs for %s failed: %s",
+                             slug, e)
+                rows = []
+            for row in rows:
+                rc = (row.get("custom_fields") or {})
+                vid = _as_int(rc.get("proxmox_vmid"))
+                if vid is None:
+                    continue
+                if start_i is not None and end_i is not None:
+                    if not (start_i <= vid <= end_i):
+                        continue
+                used.append(vid)
+            used = sorted(set(used))
+            return {"status": "SUCCESS",
+                    "vmid_start": start_i, "vmid_end": end_i,
+                    "used_vmids": used}
+        except Exception as e:
+            logger.error("get_tenant_vmid_range failed: %s", e)
+            return {"status": "ERROR", "message": str(e),
+                    "vmid_start": None, "vmid_end": None, "used_vmids": []}
 
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,

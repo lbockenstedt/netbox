@@ -435,6 +435,167 @@ except Exception as e:
         fi
     fi
 
+    # ── Lab Manager Proxmox VMID-range custom fields + validators ──────────
+    # Idempotent: safe on a fresh install and on a re-run. Adds integer custom
+    # fields vmid_start/vmid_end to tenancy.tenant, ships a custom-validator
+    # module (range start<=end + no overlap between tenants; a VM's
+    # proxmox_vmid must fall inside its tenant's range), and injects
+    # CUSTOM_VALIDATORS into configuration.py. Both validators are LENIENT when
+    # a range is unset so the Proxmox→NetBox sync keeps working before/without
+    # ranges — enforcement strengthens as tenants get ranges.
+    step "Ensuring Lab Manager VMID-range custom fields + validators"
+    NB_PROJECT_DIR="$NB_APP_DIR/netbox"   # manage.py lives here (on sys.path)
+
+    # 1) Validator module — written to the project root so configuration.py can
+    #    `import lm_custom_validators`. Overwritten each run (it is ours).
+    cat > "$NB_PROJECT_DIR/lm_custom_validators.py" <<'LMCV'
+"""Lab Manager custom validators for NetBox (loaded via CUSTOM_VALIDATORS in
+configuration.py by the Lab Manager NetBox installer).
+
+Enforces per-tenant Proxmox VMID allocation ranges:
+  * ProxmoxRangeValidator (tenancy.tenant) — vmid_start <= vmid_end, and a
+    tenant's [vmid_start, vmid_end] range must not overlap another tenant's.
+  * ProxmoxVmidInRangeValidator (virtualization.virtualmachine) — a VM's
+    proxmox_vmid custom field must fall inside its assigned tenant's range.
+
+Both are LENIENT when a range is unset: a tenant with no vmid_start/vmid_end is
+unconstrained (operators adopt ranges incrementally), and a VM whose tenant has
+no range (or which has no proxmox_vmid) is skipped. This keeps the Lab Manager
+Proxmox→NetBox sync working before/without ranges.
+
+Imported by configuration.py at Django startup, so NetBox-internal model
+imports are deferred into validate() (apps are loaded by then). Only
+extras.validators (which itself imports no NetBox models) is imported at
+module load.
+"""
+from extras.validators import CustomValidator
+
+
+class ProxmoxRangeValidator(CustomValidator):
+    """Validate a tenancy.tenant's Proxmox VMID range on create/save."""
+
+    def validate(self, instance, request):
+        cf = getattr(instance, "custom_field_data", {}) or {}
+        start = cf.get("vmid_start")
+        end = cf.get("vmid_end")
+        # Lenient: no range set -> nothing to enforce.
+        if start in (None, "") or end in (None, ""):
+            return
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            self.fail("vmid_start/vmid_end must be integers", field="custom_fields")
+            return
+        if start > end:
+            self.fail("vmid_start (%d) must be <= vmid_end (%d)" % (start, end),
+                      field="custom_fields")
+            return
+        # No overlap with another tenant's range.
+        from tenancy.models import Tenant
+        qs = Tenant.objects.filter(
+            custom_field_data__vmid_start__lte=end,
+            custom_field_data__vmid_end__gte=start,
+        )
+        if instance.pk:
+            qs = qs.exclude(pk=instance.pk)
+        for other in qs:
+            ocf = getattr(other, "custom_field_data", {}) or {}
+            os_, oe = ocf.get("vmid_start"), ocf.get("vmid_end")
+            if os_ in (None, "") or oe in (None, ""):
+                continue  # JSON lookup matches missing keys as null; skip empties
+            try:
+                os_, oe = int(os_), int(oe)
+            except (TypeError, ValueError):
+                continue
+            if os_ <= end and oe >= start:
+                self.fail("VMID range [%d-%d] overlaps tenant '%s' [%d-%d]"
+                          % (start, end, other.name, os_, oe),
+                          field="custom_fields")
+                return
+
+
+class ProxmoxVmidInRangeValidator(CustomValidator):
+    """Validate a virtualization.virtualmachine's proxmox_vmid is inside its
+    assigned tenant's [vmid_start, vmid_end] range."""
+
+    def validate(self, instance, request):
+        cf = getattr(instance, "custom_field_data", {}) or {}
+        vmid = cf.get("proxmox_vmid")
+        # Lenient: not a Proxmox-sourced VM -> skip.
+        if vmid in (None, ""):
+            return
+        try:
+            vmid = int(vmid)
+        except (TypeError, ValueError):
+            return  # non-numeric proxmox_vmid — leave to other validation
+        tenant_pk = getattr(instance, "tenant_id", None)
+        if not tenant_pk:
+            # Untagged/global VM — no tenant range to enforce. Lenient.
+            return
+        from tenancy.models import Tenant
+        try:
+            tenant = Tenant.objects.get(pk=tenant_pk)
+        except Tenant.DoesNotExist:
+            return
+        tcf = getattr(tenant, "custom_field_data", {}) or {}
+        start = tcf.get("vmid_start")
+        end = tcf.get("vmid_end")
+        # Lenient: tenant has no range -> skip.
+        if start in (None, "") or end in (None, ""):
+            return
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            return
+        if not (start <= vmid <= end):
+            self.fail("proxmox_vmid %d is outside tenant '%s' VMID range [%d-%d]"
+                      % (vmid, tenant.name, start, end),
+                      field="custom_fields")
+LMCV
+    ok "lm_custom_validators.py written"
+
+    # 2) Inject CUSTOM_VALIDATORS into configuration.py (guarded, like
+    #    API_TOKEN_PEPPERS) — append only if absent, never overwrite.
+    if ! grep -q "^CUSTOM_VALIDATORS" "$NB_CFG"; then
+        cat >> "$NB_CFG" <<'NBCUST'
+
+# Lab Manager Proxmox VMID-range custom validators (added by the LM installer).
+from lm_custom_validators import ProxmoxRangeValidator, ProxmoxVmidInRangeValidator
+CUSTOM_VALIDATORS = {
+    'tenancy.tenant': [ProxmoxRangeValidator()],
+    'virtualization.virtualmachine': [ProxmoxVmidInRangeValidator()],
+}
+NBCUST
+        ok "CUSTOM_VALIDATORS added to configuration.py"
+        # Restart so the running NetBox loads the validators (also restarted
+        # below after gunicorn setup, but this covers the re-run case where the
+        # services are already up).
+        systemctl restart netbox netbox-rq 2>/dev/null || true
+    else
+        ok "CUSTOM_VALIDATORS already present in configuration.py"
+    fi
+
+    # 3) Ensure vmid_start/vmid_end integer custom fields on tenancy.tenant
+    #    (idempotent via get_or_create; content_types set each run).
+    LM_CF_OUT=$("$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
+from extras.models import CustomField
+from extras.choices import CustomFieldTypeChoices
+from django.contrib.contenttypes.models import ContentType
+from tenancy.models import Tenant
+tct = ContentType.objects.get_for_model(Tenant)
+for name, label in (('vmid_start', 'Proxmox VMID range start'), ('vmid_end', 'Proxmox VMID range end')):
+    cf, created = CustomField.objects.get_or_create(name=name, defaults={'type': CustomFieldTypeChoices.TYPE_INTEGER, 'label': label, 'description': 'Proxmox VMID allocation range (Lab Manager)'})
+    cf.content_types.set([tct])
+print('LM_CF_OK')
+" 2>/dev/null | tail -1 || echo "LM_CF_FAIL")
+    if [ "$LM_CF_OUT" = "LM_CF_OK" ]; then
+        ok "Proxmox VMID-range custom fields ensured on tenancy.tenant"
+    else
+        warn "VMID-range custom field creation did not report OK (continuing)"
+    fi
+
     chown -R "$SVC_USER:$SVC_USER" "$NB_APP_DIR"
 
     # ── gunicorn service ─────────────────────────────────────
