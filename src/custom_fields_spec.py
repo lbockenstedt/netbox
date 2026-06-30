@@ -44,6 +44,12 @@ CUSTOM_FIELDS_SPEC = [
     ("proxmox_labels", "text", "Proxmox labels", "virtualization.virtualmachine"),
     # Firewall → IPAM device discovery sync (dcim.device)
     ("discovered_from", "text", "Discovered from", "dcim.device"),
+    # Network Devices (nw) POLL NOW inventory sync — links a NetBox dcim.device
+    # to its nw fleet device id (match key for the polled switch/gateway upsert)
+    # and marks dcim.interfaces the nw sync created (so replace-delete only ever
+    # touches our interfaces, never manually-created ones).
+    ("nw_device_id", "text", "NW device id", "dcim.device"),
+    ("nw_managed", "text", "NW managed", "dcim.interface"),
     # MAC-keyed matching shared by the NAC↔IPAM (ClearPass access tracker) and
     # firewall discovery syncs. Attached to both ipam.ipaddress and dcim.device.
     ("mac_address", "text", "MAC address", "ipam.ipaddress"),

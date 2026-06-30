@@ -2236,6 +2236,323 @@ class NetboxEngine:
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "devices_total": len(devices or [])}
 
+    def sync_nw_device(self, device: dict, interfaces: list,
+                       tenant_slug: str = "",
+                       defaults: Optional[Dict[str, Any]] = None,
+                       source: str = "Network Devices") -> Dict[str, Any]:
+        """Upsert ONE polled network device (switch/gateway) as a NetBox
+        ``dcim.device`` with its ``dcim.interfaces`` + per-interface IPs.
+
+        Called by the hub's POLL NOW path (``NETBOX_SYNC_NW_DEVICE``) with the
+        live SNMP/CLI/REST poll of a single fleet device. This is the
+        network-device **inventory** path — distinct from the scheduled
+        ARP-neighbor→endpoint ``sync_devices`` flow: here the polled device
+        ITSELF becomes the NetBox device, and its learned interfaces become
+        ``dcim.interfaces`` (name/MAC/status/speed) with an ``ipam.ip_address``
+        per interface IP.
+
+        Match the existing device by ``custom_fields.nw_device_id`` (the fleet
+        id) first, else by name within the tenant. Create if missing, tagged
+        ``discovered_from=<source>`` + ``nw_device_id=<id>``; set ``primary_ip4``
+        from the device management address. Each incoming interface is upserted
+        by name (native ``mac_address``, ``status``, ``speed``) with a
+        reused/created IP attached. ``replace=True`` deletes interfaces we
+        created (``nw_managed`` marker) whose name is absent from the incoming
+        set — so NetBox tracks the live switch without touching manually-created
+        interfaces.
+
+        ``defaults`` (``device_type``/``role``/``site`` slugs) are required to
+        CREATE a device; an existing match needs only an interface refresh. A
+        missing default on the create path returns an ERROR naming it (never
+        silently fail).
+
+        Returns ``{status, pushed, errors, skipped, deleted, interfaces_total,
+        device_id, message}``.
+        """
+        pushed = 0; errors = 0; skipped = 0; deleted = 0
+        first_err: Optional[str] = None
+        defaults = defaults or {}
+        source_tag = str(source or "Network Devices").strip() or "Network Devices"
+        try:
+            self._ensure_custom_fields()
+            dev = device or {}
+            nw_id = str(dev.get("id") or "").strip()
+            name = str(dev.get("name") or "").strip()
+            mgmt_ip = str(dev.get("address") or "").strip().split("/")[0].strip()
+            if not name and not nw_id:
+                return {"status": "ERROR", "message": "nw device has no name/id",
+                        "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
+                        "interfaces_total": len(interfaces or []), "device_id": None}
+            if not name:
+                name = f"nw-{nw_id[:8]}" if nw_id else "nw-device"
+
+            # Case-insensitive tenant resolve (slug OR name → canonical slug),
+            # mirroring sync_vms' lookup so a mixed-case/none tenant still lands.
+            tenant = None
+            if tenant_slug:
+                tenant = self._resolve_tenant_ci(tenant_slug)
+
+            # ── Resolve the existing device (by nw_device_id cf, else by name) ──
+            existing = None
+            try:
+                params: Dict[str, Any] = {"limit": 500}
+                if tenant:
+                    params["tenant"] = tenant.id
+                rows = self._api_get_all("/api/dcim/devices/", params)
+            except Exception as e:
+                return {"status": "ERROR",
+                        "message": f"failed to list NetBox devices: {e}",
+                        "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
+                        "interfaces_total": len(interfaces or []), "device_id": None}
+            for row in rows:
+                cf = row.get("custom_fields") or {}
+                if nw_id and str(cf.get("nw_device_id") or "").strip() == nw_id:
+                    existing = row
+                    break
+            if existing is None and name:
+                nl = name.lower()
+                for row in rows:
+                    if str(row.get("name") or "").strip().lower() == nl:
+                        existing = row
+                        break
+
+            # ── Create the device if missing (defaults required) ────────────────
+            if existing is None:
+                dt_slug = str(defaults.get("device_type") or "").strip()
+                role_slug = str(defaults.get("role") or "").strip()
+                site_slug = str(defaults.get("site") or "").strip()
+                missing = [k for k, v in (("device_type", dt_slug),
+                                         ("role", role_slug),
+                                         ("site", site_slug)) if not v]
+                if missing:
+                    return {"status": "ERROR",
+                            "message": f"cannot create nw device {name!r}: missing "
+                                       f"default(s): {', '.join(missing)} "
+                                       f"(set them in Setup → Network Devices → "
+                                       f"IPAM Sync defaults)",
+                            "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
+                            "interfaces_total": len(interfaces or []), "device_id": None}
+                try:
+                    dt = self.nb.dcim.device_types.get(slug=dt_slug)
+                    role = self.nb.dcim.device_roles.get(slug=role_slug)
+                    site = self.nb.dcim.sites.get(slug=site_slug)
+                    ck: Dict[str, Any] = {"name": name, "device_type": dt.id,
+                                          "role": role.id, "site": site.id}
+                    if tenant:
+                        ck["tenant"] = tenant.id
+                    devobj = self.nb.dcim.devices.create(**ck)
+                    # Tag ownership + link to the fleet id (best-effort cf PATCH).
+                    try:
+                        devobj.custom_fields = {
+                            "discovered_from": source_tag,
+                            "nw_device_id": nw_id,
+                            "last_seen": datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"),
+                        }
+                        devobj.save()
+                    except Exception as e:
+                        logger.warning("sync_nw_device: tag new device %s skipped: %s",
+                                       nw_id or name, e)
+                    self._journal("dcim.device", devobj.id, "nw-poll",
+                                  note=f"NW device {name} ({nw_id or 'no id'})")
+                except Exception as e:
+                    return {"status": "ERROR",
+                            "message": f"create nw device {name!r} failed: {e}",
+                            "pushed": 0, "errors": 1, "skipped": 0, "deleted": 0,
+                            "interfaces_total": len(interfaces or []), "device_id": None}
+            else:
+                devobj = self.nb.dcim.devices.get(existing["id"])
+                if not devobj:
+                    return {"status": "ERROR",
+                            "message": f"existing nw device {existing['id']} vanished",
+                            "pushed": 0, "errors": 1, "skipped": 0, "deleted": 0,
+                            "interfaces_total": len(interfaces or []), "device_id": None}
+                # Refresh ownership + last_seen (best-effort).
+                try:
+                    cf = dict(devobj.custom_fields or {})
+                    cf["discovered_from"] = source_tag
+                    if nw_id:
+                        cf["nw_device_id"] = nw_id
+                    cf["last_seen"] = datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")
+                    devobj.custom_fields = cf
+                    devobj.save()
+                except Exception as e:
+                    logger.debug("sync_nw_device: refresh device cf skipped: %s", e)
+
+            dev_id = devobj.id
+
+            # ── Index existing interfaces on this device by name (lowercased) ──
+            existing_ifaces: Dict[str, Any] = {}
+            try:
+                for ifc in self.nb.dcim.interfaces.filter(device=dev_id):
+                    existing_ifaces[str(getattr(ifc, "name", "") or "").lower()] = ifc
+            except Exception as e:
+                logger.debug("sync_nw_device: list interfaces for %s failed: %s",
+                             dev_id, e)
+
+            incoming_names: set = set()
+            for ifc in (interfaces or []):
+                if not isinstance(ifc, dict):
+                    continue
+                ifname = str(ifc.get("name") or "").strip()
+                if not ifname:
+                    skipped += 1
+                    continue
+                incoming_names.add(ifname.lower())
+                mac = self._norm_mac(ifc.get("mac", ""))
+                status = "active" if str(ifc.get("status") or "").strip().lower() in (
+                    "up", "active", "1") else "planned"
+                speed_val = ifc.get("speed")
+                try:
+                    sv = int(speed_val) if speed_val not in (None, "") else 0
+                except (TypeError, ValueError):
+                    sv = 0
+                # ifSpeed is bps; NetBox interface speed is Kbps. Convert when the
+                # value is clearly bps (>=1e6); else assume already Kbps.
+                speed_kbps = sv // 1000 if sv >= 1_000_000 else sv
+                ip = str(ifc.get("ip") or "").strip().split("/")[0].strip()
+                vlan = str(ifc.get("vlan") or "").strip()
+                try:
+                    match = existing_ifaces.get(ifname.lower())
+                    if match is None:
+                        ik: Dict[str, Any] = {"device": dev_id, "name": ifname,
+                                              "type": "other", "status": status}
+                        if mac:
+                            ik["mac_address"] = mac
+                        if speed_kbps > 0:
+                            ik["speed"] = speed_kbps
+                        # VLAN: best-effort tagged vlan (NetBox expects a list of
+                        # vlan ids or a single untagged vlan id). We only have a
+                        # vlan label/number from the poll; skip unless numeric.
+                        iface_obj = self.nb.dcim.interfaces.create(**ik)
+                        try:
+                            iface_obj.custom_fields = {"nw_managed": "true"}
+                            iface_obj.save()
+                        except Exception as e:
+                            logger.debug("sync_nw_device: tag new iface %s skipped: %s",
+                                         ifname, e)
+                    else:
+                        iface_obj = match
+                        changed = False
+                        if getattr(iface_obj, "status", None) != status:
+                            iface_obj.status = status
+                            changed = True
+                        if mac and str(getattr(iface_obj, "mac_address", "") or "") != mac:
+                            iface_obj.mac_address = mac
+                            changed = True
+                        if speed_kbps > 0 and int(getattr(iface_obj, "speed", 0) or 0) != speed_kbps:
+                            iface_obj.speed = speed_kbps
+                            changed = True
+                        if changed:
+                            iface_obj.save()
+                        # Mark an adopted interface as nw-managed (best-effort) so
+                        # replace-delete can track it on later polls.
+                        try:
+                            m = dict(iface_obj.custom_fields or {})
+                            if str(m.get("nw_managed") or "") != "true":
+                                m["nw_managed"] = "true"
+                                iface_obj.custom_fields = m
+                                iface_obj.save()
+                        except Exception as e:
+                            logger.debug("sync_nw_device: mark adopted iface %s: %s",
+                                         ifname, e)
+
+                    # Per-interface IP (reuse global record, attach to the iface).
+                    if ip:
+                        mask = self._mask_for_ip(ip)
+                        ip_kwargs = {
+                            "address": f"{ip}/{mask}",
+                            "assigned_object_type": "dcim.interface",
+                            "assigned_object_id": iface_obj.id,
+                        }
+                        if tenant:
+                            ip_kwargs["tenant"] = tenant.id
+                        try:
+                            ipobj = self._reuse_or_create_ip(
+                                f"{ip}/{mask}", ip_kwargs, ip, iface_obj.id,
+                                tenant=tenant, hostname="", mac=mac,
+                                source="nw-poll", iface_type="dcim.interface")
+                            # Device primary_ip4 from the management address.
+                            if mgmt_ip and ip == mgmt_ip and \
+                                    not getattr(devobj, "primary_ip4", None):
+                                devobj.primary_ip4 = ipobj.id
+                                devobj.save()
+                            self._stamp_last_seen(ipobj)
+                        except Exception as e:
+                            errors += 1
+                            if first_err is None:
+                                first_err = f"iface {ifname} ip {ip}: {e}"
+                            logger.debug("sync_nw_device: iface %s ip %s failed: %s",
+                                         ifname, ip, e)
+                    pushed += 1
+                except Exception as e:
+                    errors += 1
+                    if first_err is None:
+                        first_err = f"iface {ifname}: {e}"
+                    logger.debug("sync_nw_device: iface %s failed: %s", ifname, e)
+
+            # ── Replace-delete: drop nw-managed interfaces no longer reported ──
+            for ifname_l, ifc_obj in list(existing_ifaces.items()):
+                    if ifname_l in incoming_names:
+                        continue
+                    try:
+                        cf = dict(ifc_obj.custom_fields or {})
+                        if str(cf.get("nw_managed") or "") != "true":
+                            continue  # never delete a manually-created interface
+                        ifc_obj.delete()
+                        deleted += 1
+                    except Exception as e:
+                        errors += 1
+                        if first_err is None:
+                            first_err = f"delete iface {ifname_l}: {e}"
+                        logger.debug("sync_nw_device: delete stale iface %s failed: %s",
+                                     ifname_l, e)
+
+            msg = (f"nw device {name} upserted: {pushed} interface(s), "
+                   f"{deleted} deleted, {skipped} skipped, {errors} errors")
+            if errors and first_err:
+                msg += f" — first error: {first_err}"
+                logger.warning("sync_nw_device: %s", msg)
+            else:
+                logger.info("sync_nw_device: %s", msg)
+            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
+                    "skipped": skipped, "deleted": deleted,
+                    "interfaces_total": len(interfaces or []),
+                    "device_id": dev_id, "message": msg}
+        except Exception as e:
+            logger.error("sync_nw_device failed: %s", e)
+            return {"status": "ERROR", "message": str(e), "pushed": pushed,
+                    "errors": errors, "skipped": skipped, "deleted": deleted,
+                    "interfaces_total": len(interfaces or []), "device_id": None}
+
+    def _resolve_tenant_ci(self, slug: str) -> Any:
+        """Case-insensitive tenant resolve: lower(slug) ∪ lower(name) → tenant
+        object. Returns None when not found. Mirrors sync_vms' per-batch lookup
+        but as a reusable helper. NetBox slugs are conventionally lowercase, but
+        a configured tenant_slug may arrive mixed-case or as the display name."""
+        s = str(slug or "").strip()
+        if not s:
+            return None
+        try:
+            lut: Dict[str, str] = {}
+            for t in self._api_get_all("/api/tenancy/tenants/"):
+                tslug = str((t or {}).get("slug") or "").strip()
+                if not tslug:
+                    continue
+                lut.setdefault(tslug.lower(), tslug)
+                nm = str((t or {}).get("name") or "").strip()
+                if nm:
+                    lut.setdefault(nm.lower(), tslug)
+            canon = lut.get(s.lower()) or s
+            return self.nb.tenancy.tenants.get(slug=canon)
+        except Exception as e:
+            logger.debug("resolve_tenant_ci %s failed: %s", s, e)
+            try:
+                return self.nb.tenancy.tenants.get(slug=s)
+            except Exception:
+                return None
+
     def sync_access_tracker(self, sessions: list, tenant_slug: str = "",
                             defaults: Optional[Dict[str, Any]] = None,
                             source_of_truth: str = "netbox") -> Dict[str, Any]:

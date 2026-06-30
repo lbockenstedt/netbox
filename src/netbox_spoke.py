@@ -362,6 +362,22 @@ class NetboxSpoke(BaseSpoke):
                 source_of_truth=data.get("source_of_truth", "external"),
             )
 
+        if normalized == "NETBOX_SYNC_NW_DEVICE":
+            # Network Devices POLL NOW inventory sync. The hub relays a single
+            # polled switch/gateway (SNMP/CLI/REST) here for an upsert into a
+            # NetBox dcim.device + its dcim.interfaces + per-interface IPs — the
+            # device itself becomes the NetBox record (distinct from the
+            # ARP-neighbor→endpoint NETBOX_SYNC_DEVICES flow). ``defaults`` carry
+            # the role/device_type/site slugs required to create the device.
+            return await self._run_sync(
+                self.engine.sync_nw_device,
+                device=data.get("device", {}),
+                interfaces=data.get("interfaces", []),
+                tenant_slug=data.get("tenant_slug", ""),
+                defaults=data.get("defaults", {}),
+                source=data.get("source", "Network Devices"),
+            )
+
         if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
             # Realtime NAC→IPAM reverse sync. The hub relays a tenant's recent
             # ClearPass Access Tracker / session records (CPPM_GET_RECENT_SESSIONS,
