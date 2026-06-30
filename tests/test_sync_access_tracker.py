@@ -40,6 +40,9 @@ def _engine_with(existing_rows, tenant_obj=None):
     eng = NetboxEngine("http://localhost", "tok")
     eng.nb = MagicMock()
     eng.nb.tenancy.tenants.get.return_value = tenant_obj
+    # Default: no pre-existing global IP → _reuse_or_create_ip creates. Tests
+    # that need the reuse path override ip_addresses.get.return_value.
+    eng.nb.ipam.ip_addresses.get.return_value = None
     eng._api_get_all = MagicMock(return_value=existing_rows)
     eng._api_get = MagicMock(return_value={"results": []})
     return eng

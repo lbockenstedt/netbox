@@ -3,6 +3,7 @@ import re
 import pynetbox
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
@@ -1054,6 +1055,125 @@ class NetboxEngine:
             logger.debug("ensure_vm_cluster %s failed: %s", name, e)
             return None
 
+    # ── change-log + IP-reuse helpers (shared by the external-source syncs) ────
+
+    def _journal(self, content_type: str, object_id: Any, module: str,
+                 note: str = "") -> None:
+        """Write a NetBox **journal entry** on ``object_id`` (of NetBox content
+        type ``dcim.device`` / ``ipam.ipaddress`` / ``dcim.interface`` /
+        ``virtualization.virtualmachine`` / ``dcim.cable``) recording which LM
+        sync module created it and when. The Journal tab is NetBox's native
+        per-object change log, so this is the audit trail the user asked for
+        ("comments to the change log for what module added the entry and when").
+
+        Best-effort by design: a journal failure (older NetBox without the
+        journal endpoint, a content-type mismatch, a transient 4xx) must NEVER
+        break a sync — it's logged at DEBUG and swallowed.
+        """
+        if not object_id:
+            return
+        try:
+            when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            comment = f"Created by LM {module} sync at {when}"
+            if note:
+                comment += f" — {note}"
+            self.nb.extras.journal_entries.create(
+                assigned_object_type=content_type,
+                assigned_object_id=int(object_id),
+                kind="info",
+                comment=comment,
+            )
+        except Exception as e:
+            logger.debug("journal %s/%s (%s) failed: %s",
+                         content_type, object_id, module, e)
+
+    def _reuse_or_create_ip(self, addr: str, create_kwargs: Dict[str, Any],
+                            bare_ip: str, iface_id: int, tenant: Any = None,
+                            hostname: str = "", mac: str = "",
+                            source: str = "sync") -> Any:
+        """Return an ``ipam.ip_address`` for ``addr`` (``host/prefix``), reusing
+        an existing **global** record when one already exists and reassigning it
+        to ``iface_id``, else creating a new one.
+
+        NetBox enforces global IP uniqueness, so a discovery source that tries
+        to create an IP the IPAM already provisioned 400s with ``Duplicate IP
+        address found in global table`` — that was failing ~every record in
+        ``sync_devices`` because NetBox (the IPAM source of truth) already held
+        most of the discovered addresses. Reusing the existing record and
+        pointing it at the discovered device's NIC fixes that without losing the
+        address, and tags MAC/tenant/dns_name best-effort.
+
+        The create path propagates a real failure (so the caller records it);
+        the reuse path never raises. A mask-mismatch duplicate on create falls
+        back to a bare-IP lookup + reassign so the record isn't lost.
+        """
+        # 1) Proactive reuse: an exact host/prefix match already exists.
+        ipobj = None
+        try:
+            ipobj = self.nb.ipam.ip_addresses.get(address=addr)
+        except Exception as e:
+            logger.debug("%s: existing-IP lookup %s failed: %s", source, addr, e)
+        if ipobj:
+            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, addr)
+            return ipobj
+
+        # 2) No existing record — create one.
+        try:
+            ipobj = self.nb.ipam.ip_addresses.create(**create_kwargs)
+            self._tag_ip_mac(ipobj, mac, source, addr)
+            return ipobj
+        except Exception as create_err:
+            # 3) Mask-mismatch duplicate: the existing record has a different
+            # prefix length than we computed, so the exact lookup missed it but
+            # the create still 400s. Fall back to a bare-IP lookup + reassign.
+            matches: List[Any] = []
+            try:
+                matches = list(self.nb.ipam.ip_addresses.filter(address=bare_ip))
+            except Exception:
+                matches = []
+            if not matches:
+                raise create_err
+            ipobj = matches[0]
+            self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, bare_ip)
+            return ipobj
+
+    def _reassign_ip(self, ipobj: Any, iface_id: int, tenant: Any,
+                     hostname: str, mac: str, source: str, addr: str) -> None:
+        """Reassign an existing ipam.ip_address to ``iface_id`` and best-effort
+        tag tenant/dns_name/MAC. Never raises (reuse is best-effort)."""
+        try:
+            changed = False
+            if getattr(ipobj, "assigned_object_id", None) != iface_id:
+                ipobj.assigned_object_type = "dcim.interface"
+                ipobj.assigned_object_id = iface_id
+                changed = True
+            if tenant and getattr(ipobj, "tenant", None) != tenant.id:
+                ipobj.tenant = tenant.id
+                changed = True
+            if hostname and hostname.lower() != "unknown" and \
+                    (getattr(ipobj, "dns_name", "") or "") != hostname:
+                ipobj.dns_name = hostname
+                changed = True
+            if changed:
+                ipobj.save()
+        except Exception as e:
+            logger.debug("%s: reuse-IP %s reassign failed: %s", source, addr, e)
+        self._tag_ip_mac(ipobj, mac, source, addr)
+
+    def _tag_ip_mac(self, ipobj: Any, mac: str, source: str, addr: str) -> None:
+        """Best-effort write ``mac_address`` onto an ipam.ip_address custom
+        field. Never raises (the IP is still synced without the MAC tag)."""
+        if not mac:
+            return
+        try:
+            m = dict(ipobj.custom_fields or {})
+            if m.get("mac_address") != mac:
+                m["mac_address"] = mac
+                ipobj.custom_fields = m
+                ipobj.save()
+        except Exception as e:
+            logger.debug("%s: mac_address on IP %s skipped: %s", source, addr, e)
+
     def _assign_vm_primary_ip4(self, vm_obj, ips: list, tenant=None) -> None:
         """Best-effort: set ``vm.primary_ip4`` from the first IP in ``ips``.
 
@@ -1378,6 +1498,9 @@ class NetboxEngine:
                         except Exception as e:
                             logger.warning("sync_vms: custom_fields set on new VM %s "
                                            "skipped (field unprovisioned?): %s", uid, e)
+                        self._journal("virtualization.virtualmachine", obj.id,
+                                      "hypervisor-vm-sync",
+                                      note=f"VM {name} ({uid})")
                     # primary_ip4 (best-effort) — needs a vminterface + IP assigned to it
                     self._assign_vm_primary_ip4(obj, vm.get("ips") or [], tenant)
                     pushed += 1
@@ -1721,6 +1844,8 @@ class NetboxEngine:
                             devobj.save()
                         except Exception as e:
                             logger.debug("sync_devices: discovered_from tag skipped: %s", e)
+                        self._journal("dcim.device", devobj.id, "firewall-discovery",
+                                      note=f"device {name}")
                         # mgmt interface + IP (mac on the IP) + primary_ip4.
                         if real_ip:
                             # Use the top-level dcim.interfaces endpoint with
@@ -1742,17 +1867,21 @@ class NetboxEngine:
                                 ip_kwargs["tenant"] = tenant.id
                             if hostname and hostname.lower() != "unknown":
                                 ip_kwargs["dns_name"] = hostname
-                            ipobj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
-                            if mac:
-                                try:
-                                    m = dict(ipobj.custom_fields or {})
-                                    m["mac_address"] = mac
-                                    ipobj.custom_fields = m
-                                    ipobj.save()
-                                except Exception as e:
-                                    logger.debug("sync_devices: mac_address on IP %s skipped: %s", real_ip, e)
+                            # Reuse an existing global IP record (NetBox enforces
+                            # global uniqueness — creating a duplicate 400s with
+                            # "Duplicate IP address found in global table", which
+                            # was failing ~every record because the IPAM already
+                            # held most of these addresses) and reassign it to
+                            # this mgmt interface instead of creating a new one.
+                            ipobj = self._reuse_or_create_ip(
+                                f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id,
+                                tenant=tenant, hostname=hostname, mac=mac,
+                                source="firewall-discovery")
                             devobj.primary_ip4 = ipobj.id
                             devobj.save()
+                            self._journal("ipam.ipaddress", ipobj.id,
+                                          "firewall-discovery",
+                                          note=f"IP {real_ip}/{mask} → {name}")
                         pushed += 1
                 except Exception as e:
                     errors += 1
@@ -2040,6 +2169,9 @@ class NetboxEngine:
                         devobj.save()
                     except Exception as e:
                         logger.debug("sync_access_tracker: cf tag skipped: %s", e)
+                    self._journal("dcim.device", devobj.id,
+                                  "realtime-nac-access-tracker",
+                                  note=f"endpoint {name} (MAC {mac})")
 
                     # NIC interface (native MAC) + framed IP + primary_ip4.
                     nic = None
@@ -2057,9 +2189,19 @@ class NetboxEngine:
                             ip_kwargs["tenant"] = tenant.id
                         if username:
                             ip_kwargs["dns_name"] = username
-                        ipobj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
+                        # Reuse an existing global IP record (NetBox enforces
+                        # global uniqueness) and reassign it to this NIC instead
+                        # of creating a duplicate that 400s — same fix as
+                        # sync_devices, for the same root cause.
+                        ipobj = self._reuse_or_create_ip(
+                            f"{ip}/{mask}", ip_kwargs, ip, nic.id,
+                            tenant=tenant, hostname=username, mac=mac,
+                            source="realtime-nac-access-tracker")
                         devobj.primary_ip4 = ipobj.id
                         devobj.save()
+                        self._journal("ipam.ipaddress", ipobj.id,
+                                      "realtime-nac-access-tracker",
+                                      note=f"framed IP {ip}/{mask} → {name}")
 
                     # Switch topology (best-effort, never breaks the sync).
                     if nas_ip:

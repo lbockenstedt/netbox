@@ -41,6 +41,9 @@ def _engine_with(existing_rows, tenant_obj=None):
     eng = NetboxEngine("http://localhost", "tok")
     eng.nb = MagicMock()
     eng.nb.tenancy.tenants.get.return_value = tenant_obj  # _Obj(id=1) or None
+    # Default: no pre-existing global IP → _reuse_or_create_ip creates. Tests
+    # that need the reuse/refresh path override ip_addresses.get.return_value.
+    eng.nb.ipam.ip_addresses.get.return_value = None
     eng._api_get_all = MagicMock(return_value=existing_rows)
     eng._api_get = MagicMock(return_value={"results": []})  # no containing prefix → /32
     return eng
@@ -396,3 +399,57 @@ def test_ensure_custom_fields_swallows_api_error():
     # Must not raise — a restricted token must never break the spoke.
     eng._ensure_custom_fields()
     eng.nb.extras.custom_fields.create.assert_not_called()
+
+
+# ── global duplicate-IP reuse (the 183-error fix) ───────────────────────────
+
+def test_sync_devices_reuses_existing_global_ip_instead_of_duplicate_create():
+    # The IP already exists globally in NetBox (the IPAM provisioned it — NetBox
+    # is the IPAM source of truth). The create branch must REUSE the existing
+    # ipam.ip_address and reassign it to the new device's mgmt interface + tag
+    # MAC, instead of ipam.ip_addresses.create — which 400s "Duplicate IP
+    # address found in global table" and was failing ~every record.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    existing_ip = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = existing_ip   # global duplicate
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-05"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    # No duplicate create — the existing record was reused + reassigned.
+    eng.nb.ipam.ip_addresses.create.assert_not_called()
+    assert existing_ip.assigned_object_id == 100
+    assert existing_ip.assigned_object_type == "dcim.interface"
+    assert existing_ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+    existing_ip.save.assert_called()
+    assert dev.primary_ip4 == 901   # device points at the reused IP
+
+
+# ── change-log journal stamps ───────────────────────────────────────────────
+
+def test_sync_devices_journals_created_device_and_ip_with_module_and_timestamp():
+    # Every entry the sync ADDS to NetBox gets a journal entry (NetBox's
+    # per-object change log) recording which module created it and when.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    calls = eng.nb.extras.journal_entries.create.call_args_list
+    assert len(calls) == 2   # one on the device, one on the IP
+    ctypes = {c.kwargs["assigned_object_type"] for c in calls}
+    assert ctypes == {"dcim.device", "ipam.ipaddress"}
+    for c in calls:
+        assert c.kwargs["kind"] == "info"
+        assert "firewall-discovery" in c.kwargs["comment"]      # module
+        assert " at " in c.kwargs["comment"]                     # timestamp
