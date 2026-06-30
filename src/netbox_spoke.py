@@ -331,6 +331,20 @@ class NetboxSpoke(BaseSpoke):
                 replace=bool(data.get("replace", False)),
             )
 
+        if normalized == "NETBOX_SYNC_DEVICES":
+            # Firewall → NetBox device discovery sync. The hub relays a tenant's
+            # firewall-discovered devices (DHCP leases + ARP from the OPNsense
+            # spoke, attributed to the tenant by prefix) for an authoritative
+            # replace into NetBox DCIM devices + IP records. ``defaults`` carries
+            # the role/device_type/site slugs for creation.
+            return await self._run_sync(
+                self.engine.sync_devices,
+                devices=data.get("devices", []),
+                tenant_slug=data.get("tenant_slug", ""),
+                replace=bool(data.get("replace", False)),
+                defaults=data.get("defaults", {}),
+            )
+
         if normalized == "NETBOX_SEARCH":
             return await self._run_sync(self.engine.search,
                                         query=data.get("q", ""), tenant=data.get("tenant"))

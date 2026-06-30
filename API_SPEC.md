@@ -46,6 +46,11 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
   - **Purpose**: Triggers an immediate synchronization of DHCP prefixes from NetBox to the KEA DHCP server.
   - **Payload**: `{}`
   - **Response**: `{"status": "SUCCESS", "message": "DHCP synchronization triggered."}`
+- **`NETBOX_SYNC_DEVICES`**
+  - **Purpose**: Firewall → NetBox device discovery sync. The hub relays a tenant's firewall-discovered devices (DHCP leases + ARP table from the OPNsense spoke, attributed to the tenant by prefix containment) for an authoritative replace into NetBox DCIM devices + IP records. Each incoming `{ip, mac, hostname}` is matched to an existing device by its primary IPv4; missing devices are created (tenant-owned device + `mgmt` interface + IP with `custom_fields.mac_address` + `primary_ip4`). Writing the MAC onto the IP feeds the NetBox→CPPM endpoint sync (keys on `mac_address`) — so static-IP devices the ARP table sees flow to ClearPass. Created devices are tagged `custom_fields.discovered_from = "opnsense"`; when `replace` + a tenant slug are given, tagged devices of that tenant whose primary IP is absent from the incoming set are deleted. Pre-existing devices matched by IP are refreshed (MAC/dns_name) but not tagged/deleted.
+  - **Payload**: `{"tenant_id", "tenant_slug": "<netbox-tenant-slug>", "tenant_name", "source": "OPNsense", "replace": true, "devices": [{"ip", "mac", "hostname"}, ...], "defaults": {"role": "<slug>", "device_type": "<slug>", "site": "<slug>"}}`
+  - **Response**: `{"status": "SUCCESS", "pushed": N, "errors": N, "skipped": N, "deleted": N, "devices_total": N, "message": "..."}`
+  - **Errors**: unknown tenant → `{"status": "ERROR", "message": "NetBox tenant '<slug>' not found ..."}`. Missing `discovered_from`/`mac_address` custom fields are tolerated (writes skipped, replace-delete becomes a safe no-op).
 
 ### Tenant Self-Service Subnet Allocation
 - **`NETBOX_FIND_AVAILABLE_PREFIXES`**

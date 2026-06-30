@@ -1,0 +1,176 @@
+"""Tests for NetboxEngine.sync_devices (NETBOX_SYNC_DEVICES handler).
+
+Self-contained: inserts src/ on sys.path and constructs the engine without a
+live NetBox (pynetbox.api is lazy; we overwrite engine.nb + the _api_get*
+helpers with fakes). Uses lightweight mock objects because sync_devices does
+``dict(obj.custom_fields or {})`` which needs real dicts, not MagicMocks.
+"""
+import os
+import sys
+from unittest.mock import MagicMock
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from netbox_engine import NetboxEngine  # noqa: E402
+
+
+class _Iface:
+    """Minimal interface stand-in (just needs .id)."""
+    def __init__(self, id=100):
+        self.id = id
+
+
+class _Obj:
+    """A minimal stand-in for a pynetbox record: settable custom_fields, save,
+    delete, and an arbitrary .id / .interfaces / .primary_ip4."""
+
+    def __init__(self, id=1, custom_fields=None):
+        self.id = id
+        self.custom_fields = dict(custom_fields or {})
+        self.primary_ip4 = None
+        self.interfaces = MagicMock()
+        self.interfaces.create.return_value = _Iface(id=100)
+        self.save = MagicMock()
+        self.delete = MagicMock()
+
+
+def _engine_with(existing_rows, tenant_obj=None):
+    """Build an engine whose nb is a MagicMock; _api_get_all returns the given
+    existing device rows; _api_get (prefix lookup) returns empty (→ /32)."""
+    eng = NetboxEngine("http://localhost", "tok")
+    eng.nb = MagicMock()
+    eng.nb.tenancy.tenants.get.return_value = tenant_obj  # _Obj(id=1) or None
+    eng._api_get_all = MagicMock(return_value=existing_rows)
+    eng._api_get = MagicMock(return_value={"results": []})  # no containing prefix → /32
+    return eng
+
+
+def test_sync_devices_refuses_unknown_tenant():
+    eng = _engine_with(existing_rows=[], tenant_obj=None)
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws"}],
+        tenant_slug="ghost", replace=True, defaults={})
+    assert res["status"] == "ERROR"
+    assert "ghost" in res["message"]
+    # Nothing created when the tenant is unknown (no unattributed records).
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_sync_devices_creates_new_owned_device():
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    ip = _Obj(id=555)
+    eng.nb.ipam.ip_addresses.create.return_value = ip
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA-BB-CC-DD-EE-FF", "hostname": "ws-05"}],
+        tenant_slug="lrb", replace=True, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    # Device created with tenant + role/device_type/site defaults + active.
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["status"] == "active"
+    assert ck["tenant"] == 1
+    assert ck["role"] is not None and ck["device_type"] is not None
+    assert ck["name"] == "ws-05"
+    # Ownership tag applied to the device.
+    assert dev.custom_fields.get("discovered_from") == "opnsense"
+    dev.save.assert_called()
+    # mgmt interface created + IP created against it + mac_address set on IP.
+    dev.interfaces.create.assert_called_once()
+    ik = eng.nb.ipam.ip_addresses.create.call_args.kwargs
+    assert ik["address"] == "10.0.0.5/32"  # no containing prefix → /32
+    assert ik["assigned_object_type"] == "dcim.interface"
+    assert ik["dns_name"] == "ws-05"
+    assert ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"  # normalized
+    # primary_ip4 set from the created IP.
+    assert dev.primary_ip4 == 555
+
+
+def test_sync_devices_updates_existing_by_ip_no_duplicate():
+    # Existing device (ours, tagged) with primary IP 10.0.0.5 → PUT-refresh, no new device.
+    row = {"id": 77, "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ip = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = ip
+    dev = _Obj(id=77, custom_fields={"discovered_from": "opnsense"})
+    eng.nb.dcim.devices.get.return_value = dev
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "ws-renamed"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()  # no duplicate
+    # MAC refreshed on the existing IP (normalized) + dns_name set.
+    assert ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+    assert ip.dns_name == "ws-renamed"
+    ip.save.assert_called()
+    # Owned → renamed.
+    assert dev.name == "ws-renamed"
+    dev.save.assert_called()
+
+
+def test_sync_devices_replace_deletes_owned_absent_tenant_scoped():
+    # Two owned devices; incoming only has one → the other is deleted.
+    rows = [
+        {"id": 11, "primary_ip4": {"id": 111, "address": "10.0.0.5/24"},
+         "custom_fields": {"discovered_from": "opnsense"}},
+        {"id": 22, "primary_ip4": {"id": 222, "address": "10.0.0.6/24"},
+         "custom_fields": {"discovered_from": "opnsense"}},
+    ]
+    eng = _engine_with(existing_rows=rows, tenant_obj=_Obj(id=1))
+    # The absent device's IP 10.0.0.6 → device 22 fetched + deleted.
+    dev22 = _Obj(id=22)
+    eng.nb.dcim.devices.get.return_value = dev22
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=111, custom_fields={})
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-05"}],
+        tenant_slug="lrb", replace=True, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["deleted"] == 1
+    dev22.delete.assert_called()
+
+
+def test_sync_devices_no_delete_when_unscoped():
+    # Global sync (no tenant slug) must NOT delete even with replace=True and
+    # owned devices present — mirror sync_vms's global safety contract.
+    rows = [{"id": 11, "primary_ip4": {"id": 111, "address": "10.0.0.5/24"},
+             "custom_fields": {"discovered_from": "opnsense"}}]
+    eng = _engine_with(existing_rows=rows, tenant_obj=None)
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.6", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-06"}],
+        tenant_slug="", replace=True, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["deleted"] == 0
+    eng.nb.dcim.devices.get.assert_not_called()  # no delete path entered
+
+
+def test_sync_devices_missing_custom_field_is_graceful():
+    # mac_address / discovered_from custom fields absent in NetBox → the
+    # post-create save raises (NetBox rejects unknown custom fields). The sync
+    # must swallow it and still create the device + IP.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    # First save (the discovered_from tag) raises; the second (primary_ip4) must
+    # succeed so the device + IP are still created.
+    dev.save.side_effect = [Exception("custom field discovered_from not found"), None]
+    eng.nb.dcim.devices.create.return_value = dev
+    ip = _Obj(id=555)
+    eng.nb.ipam.ip_addresses.create.return_value = ip
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1  # device still counts as pushed despite the tag failure

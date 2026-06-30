@@ -1,4 +1,5 @@
 import ipaddress
+import re
 import pynetbox
 import logging
 import threading
@@ -976,6 +977,93 @@ class NetboxEngine:
         except Exception as e:
             logger.debug("assign_vm_primary_ip4 %s failed: %s", ip_str, e)
 
+    # ---- firewall→NetBox device discovery sync helpers ---------------------
+
+    @staticmethod
+    def _norm_mac(mac: str) -> str:
+        """Normalize a MAC to lowercase colon form (aa:bb:cc:dd:ee:ff).
+
+        The OPNsense spoke returns the raw MAC; normalize here so the value
+        written to the IP's ``mac_address`` custom field matches what the
+        NetBox→CPPM endpoint sync reads (it keys on the colon form).
+        """
+        m = (mac or "").strip().lower()
+        hexonly = re.sub(r"[^0-9a-f]", "", m)
+        if len(hexonly) == 12:
+            return ":".join(hexonly[i:i + 2] for i in range(0, 12, 2))
+        return m
+
+    def _mask_for_ip(self, ip_str: str) -> str:
+        """Derive the mask from the most specific containing prefix; /32 if none.
+
+        Mirrors the inline lookup in ``claim_device`` (engine.py ~296-304),
+        extracted so the device sync reuses it.
+        """
+        try:
+            pdata = self._api_get("/api/ipam/prefixes/", {"contains": ip_str, "limit": 500})
+            prefs = [ipaddress.ip_network(p["prefix"], strict=False)
+                     for p in pdata.get("results", []) if p.get("prefix")]
+            if prefs:
+                prefs.sort(key=lambda n: n.prefixlen, reverse=True)  # longest first
+                return str(prefs[0].prefixlen)
+        except Exception as e:
+            logger.debug("containing-prefix lookup for %s failed, using /32: %s", ip_str, e)
+        return "32"
+
+    def _ensure_device_role(self, slug: str = "discovered"):
+        """Return the device role (auto-creating 'discovered' if missing). Best-effort."""
+        slug = (slug or "discovered").strip().lower() or "discovered"
+        try:
+            r = self.nb.dcim.device_roles.get(slug=slug)
+            if r:
+                return r
+            return self.nb.dcim.device_roles.create(
+                name=slug.capitalize(), slug=slug, color="9e9e9e")
+        except Exception as e:
+            logger.debug("ensure_device_role failed: %s", e)
+            return None
+
+    def _ensure_device_type(self, slug: str = "discovered"):
+        """Return the device type (auto-creating 'Discovered Device' under an
+        'Unknown' manufacturer if missing). Best-effort."""
+        slug = (slug or "discovered").strip().lower() or "discovered"
+        try:
+            dt = self.nb.dcim.device_types.get(slug=slug)
+            if dt:
+                return dt
+            mfr = None
+            try:
+                mfr = self.nb.dcim.manufacturers.get(slug="unknown")
+            except Exception:
+                mfr = None
+            if not mfr:
+                mfr = self.nb.dcim.manufacturers.create(name="Unknown", slug="unknown")
+            return self.nb.dcim.device_types.create(
+                model="Discovered Device", slug=slug, manufacturer=mfr.id)
+        except Exception as e:
+            logger.debug("ensure_device_type failed: %s", e)
+            return None
+
+    def _resolve_site(self, slug: str = "", tenant=None):
+        """Resolve a site for device creation. Configured slug first; else the
+        first site as a fallback. None if none resolve (site is optional for a
+        NetBox device). Best-effort."""
+        slug = (slug or "").strip().lower()
+        if slug:
+            try:
+                s = self.nb.dcim.sites.get(slug=slug)
+                if s:
+                    return s
+            except Exception as e:
+                logger.debug("resolve_site %s failed: %s", slug, e)
+        try:
+            sites = list(self.nb.dcim.sites.filter(limit=1))
+            if sites:
+                return sites[0]
+        except Exception as e:
+            logger.debug("resolve_site first-site fallback failed: %s", e)
+        return None
+
     def sync_vms(self, vms: list, tenant_slug: str = "",
                  replace: bool = False) -> Dict[str, Any]:
         """Push a tenant's Proxmox VM set into NetBox virtualization records.
@@ -1105,6 +1193,210 @@ class NetboxEngine:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "vms_total": len(vms or [])}
+
+    def sync_devices(self, devices: list, tenant_slug: str = "",
+                     replace: bool = False,
+                     defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Push a tenant's firewall-discovered device set into NetBox DCIM.
+
+        Source = OPNsense DHCP leases + ARP table (relayed by the hub). Each
+        incoming record ``{ip, mac, hostname}`` is matched to an existing
+        device by its primary IPv4; missing devices are created (mirroring
+        ``claim_device``: tenant-owned device + ``mgmt`` interface + IP with
+        ``custom_fields.mac_address`` + ``primary_ip4``). Writing the MAC onto
+        the IP record feeds the NetBox→CPPM endpoint sync (which keys on
+        ``mac_address``) — so static-IP devices the ARP table sees start flowing
+        to ClearPass too.
+
+        Ownership / replace-delete: devices this sync CREATES are tagged
+        ``custom_fields.discovered_from = "opnsense"`` (best-effort; mirrors
+        ``proxmox_unique_id`` on VMs). When ``replace`` AND a tenant slug are
+        provided, tagged devices of that tenant whose primary IP is absent from
+        the incoming set are deleted. Pre-existing devices matched by IP are
+        refreshed (MAC/dns_name on the IP) but NOT tagged and NOT deleted — we
+        don't own them. Replace-delete is skipped when unscoped (global) so a
+        global sync can't delete another tenant's records. If the
+        ``discovered_from`` custom field isn't configured in NetBox the tag
+        write is silently skipped and replace-delete becomes a safe no-op.
+
+        Returns ``{status, pushed, errors, skipped, deleted, devices_total, message}``.
+        """
+        pushed = 0; errors = 0; skipped = 0; deleted = 0
+        defaults = defaults or {}
+        try:
+            tenant = None
+            if tenant_slug:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                if not tenant:
+                    return {"status": "ERROR",
+                            "message": f"NetBox tenant '{tenant_slug}' not found — "
+                                       f"firewall-discovered devices not attributed. "
+                                       f"Check the tenant's NetBox slug mapping.",
+                            "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
+                            "devices_total": len(devices or [])}
+
+            # Normalize incoming: ip (mask stripped) -> {mac, hostname}.
+            incoming: Dict[str, Dict[str, str]] = {}
+            for dev in (devices or []):
+                if not isinstance(dev, dict):
+                    continue
+                ip = str(dev.get("ip") or "").strip().split("/")[0].strip()
+                mac = self._norm_mac(dev.get("mac", ""))
+                hostname = str(dev.get("hostname") or "").strip()
+                if not ip and not mac:
+                    skipped += 1
+                    continue
+                if not ip:
+                    # MAC-only: index by mac-key so it's at least created, but
+                    # replace-delete (which keys on IP) won't track it.
+                    ip = f"mac:{mac}"
+                incoming[ip] = {"mac": mac, "hostname": hostname}
+
+            # Index existing tenant devices by primary IPv4 (all) + track which
+            # of those we own (discovered_from tag) for replace-delete.
+            existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
+            owned_ips: set = set()                   # primary IPs of tagged devices
+            list_params: Dict[str, Any] = {"limit": 500}
+            if tenant_slug:
+                list_params["tenant"] = tenant_slug
+            try:
+                rows = self._api_get_all("/api/dcim/devices/", list_params)
+            except Exception as e:
+                return {"status": "ERROR",
+                        "message": f"failed to list NetBox devices: {e}",
+                        "pushed": 0, "errors": 0, "skipped": skipped, "deleted": 0,
+                        "devices_total": len(incoming)}
+            for row in rows:
+                pip = row.get("primary_ip4")
+                addr = ""
+                if isinstance(pip, dict):
+                    addr = (pip.get("address") or "").split("/")[0].strip()
+                if not addr:
+                    continue
+                existing_by_ip[addr] = row
+                cf = row.get("custom_fields") or {}
+                if str((cf.get("discovered_from") or "")).lower() == "opnsense":
+                    owned_ips.add(addr)
+
+            # Replace-with-delete — only when tenant-scoped, only owned devices.
+            if replace and tenant_slug:
+                for ip_str in list(owned_ips - set(incoming.keys())):
+                    row = existing_by_ip.get(ip_str)
+                    if not row:
+                        continue
+                    try:
+                        obj = self.nb.dcim.devices.get(row["id"])
+                        if obj:
+                            obj.delete()
+                            deleted += 1
+                    except Exception as e:
+                        errors += 1
+                        logger.debug("sync_devices: delete stale %s failed: %s", ip_str, e)
+
+            role = self._ensure_device_role(defaults.get("role") or "discovered")
+            dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
+            site = self._resolve_site(defaults.get("site") or "", tenant)
+
+            for ip_str, rec in incoming.items():
+                mac = rec["mac"]
+                hostname = rec["hostname"]
+                is_mac_key = ip_str.startswith("mac:")
+                real_ip = "" if is_mac_key else ip_str
+                try:
+                    row = existing_by_ip.get(ip_str) if not is_mac_key else None
+                    if row:
+                        # Existing device matched by IP — refresh its IP's MAC +
+                        # dns_name (the goal: populate mac_address so the endpoint
+                        # sync can match). Rename only if we own it.
+                        pip = row.get("primary_ip4") or {}
+                        ip_id = pip.get("id") if isinstance(pip, dict) else None
+                        cf = row.get("custom_fields") or {}
+                        we_own = str((cf.get("discovered_from") or "")).lower() == "opnsense"
+                        if ip_id:
+                            try:
+                                ipobj = self.nb.ipam.ip_addresses.get(ip_id)
+                                if ipobj:
+                                    if mac:
+                                        merged = dict(ipobj.custom_fields or {})
+                                        merged["mac_address"] = mac
+                                        ipobj.custom_fields = merged
+                                    if hostname and hostname.lower() != "unknown":
+                                        ipobj.dns_name = hostname
+                                    ipobj.save()
+                            except Exception as e:
+                                logger.debug("sync_devices: refresh IP %s failed: %s", ip_str, e)
+                        if we_own and hostname and hostname.lower() != "unknown":
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    devobj.name = hostname
+                                    devobj.save()
+                            except Exception as e:
+                                logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
+                        pushed += 1
+                    else:
+                        # No existing device for this IP — create one we own.
+                        name = (hostname if hostname and hostname.lower() != "unknown"
+                                else (f"device-{mac.replace(':', '')}" if mac
+                                      else f"device-{real_ip or 'unknown'}"))
+                        create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
+                        if role:
+                            create_kwargs["role"] = role.id
+                        if dtype:
+                            create_kwargs["device_type"] = dtype.id
+                        if site:
+                            create_kwargs["site"] = site.id
+                        if tenant:
+                            create_kwargs["tenant"] = tenant.id
+                        devobj = self.nb.dcim.devices.create(**create_kwargs)
+                        # Ownership tag (best-effort; missing custom field => no-op).
+                        try:
+                            merged = dict(devobj.custom_fields or {})
+                            merged["discovered_from"] = "opnsense"
+                            devobj.custom_fields = merged
+                            devobj.save()
+                        except Exception as e:
+                            logger.debug("sync_devices: discovered_from tag skipped: %s", e)
+                        # mgmt interface + IP (mac on the IP) + primary_ip4.
+                        if real_ip:
+                            iface = devobj.interfaces.create(name="mgmt", type="other")
+                            mask = self._mask_for_ip(real_ip)
+                            ip_kwargs: Dict[str, Any] = {
+                                "address": f"{real_ip}/{mask}",
+                                "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": iface.id,
+                            }
+                            if tenant:
+                                ip_kwargs["tenant"] = tenant.id
+                            if hostname and hostname.lower() != "unknown":
+                                ip_kwargs["dns_name"] = hostname
+                            ipobj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
+                            if mac:
+                                try:
+                                    m = dict(ipobj.custom_fields or {})
+                                    m["mac_address"] = mac
+                                    ipobj.custom_fields = m
+                                    ipobj.save()
+                                except Exception as e:
+                                    logger.debug("sync_devices: mac_address on IP %s skipped: %s", real_ip, e)
+                            devobj.primary_ip4 = ipobj.id
+                            devobj.save()
+                        pushed += 1
+                except Exception as e:
+                    errors += 1
+                    logger.debug("sync_devices: upsert %s failed: %s", ip_str, e)
+
+            msg = (f"{pushed} device(s) upserted, {deleted} deleted, "
+                   f"{skipped} skipped, {errors} errors")
+            logger.info("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
+            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
+                    "skipped": skipped, "deleted": deleted,
+                    "devices_total": len(incoming), "message": msg}
+        except Exception as e:
+            logger.error("sync_devices failed: %s", e)
+            return {"status": "ERROR", "message": str(e), "pushed": pushed,
+                    "errors": errors, "skipped": skipped, "deleted": deleted,
+                    "devices_total": len(devices or [])}
 
     def search(self, query: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """
