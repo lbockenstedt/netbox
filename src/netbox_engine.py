@@ -943,13 +943,23 @@ class NetboxEngine:
         field AND verifies/attaches its content_type. Best-effort: a permission
         / API error is logged at WARNING (so it's visible) and swallowed — a
         restricted token must never break a sync. Safe at startup and reconnect.
+
+        Called at spoke startup + reconnect (netbox_spoke.py) AND at the top of
+        ``sync_vms`` / ``sync_devices`` so a sync self-heals even if the startup
+        call was skipped or failed. Cached per-process via ``_cf_ensured``: a
+        clean run (every field present AND attached) sets the flag so subsequent
+        syncs skip the list-all; a run with any WARNING leaves it unset so the
+        next sync retries (self-healing until the provisioning gap closes).
         """
+        if getattr(self, "_cf_ensured", False):
+            return
+        had_failure = False
         try:
             cf_api = self.nb.extras.custom_fields
             by_name = {str(f.name): f for f in cf_api.all()}
         except Exception as e:
             logger.warning("ensure_custom_fields: list failed: %s", e)
-            return
+            return  # leave _cf_ensured unset → next sync retries
         for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
             cf = by_name.get(name)
             if cf is None:
@@ -959,6 +969,7 @@ class NetboxEngine:
                     logger.info("ensure_custom_fields: created %s on %s", name, content_type)
                 except Exception as e:
                     logger.warning("ensure_custom_fields: create %s failed: %s", name, e)
+                    had_failure = True
                     continue
             # Verify the content type is attached (create may not attach it on
             # every NetBox version; a pre-existing field may be unattached).
@@ -972,6 +983,35 @@ class NetboxEngine:
             except Exception as e:
                 logger.warning("ensure_custom_fields: attach %s to %s failed: %s",
                                name, content_type, e)
+                had_failure = True
+        if not had_failure:
+            self._cf_ensured = True
+
+    @staticmethod
+    def _uniq_device_name(base: str, mac: str, real_ip: str,
+                          existing_by_name: Dict[str, dict],
+                          used_names: set) -> str:
+        """Uniquify ``base`` against pre-existing device names AND names already
+        used this batch so the NetBox ``(name, site, tenant)`` unique constraint
+        can't fire on a create.
+
+        Many firewall-discovered records share a hostname (ks205, sonoszp,
+        iphone…) across distinct MACs — genuinely different devices that the
+        constraint forces to distinct names. Appends ``-<mac[-4:]>`` (or
+        ``-<ip>`` when there's no MAC); if that still collides, a ``-<n>``
+        counter guarantees uniqueness. Returns ``base`` unchanged when it
+        doesn't collide with either set.
+        """
+        key = base.lower()
+        if key not in existing_by_name and key not in used_names:
+            return base
+        suffix = (mac.replace(":", "")[-4:] if mac else (real_ip or "x"))
+        cand = f"{base}-{suffix}"
+        i = 2
+        while cand.lower() in existing_by_name or cand.lower() in used_names:
+            cand = f"{base}-{suffix}-{i}"
+            i += 1
+        return cand
 
     def _ensure_cluster_type(self, name: str = "Proxmox", slug: str = "proxmox"):
         """Return the 'Proxmox' cluster type (creating it if missing). Best-effort."""
@@ -1190,6 +1230,9 @@ class NetboxEngine:
             return t
 
         try:
+            # Self-heal proxmox_* custom fields on virtualization.virtualmachine
+            # so the linkage PATCHes below land. Cached per-process.
+            self._ensure_custom_fields()
             incoming: Dict[str, Dict[str, Any]] = {}
             for vm in (vms or []):
                 uid = str((vm or {}).get("unique_id") or "").strip()
@@ -1284,13 +1327,31 @@ class NetboxEngine:
                         # Set/clear so a VM that changed tags moves tenant
                         # (or drops to unassigned) without a delete+recreate.
                         obj.tenant = tenant.id if tenant else None
-                        merged = dict(obj.custom_fields or {})
-                        merged.update(cf)
-                        obj.custom_fields = merged
-                        obj.save()
+                        obj.save()  # core fields — always syncs even if cf unprovisioned
+                        # proxmox_* linkage is best-effort: the deployed NetBox
+                        # may not have the custom fields attached to
+                        # virtualization.virtualmachine yet, and a 400 here must
+                        # NOT undo the core update above. The create path sets
+                        # them once the fields exist (next sync after ensure).
+                        try:
+                            merged = dict(obj.custom_fields or {})
+                            merged.update(cf)
+                            obj.custom_fields = merged
+                            obj.save()
+                        except Exception as e:
+                            logger.warning("sync_vms: custom_fields update %s skipped "
+                                           "(field unprovisioned?): %s", uid, e)
                     else:
+                        # Create WITHOUT inline custom_fields: a create carrying
+                        # custom_fields 400s ("Custom field 'proxmox_node' does
+                        # not exist for this object type") when the field isn't
+                        # attached to virtualization.virtualmachine on the
+                        # deployed NetBox — which blocked ALL VM syncs (0/N).
+                        # Sync the VM first, then PATCH the proxmox_* linkage
+                        # best-effort so a provisioning gap never blocks the
+                        # sync. The update path sets them once fields exist.
                         create_kwargs: Dict[str, Any] = {
-                            "name": name, "status": status, "custom_fields": cf}
+                            "name": name, "status": status}
                         if cluster_id:
                             create_kwargs["cluster"] = cluster_id
                         if vcpus:
@@ -1302,6 +1363,12 @@ class NetboxEngine:
                         if tenant:
                             create_kwargs["tenant"] = tenant.id
                         obj = self.nb.virtualization.virtual_machines.create(**create_kwargs)
+                        try:
+                            obj.custom_fields = cf
+                            obj.save()
+                        except Exception as e:
+                            logger.warning("sync_vms: custom_fields set on new VM %s "
+                                           "skipped (field unprovisioned?): %s", uid, e)
                     # primary_ip4 (best-effort) — needs a vminterface + IP assigned to it
                     self._assign_vm_primary_ip4(obj, vm.get("ips") or [], tenant)
                     pushed += 1
@@ -1425,6 +1492,10 @@ class NetboxEngine:
         first_err: Optional[str] = None   # first per-record failure text (diagnosability)
         defaults = defaults or {}
         try:
+            # Self-heal custom fields (discovered_from on dcim.device,
+            # mac_address on ipam.ipaddress) so the ownership tag + MAC writes
+            # below land. Cached per-process; no-op once provisioned.
+            self._ensure_custom_fields()
             tenant = None
             if tenant_slug:
                 tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
@@ -1462,6 +1533,17 @@ class NetboxEngine:
             existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
             existing_by_name: Dict[str, dict] = {}  # name.lower() -> raw device row
             owned_ips: set = set()                   # primary IPs of tagged devices
+            # Intra-batch dedup: many discovery records share a hostname across
+            # distinct MACs (ks205, sonoszp, iphone…). existing_by_name is a
+            # pre-batch snapshot and can't see names created earlier THIS batch,
+            # so a 2nd create with the same name 400s on (name, site, tenant).
+            # used_names tracks every name we create/refresh this batch.
+            used_names: set = set()
+            # device ids handled via the IP-match refresh path — the create
+            # branch must never reclaim/clobber one of these by name (a
+            # duplicate-hostname record would otherwise delete a device we just
+            # refreshed for a different IP).
+            refreshed_ids: set = set()
             list_params: Dict[str, Any] = {"limit": 500}
             if tenant_slug:
                 list_params["tenant"] = tenant_slug
@@ -1518,7 +1600,17 @@ class NetboxEngine:
                     if row:
                         # Existing device matched by IP — refresh its IP's MAC +
                         # dns_name (the goal: populate mac_address so the endpoint
-                        # sync can match). Rename only if we own it.
+                        # sync can match). Rename only if we own it. Remember its
+                        # id so the create branch never reclaims/clobbers a device
+                        # we just refreshed when a duplicate hostname shows up.
+                        refreshed_ids.add(row["id"])
+                        # The refreshed device keeps (or is renamed to) a name
+                        # that's now occupied in NetBox — track it so a later
+                        # duplicate-hostname create this batch uniquifies instead
+                        # of colliding on (name, site, tenant).
+                        rname = str(row.get("name") or "").strip().lower()
+                        if rname:
+                            used_names.add(rname)
                         pip = row.get("primary_ip4") or {}
                         ip_id = pip.get("id") if isinstance(pip, dict) else None
                         cf = row.get("custom_fields") or {}
@@ -1542,6 +1634,7 @@ class NetboxEngine:
                                 if devobj:
                                     devobj.name = hostname
                                     devobj.save()
+                                    used_names.add(hostname.strip().lower())
                             except Exception as e:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
                         pushed += 1
@@ -1550,22 +1643,32 @@ class NetboxEngine:
                         name = (hostname if hostname and hostname.lower() != "unknown"
                                 else (f"device-{mac.replace(':', '')}" if mac
                                       else f"device-{real_ip or 'unknown'}"))
-                        # The (name, site, tenant) unique constraint: a device
-                        # we own (discovered_from=opnsense) whose IP moved
-                        # (DHCP renewal, same MAC) is absent from existing_by_ip
-                        # but still present under the same device-<mac> name → a
-                        # plain create re-uses that name and 400s. If the name
-                        # collides with an OWNED device, delete the stale record
-                        # first (it's ours; replace-delete already nukes owned
-                        # devices wholesale, so this is consistent) then create
-                        # fresh with the new IP. If it collides with a device we
-                        # do NOT own (human / pre-existing), uniquify the name
-                        # instead of clobbering a hand-managed device.
+                        # The (name, site, tenant) unique constraint. Two hazards:
+                        # (1) the name matches a PRE-existing device (snapshot in
+                        # existing_by_name); (2) INTRA-batch duplicates — many
+                        # discovery records share a hostname (ks205, sonoszp,
+                        # iphone…) across distinct MACs, and existing_by_name
+                        # (a pre-batch snapshot) can't see names created earlier
+                        # this batch, so a 2nd create with the same name 400s.
+                        # used_names tracks every name we create/refresh this
+                        # batch; _uniq_device_name uniquifies against both sets.
+                        # Never reclaim a name held by a device we just refreshed
+                        # via IP-match (refreshed_ids) — that's a different IP's
+                        # real device, not a stale orphan.
                         byname = existing_by_name.get(name.lower())
-                        if byname:
+                        if byname and byname["id"] not in refreshed_ids:
                             bcf = byname.get("custom_fields") or {}
                             b_own = str((bcf.get("discovered_from") or "")).lower() == "opnsense"
-                            if b_own:
+                            # Reclaim the name only for a stale OWNED device that
+                            # is NOT being refreshed this batch (refreshed_ids) and
+                            # whose name no earlier record this batch took
+                            # (used_names) — i.e. our own orphan (DHCP IP-move of
+                            # a device-<mac> record, or a stale owned hostname).
+                            # refreshed_ids guarantees we never delete a live
+                            # device we just refreshed for a different IP. An
+                            # UNOWNED (human) collision, or a name already used
+                            # this batch, → uniquify instead of clobbering.
+                            if b_own and name.lower() not in used_names:
                                 try:
                                     old = self.nb.dcim.devices.get(byname["id"])
                                     if old:
@@ -1577,11 +1680,20 @@ class NetboxEngine:
                                         first_err = f"delete-stale {name}: {e}"
                                     logger.debug("sync_devices: delete stale by-name %s failed: %s", name, e)
                             else:
-                                suffix = (mac.replace(":", "")[-4:] if mac
-                                          else (real_ip or "x"))
-                                name = f"{name}-{suffix}"
-                                logger.debug("sync_devices: name %s taken by unowned device; "
-                                             "creating as %s to avoid clobbering it", name[:-len(suffix)-1], name)
+                                orig = name
+                                name = self._uniq_device_name(name, mac, real_ip,
+                                                              existing_by_name, used_names)
+                                logger.debug("sync_devices: name %s taken; creating as %s", orig, name)
+                        elif name.lower() in used_names:
+                            # Intra-batch duplicate hostname: no pre-existing
+                            # device by that name, but an earlier record this
+                            # batch already created it.
+                            orig = name
+                            name = self._uniq_device_name(name, mac, real_ip,
+                                                          existing_by_name, used_names)
+                            logger.debug("sync_devices: hostname %s already used this batch; "
+                                         "creating as %s", orig, name)
+                        used_names.add(name.lower())
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                         if role:
                             create_kwargs["role"] = role.id

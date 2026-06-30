@@ -268,6 +268,67 @@ def test_sync_devices_no_ip_owned_device_indexed_by_name():
     stale.delete.assert_called_once()  # the no-IP stale owned device was freed
 
 
+# ── intra-batch duplicate hostnames (the real 182-error root cause) ─────────
+
+def test_sync_devices_intra_batch_duplicate_hostnames_get_unique_names():
+    # Many discovery records share a hostname (ks205, sonoszp…) across distinct
+    # MACs. existing_by_name is a pre-batch snapshot and can't see names created
+    # earlier THIS batch, so a 2nd create with the same name 400s on
+    # (name, site, tenant). used_names dedups intra-batch: the first keeps the
+    # hostname, the rest get a -<mac[-4:]> suffix — no 400s.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.devices.create.side_effect = [_Obj(id=i) for i in (42, 43, 44)]
+    eng.nb.ipam.ip_addresses.create.side_effect = [_Obj(id=i) for i in (555, 556, 557)]
+
+    res = eng.sync_devices(
+        devices=[
+            {"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:01", "hostname": "ks205"},
+            {"ip": "10.0.0.6", "mac": "aa:bb:cc:dd:ee:02", "hostname": "ks205"},
+            {"ip": "10.0.0.7", "mac": "aa:bb:cc:dd:ee:03", "hostname": "ks205"},
+        ],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 3
+    assert res["errors"] == 0
+    names = [c.kwargs["name"] for c in eng.nb.dcim.devices.create.call_args_list]
+    assert len(names) == len(set(names))   # all unique → no constraint 400
+    assert names[0] == "ks205"
+    assert names[1].startswith("ks205-") and names[1].endswith("ee02")
+    assert names[2].startswith("ks205-") and names[2].endswith("ee03")
+
+
+def test_sync_devices_duplicate_hostname_does_not_clobber_refreshed_device():
+    # An owned "ks205" at 10.0.0.5 IS in the batch (refreshed by IP-match) and a
+    # SECOND record shares hostname "ks205" at a different IP + MAC. The
+    # duplicate must uniquify — it must NOT delete (reclaim) the device we just
+    # refreshed for a different IP. refreshed_ids + used_names guard this.
+    row = {"id": 77, "name": "ks205",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    refreshed_dev = _Obj(id=77, custom_fields={"discovered_from": "opnsense"})
+    eng.nb.dcim.devices.get.return_value = refreshed_dev   # IP-match rename fetch
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=901, custom_fields={})
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[
+            {"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:01", "hostname": "ks205"},  # refresh
+            {"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:09", "hostname": "ks205"},  # dup → uniquify
+        ],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 2
+    assert res["errors"] == 0
+    refreshed_dev.delete.assert_not_called()   # never clobber the refreshed device
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["name"] != "ks205"
+    assert ck["name"].startswith("ks205-") and ck["name"].endswith("ee09")
+
+
 # ── _ensure_custom_fields (spoke-side self-heal) ────────────────────────────
 
 def test_ensure_custom_fields_creates_missing_skips_present():
