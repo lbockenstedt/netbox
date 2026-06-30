@@ -928,6 +928,15 @@ class NetboxEngine:
         ("proxmox_type", "text", "Proxmox type", "virtualization.virtualmachine"),
         ("discovered_from", "text", "Discovered from", "dcim.device"),
         ("mac_address", "text", "MAC address", "ipam.ipaddress"),
+        # mac_address attached to dcim.device too — the access-tracker sync keys
+        # existing-device matching by MAC (read off the device's custom field), so
+        # it can skip MACs already in NetBox (only-add-missing). Re-uses the same
+        # global custom field; _ensure_custom_fields attaches the extra content type.
+        ("mac_address", "text", "MAC address", "dcim.device"),
+        # Access-tracker (NAC→IPAM reverse sync) topology on the endpoint device:
+        ("switch_ip", "text", "Switch IP", "dcim.device"),
+        ("switch_port", "text", "Switch port", "dcim.device"),
+        ("last_seen", "text", "Last seen", "dcim.device"),
         ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
         ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
     ]
@@ -1769,6 +1778,327 @@ class NetboxEngine:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "devices_total": len(devices or [])}
+
+    def sync_access_tracker(self, sessions: list, tenant_slug: str = "",
+                            defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Pull ClearPass Access Tracker / session data INTO NetBox (NAC→IPAM
+        reverse sync; the bidirectional counterpart to ``EndpointSyncMixin``).
+
+        Source = CPPM ``/api/session`` (relayed by the hub realtime loop). Each
+        incoming session ``{mac, ip, nas_ip, nas_port, nas_name, username,
+        start_time}`` is matched **MAC-first** against the tenant's existing
+        devices (keyed by the device's ``custom_fields.mac_address``). NetBox
+        stays source of truth → this is **only-add-missing**: a MAC already in
+        NetBox is skipped (never duplicated, never overwritten), with a
+        best-effort ``last_seen``/``switch_ip``/``switch_port`` refresh on
+        devices *we* created (``discovered_from == "cppm-access-tracker"``); a
+        MAC not in NetBox → a device is created.
+
+        Created endpoint device mirrors ``sync_devices`` (tenant-owned device +
+        NIC interface carrying the native MAC + framed IP + ``primary_ip4``),
+        tagged ``discovered_from = "cppm-access-tracker"`` with
+        ``mac_address``/``switch_ip``/``switch_port``/``last_seen`` custom
+        fields. Full switch topology is built best-effort: a switch
+        ``dcim.devices`` (role ``switch``) keyed by NAS IP, a port-named
+        ``dcim.interfaces`` on it, and a ``dcim.cables`` connection from the
+        endpoint NIC to that switch port — idempotent, with a graceful fallback
+        to the custom-field record if the cable API differs on the deployed
+        NetBox (the device + IP + MAC are still synced).
+
+        ``replace`` is always False here (only-add-missing by design — never
+        delete hand-managed NetBox records). Returns ``{status, pushed, errors,
+        skipped, deleted, sessions_total, message}``.
+        """
+        pushed = 0; errors = 0; skipped = 0; deleted = 0
+        first_err: Optional[str] = None
+        defaults = defaults or {}
+        try:
+            self._ensure_custom_fields()
+            tenant = None
+            if tenant_slug:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                if not tenant:
+                    return {"status": "ERROR",
+                            "message": f"NetBox tenant '{tenant_slug}' not found — "
+                                       f"access-tracker sessions not attributed.",
+                            "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
+                            "sessions_total": len(sessions or [])}
+
+            role = self._ensure_device_role(defaults.get("role") or "discovered")
+            dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
+            site = self._resolve_site(defaults.get("site") or "", tenant)
+            switch_role = self._ensure_device_role(defaults.get("switch_role") or "switch")
+            switch_dtype = self._ensure_device_type(defaults.get("switch_device_type") or "switch")
+
+            # MAC-first index of the tenant's existing devices (the device's
+            # custom_fields.mac_address), plus a primary-IP index (to find the
+            # switch by NAS IP) and a name index for uniquification. Reuses the
+            # same intra-batch used_names dedup that fixed sync_devices.
+            existing_by_mac: Dict[str, dict] = {}
+            existing_by_ip: Dict[str, dict] = {}
+            existing_by_name: Dict[str, dict] = {}
+            used_names: set = set()
+            list_params: Dict[str, Any] = {"limit": 500}
+            if tenant_slug:
+                list_params["tenant"] = tenant_slug
+            try:
+                rows = self._api_get_all("/api/dcim/devices/", list_params)
+            except Exception as e:
+                return {"status": "ERROR",
+                        "message": f"failed to list NetBox devices: {e}",
+                        "pushed": 0, "errors": 0, "skipped": skipped, "deleted": 0,
+                        "sessions_total": len(sessions or [])}
+            for row in rows:
+                rname = str(row.get("name") or "").strip().lower()
+                if rname:
+                    existing_by_name.setdefault(rname, row)
+                cf = row.get("custom_fields") or {}
+                mac_cf = self._norm_mac(cf.get("mac_address") or "")
+                if mac_cf:
+                    existing_by_mac.setdefault(mac_cf, row)
+                pip = row.get("primary_ip4")
+                addr = ""
+                if isinstance(pip, dict):
+                    addr = (pip.get("address") or "").split("/")[0].strip()
+                if addr:
+                    existing_by_ip.setdefault(addr, row)
+
+            # Switch-topology caches (this batch): NAS-IP → switch device,
+            # (switch.id, nas_port) → port interface.
+            switch_by_ip: Dict[str, dict] = {}
+            port_iface_by_key: Dict[tuple, Any] = {}
+
+            def _ensure_switch(nas_ip: str, nas_name: str):
+                """Get-or-create a switch device by its NAS IP (IP-keyed upsert,
+                mirroring sync_devices' IP match). Returns the device row dict or
+                None on failure."""
+                if not nas_ip:
+                    return None
+                row = existing_by_ip.get(nas_ip) or switch_by_ip.get(nas_ip)
+                if row:
+                    switch_by_ip[nas_ip] = row
+                    return row
+                name = (nas_name or f"switch-{nas_ip}").strip() or f"switch-{nas_ip}"
+                name = self._uniq_device_name(name, "", nas_ip, existing_by_name, used_names)
+                used_names.add(name.lower())
+                ck: Dict[str, Any] = {"name": name, "status": "active"}
+                if switch_role:
+                    ck["role"] = switch_role.id
+                if switch_dtype:
+                    ck["device_type"] = switch_dtype.id
+                if site:
+                    ck["site"] = site.id
+                if tenant:
+                    ck["tenant"] = tenant.id
+                try:
+                    sw = self.nb.dcim.devices.create(**ck)
+                    # mgmt interface holding the NAS IP + primary_ip4 so the
+                    # next batch finds this switch by IP (existing_by_ip path).
+                    if sw:
+                        try:
+                            miface = self.nb.dcim.interfaces.create(
+                                device=sw.id, name="mgmt", type="other")
+                            mask = self._mask_for_ip(nas_ip)
+                            ipo = self.nb.ipam.ip_addresses.create(
+                                address=f"{nas_ip}/{mask}",
+                                assigned_object_type="dcim.interface",
+                                assigned_object_id=miface.id)
+                            if tenant:
+                                ipo.tenant = tenant.id
+                                ipo.save()
+                            sw.primary_ip4 = ipo.id
+                            sw.save()
+                        except Exception as e:
+                            logger.debug("sync_access_tracker: switch mgmt/IP %s skipped: %s", nas_ip, e)
+                        row = {"id": sw.id, "name": sw.name,
+                               "primary_ip4": {"address": f"{nas_ip}/{self._mask_for_ip(nas_ip)}"}}
+                        switch_by_ip[nas_ip] = row
+                        existing_by_ip[nas_ip] = row
+                        return row
+                except Exception as e:
+                    logger.debug("sync_access_tracker: create switch %s failed: %s", nas_ip, e)
+                return None
+
+            def _ensure_switch_port(switch_row: dict, nas_port: str):
+                """Get-or-create the named port interface on the switch."""
+                if not switch_row or not nas_port:
+                    return None
+                key = (switch_row["id"], nas_port)
+                cached = port_iface_by_key.get(key)
+                if cached:
+                    return cached
+                try:
+                    iface = self.nb.dcim.interfaces.get(
+                        device=switch_row["id"], name=nas_port)
+                    if iface:
+                        port_iface_by_key[key] = iface
+                        return iface
+                except Exception as e:
+                    logger.debug("sync_access_tracker: find port %s failed: %s", nas_port, e)
+                try:
+                    iface = self.nb.dcim.interfaces.create(
+                        device=switch_row["id"], name=nas_port, type="other")
+                    port_iface_by_key[key] = iface
+                    return iface
+                except Exception as e:
+                    logger.debug("sync_access_tracker: create port %s failed: %s", nas_port, e)
+                return None
+
+            def _cable_nic_to_port(nic, port) -> None:
+                """Idempotently cable the endpoint NIC to the switch port. Skips
+                if the NIC already has a connected endpoint. On any cable API
+                failure (pynetbox/NetBox version mismatch on terminations) →
+                WARNING + fall back to the custom-field record already written
+                (switch_ip/switch_port on the device). Never raises."""
+                try:
+                    nic_obj = self.nb.dcim.interfaces.get(nic.id)
+                    if nic_obj and getattr(nic_obj, "connected_endpoint", None):
+                        return  # already cabled — don't create a second link
+                except Exception as e:
+                    logger.debug("sync_access_tracker: nic connected_endpoint check: %s", e)
+                try:
+                    self.nb.dcim.cables.create(
+                        a_terminations=[{"object_type": "dcim.interface",
+                                         "object_id": nic.id}],
+                        b_terminations=[{"object_type": "dcim.interface",
+                                         "object_id": port.id}],
+                        status="connected")
+                except Exception as e:
+                    # Cable API differs across NetBox versions (legacy used
+                    # termination_a_type/termination_a_id). The device + IP +
+                    # MAC + switch_ip/switch_port custom fields are already
+                    # written, so topology is recorded even without the cable.
+                    logger.warning("sync_access_tracker: cable NIC→%s skipped "
+                                   "(custom-field fallback): %s", nas_port, e)
+
+            for s in (sessions or []):
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    mac = self._norm_mac(s.get("mac", ""))
+                    ip = str(s.get("ip") or "").strip().split("/")[0].strip()
+                    nas_ip = str(s.get("nas_ip") or "").strip().split("/")[0].strip()
+                    nas_port = str(s.get("nas_port") or "").strip()
+                    nas_name = str(s.get("nas_name") or "").strip()
+                    username = str(s.get("username") or "").strip()
+                    start_time = str(s.get("start_time") or "").strip()
+                    if not mac:
+                        skipped += 1
+                        continue
+
+                    row = existing_by_mac.get(mac)
+                    if row:
+                        # Already in NetBox → only-add-missing: skip the create.
+                        # Best-effort refresh of topology/last_seen ONLY on a
+                        # device we own (never touch another source's record).
+                        cf = row.get("custom_fields") or {}
+                        if str((cf.get("discovered_from") or "")).lower() == "cppm-access-tracker":
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    merged = dict(devobj.custom_fields or {})
+                                    if start_time:
+                                        merged["last_seen"] = start_time
+                                    if nas_ip:
+                                        merged["switch_ip"] = nas_ip
+                                    if nas_port:
+                                        merged["switch_port"] = nas_port
+                                    devobj.custom_fields = merged
+                                    devobj.save()
+                            except Exception as e:
+                                logger.debug("sync_access_tracker: refresh %s failed: %s", mac, e)
+                        skipped += 1
+                        continue
+
+                    # Create the missing endpoint device.
+                    name = (username or f"device-{mac.replace(':', '')}")
+                    name = self._uniq_device_name(name, mac, ip, existing_by_name, used_names)
+                    used_names.add(name.lower())
+                    create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
+                    if role:
+                        create_kwargs["role"] = role.id
+                    if dtype:
+                        create_kwargs["device_type"] = dtype.id
+                    if site:
+                        create_kwargs["site"] = site.id
+                    if tenant:
+                        create_kwargs["tenant"] = tenant.id
+                    devobj = self.nb.dcim.devices.create(**create_kwargs)
+                    # Ownership tag + topology custom fields (best-effort; same
+                    # create-without-cf + best-effort PATCH lesson as sync_vms).
+                    try:
+                        merged = dict(devobj.custom_fields or {})
+                        merged["discovered_from"] = "cppm-access-tracker"
+                        merged["mac_address"] = mac
+                        if nas_ip:
+                            merged["switch_ip"] = nas_ip
+                        if nas_port:
+                            merged["switch_port"] = nas_port
+                        if start_time:
+                            merged["last_seen"] = start_time
+                        devobj.custom_fields = merged
+                        devobj.save()
+                    except Exception as e:
+                        logger.debug("sync_access_tracker: cf tag skipped: %s", e)
+
+                    # NIC interface (native MAC) + framed IP + primary_ip4.
+                    nic = None
+                    if ip:
+                        nic = self.nb.dcim.interfaces.create(
+                            device=devobj.id, name="eth0", type="other",
+                            mac_address=mac)
+                        mask = self._mask_for_ip(ip)
+                        ip_kwargs: Dict[str, Any] = {
+                            "address": f"{ip}/{mask}",
+                            "assigned_object_type": "dcim.interface",
+                            "assigned_object_id": nic.id,
+                        }
+                        if tenant:
+                            ip_kwargs["tenant"] = tenant.id
+                        if username:
+                            ip_kwargs["dns_name"] = username
+                        ipobj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
+                        devobj.primary_ip4 = ipobj.id
+                        devobj.save()
+
+                    # Switch topology (best-effort, never breaks the sync).
+                    if nas_ip:
+                        sw = _ensure_switch(nas_ip, nas_name)
+                        if sw and nas_port and nic is not None:
+                            port = _ensure_switch_port(sw, nas_port)
+                            if port:
+                                _cable_nic_to_port(nic, port)
+
+                    # Track the new device so a later duplicate-MAC session in
+                    # the same batch skips instead of re-creating.
+                    new_row = {"id": devobj.id, "name": devobj.name,
+                               "custom_fields": {"mac_address": mac,
+                                                 "discovered_from": "cppm-access-tracker"}}
+                    existing_by_mac[mac] = new_row
+                    if ip:
+                        existing_by_ip.setdefault(ip, new_row)
+                    pushed += 1
+                except Exception as e:
+                    errors += 1
+                    if first_err is None:
+                        first_err = f"upsert {s.get('mac','?')}: {e}"
+                    logger.debug("sync_access_tracker: upsert failed: %s", e)
+
+            msg = (f"{pushed} endpoint(s) added, {skipped} already present, "
+                   f"{deleted} deleted, {errors} errors")
+            if errors and first_err:
+                msg += f" — first error: {first_err}"
+                logger.warning("sync_access_tracker tenant=%s: %s", tenant_slug or "<global>", msg)
+            else:
+                logger.info("sync_access_tracker tenant=%s: %s", tenant_slug or "<global>", msg)
+            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
+                    "skipped": skipped, "deleted": deleted,
+                    "sessions_total": len(sessions or []), "message": msg}
+        except Exception as e:
+            logger.error("sync_access_tracker failed: %s", e)
+            return {"status": "ERROR", "message": str(e), "pushed": pushed,
+                    "errors": errors, "skipped": skipped, "deleted": deleted,
+                    "sessions_total": len(sessions or [])}
 
     def search(self, query: str, tenant: Optional[str] = None) -> Dict[str, Any]:
         """

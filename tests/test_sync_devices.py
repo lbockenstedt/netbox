@@ -358,22 +358,34 @@ def test_ensure_custom_fields_creates_missing_skips_present():
 def test_ensure_custom_fields_attaches_existing_unattached_field():
     # A field that exists globally but is NOT attached to its content type →
     # NetBox writes fail with "does not exist for this object type". The ensure
-    # must attach it (save) instead of skipping.
+    # must attach it (save) instead of skipping. NetBox returns ONE object per
+    # field name; mac_address is listed twice in _REQUIRED_CUSTOM_FIELDS (once
+    # per content type — ipam.ipaddress + dcim.device) so the shared field gets
+    # each content type attached.
     eng = NetboxEngine("http://localhost", "tok")
     eng.nb = MagicMock()
-    cfs = []
+    by_required = {}
     for name, ftype, label, ct in NetboxEngine._REQUIRED_CUSTOM_FIELDS:
-        attached = [] if name == "proxmox_node" else [ct]
-        cfs.append(SimpleNamespace(name=name, content_types=list(attached),
-                                   save=MagicMock()))
+        if name not in by_required:
+            attached = [] if name == "proxmox_node" else [ct]
+            by_required[name] = SimpleNamespace(name=name,
+                                                content_types=list(attached),
+                                                save=MagicMock())
+    cfs = list(by_required.values())
     eng.nb.extras.custom_fields.all.return_value = cfs
     eng._ensure_custom_fields()
     eng.nb.extras.custom_fields.create.assert_not_called()  # all exist
-    prox = next(c for c in cfs if c.name == "proxmox_node")
+    prox = by_required["proxmox_node"]
     prox.save.assert_called_once()
     assert "virtualization.virtualmachine" in prox.content_types
-    # Already-attached fields were not re-saved.
-    others = [c for c in cfs if c.name != "proxmox_node"]
+    # mac_address shared across two content types — the second (dcim.device) is
+    # attached via one save; the first was already attached (no extra save).
+    mac = by_required["mac_address"]
+    assert "ipam.ipaddress" in mac.content_types
+    assert "dcim.device" in mac.content_types
+    assert mac.save.call_count == 1
+    # Other already-attached fields were not re-saved.
+    others = [c for c in cfs if c.name not in ("proxmox_node", "mac_address")]
     assert all(c.save.call_count == 0 for c in others)
 
 

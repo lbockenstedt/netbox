@@ -349,6 +349,21 @@ class NetboxSpoke(BaseSpoke):
                 defaults=data.get("defaults", {}),
             )
 
+        if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
+            # Realtime NAC→IPAM reverse sync. The hub relays a tenant's recent
+            # ClearPass Access Tracker / session records (CPPM_GET_RECENT_SESSIONS,
+            # attributed to the tenant by IP prefix containment) for an
+            # only-add-missing push into NetBox DCIM: a device per MAC not already
+            # present, with a NIC interface (native MAC) + framed IP + a cable to
+            # a switch device's port interface. NetBox stays source of truth →
+            # replace is always False. See lm core/src/realtime_ipam_nac_sync.py.
+            return await self._run_sync(
+                self.engine.sync_access_tracker,
+                sessions=data.get("sessions", []),
+                tenant_slug=data.get("tenant_slug", ""),
+                defaults=data.get("defaults", {}),
+            )
+
         if normalized == "NETBOX_SEARCH":
             return await self._run_sync(self.engine.search,
                                         query=data.get("q", ""), tenant=data.get("tenant"))

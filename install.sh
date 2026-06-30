@@ -762,6 +762,14 @@ FIELDS = [
     ("proxmox_type",      "text", "Proxmox type",       "virtualization.virtualmachine"),
     ("discovered_from",   "text", "Discovered from",    "dcim.device"),
     ("mac_address",       "text", "MAC address",        "ipam.ipaddress"),
+    # mac_address also attaches to dcim.device (the access-tracker sync keys
+    # existing-device matching off the device's MAC custom field). The GET-skip
+    # below leaves an already-existing field as-is; the spoke self-heals the
+    # extra content-type at startup (_ensure_custom_fields).
+    ("mac_address",       "text", "MAC address",        "dcim.device"),
+    ("switch_ip",         "text", "Switch IP",          "dcim.device"),
+    ("switch_port",       "text", "Switch port",        "dcim.device"),
+    ("last_seen",         "text", "Last seen",          "dcim.device"),
     ("vmid_start",        "integer", "Proxmox VMID range start", "tenancy.tenant"),
     ("vmid_end",          "integer", "Proxmox VMID range end",   "tenancy.tenant"),
 ]
