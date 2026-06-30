@@ -303,7 +303,8 @@ class NetboxEngine:
                     except Exception as e:
                         logger.debug(f"containing-prefix lookup for {ip_str} failed, using /32: {e}")
                     full = f"{ip_str}/{mask}"
-                iface = device.interfaces.create(name="mgmt", type="other")
+                iface = self.nb.dcim.interfaces.create(
+                    device=device.id, name="mgmt", type="other")
                 ip_kwargs: Dict[str, Any] = {
                     "address": full,
                     "assigned_object_type": "dcim.interface",
@@ -932,26 +933,45 @@ class NetboxEngine:
     ]
 
     def _ensure_custom_fields(self) -> None:
-        """Create any of _REQUIRED_CUSTOM_FIELDS that are missing on NetBox.
+        """Ensure each of _REQUIRED_CUSTOM_FIELDS exists AND is attached to its
+        content type on NetBox.
 
-        Idempotent (get-or-create by name) and best-effort: a permission / API
-        error is logged at DEBUG and swallowed so a restricted token never
-        breaks a sync. Safe to call at startup and on reconnect."""
+        A field can exist globally but be unassigned to the object type — in
+        that case NetBox rejects writes with "Custom field 'X' does not exist
+        for this object type." (the exact sync_vms failure seen after the
+        fields were created without content_types). So this get-or-creates each
+        field AND verifies/attaches its content_type. Best-effort: a permission
+        / API error is logged at WARNING (so it's visible) and swallowed — a
+        restricted token must never break a sync. Safe at startup and reconnect.
+        """
         try:
             cf_api = self.nb.extras.custom_fields
-            existing = {str(f.name) for f in cf_api.all()}
+            by_name = {str(f.name): f for f in cf_api.all()}
         except Exception as e:
-            logger.debug("ensure_custom_fields: list failed: %s", e)
+            logger.warning("ensure_custom_fields: list failed: %s", e)
             return
         for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
-            if name in existing:
-                continue
+            cf = by_name.get(name)
+            if cf is None:
+                try:
+                    cf = cf_api.create(name=name, type=ftype, label=label,
+                                       content_types=[content_type])
+                    logger.info("ensure_custom_fields: created %s on %s", name, content_type)
+                except Exception as e:
+                    logger.warning("ensure_custom_fields: create %s failed: %s", name, e)
+                    continue
+            # Verify the content type is attached (create may not attach it on
+            # every NetBox version; a pre-existing field may be unattached).
             try:
-                cf_api.create(name=name, type=ftype, label=label,
-                              content_types=[content_type])
-                logger.info("ensure_custom_fields: created %s on %s", name, content_type)
+                current = list(getattr(cf, "content_types", None) or [])
+                if content_type not in current:
+                    cf.content_types = current + [content_type]
+                    cf.save()
+                    logger.info("ensure_custom_fields: attached %s to %s",
+                                name, content_type)
             except Exception as e:
-                logger.debug("ensure_custom_fields: create %s failed: %s", name, e)
+                logger.warning("ensure_custom_fields: attach %s to %s failed: %s",
+                               name, content_type, e)
 
     def _ensure_cluster_type(self, name: str = "Proxmox", slug: str = "proxmox"):
         """Return the 'Proxmox' cluster type (creating it if missing). Best-effort."""
@@ -1582,7 +1602,15 @@ class NetboxEngine:
                             logger.debug("sync_devices: discovered_from tag skipped: %s", e)
                         # mgmt interface + IP (mac on the IP) + primary_ip4.
                         if real_ip:
-                            iface = devobj.interfaces.create(name="mgmt", type="other")
+                            # Use the top-level dcim.interfaces endpoint with
+                            # device=<id> rather than devobj.interfaces.create
+                            # — the nested accessor isn't supported on every
+                            # pynetbox version (AttributeError "object has no
+                            # attribute 'interfaces'"), and it's what unblocked
+                            # the create branch once the name-collision 400s were
+                            # resolved.
+                            iface = self.nb.dcim.interfaces.create(
+                                device=devobj.id, name="mgmt", type="other")
                             mask = self._mask_for_ip(real_ip)
                             ip_kwargs: Dict[str, Any] = {
                                 "address": f"{real_ip}/{mask}",

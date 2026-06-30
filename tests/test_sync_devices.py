@@ -61,6 +61,8 @@ def test_sync_devices_creates_new_owned_device():
     eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
     dev = _Obj(id=42)
     eng.nb.dcim.devices.create.return_value = dev
+    iface = _Iface(id=100)
+    eng.nb.dcim.interfaces.create.return_value = iface
     ip = _Obj(id=555)
     eng.nb.ipam.ip_addresses.create.return_value = ip
 
@@ -79,11 +81,15 @@ def test_sync_devices_creates_new_owned_device():
     # Ownership tag applied to the device.
     assert dev.custom_fields.get("discovered_from") == "opnsense"
     dev.save.assert_called()
-    # mgmt interface created + IP created against it + mac_address set on IP.
-    dev.interfaces.create.assert_called_once()
+    # mgmt interface created via the top-level dcim.interfaces endpoint
+    # (device=<id>) — NOT devobj.interfaces.create (nested accessor unsupported
+    # on some pynetbox versions). IP created against it + mac_address set.
+    eng.nb.dcim.interfaces.create.assert_called_once()
+    assert eng.nb.dcim.interfaces.create.call_args.kwargs["device"] == 42
     ik = eng.nb.ipam.ip_addresses.create.call_args.kwargs
     assert ik["address"] == "10.0.0.5/32"  # no containing prefix → /32
     assert ik["assigned_object_type"] == "dcim.interface"
+    assert ik["assigned_object_id"] == 100
     assert ik["dns_name"] == "ws-05"
     assert ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"  # normalized
     # primary_ip4 set from the created IP.
@@ -267,17 +273,47 @@ def test_sync_devices_no_ip_owned_device_indexed_by_name():
 def test_ensure_custom_fields_creates_missing_skips_present():
     eng = NetboxEngine("http://localhost", "tok")
     eng.nb = MagicMock()
-    # proxmox_node already exists → skip; the other 7 must be created.
-    eng.nb.extras.custom_fields.all.return_value = [SimpleNamespace(name="proxmox_node")]
+    # proxmox_node already exists AND is attached → skip (no create, no save);
+    # the other 7 must be created.
+    present = SimpleNamespace(name="proxmox_node",
+                              content_types=["virtualization.virtualmachine"],
+                              save=MagicMock())
+    eng.nb.extras.custom_fields.all.return_value = [present]
+    eng.nb.extras.custom_fields.create.return_value = SimpleNamespace(
+        name="x", content_types=[], save=MagicMock())
     eng._ensure_custom_fields()
     created = {c.kwargs["name"] for c in eng.nb.extras.custom_fields.create.call_args_list}
     assert "proxmox_node" not in created
     assert {"proxmox_unique_id", "proxmox_vmid", "proxmox_type",
             "discovered_from", "mac_address", "vmid_start", "vmid_end"} <= created
-    # Each create carries the NetBox REST shape.
+    # Each create carries the NetBox REST shape (incl. content_types).
     sample = eng.nb.extras.custom_fields.create.call_args_list[0].kwargs
     assert sample["type"] in ("text", "integer")
     assert isinstance(sample["content_types"], list)
+    # Already-attached present field was not re-saved.
+    present.save.assert_not_called()
+
+
+def test_ensure_custom_fields_attaches_existing_unattached_field():
+    # A field that exists globally but is NOT attached to its content type →
+    # NetBox writes fail with "does not exist for this object type". The ensure
+    # must attach it (save) instead of skipping.
+    eng = NetboxEngine("http://localhost", "tok")
+    eng.nb = MagicMock()
+    cfs = []
+    for name, ftype, label, ct in NetboxEngine._REQUIRED_CUSTOM_FIELDS:
+        attached = [] if name == "proxmox_node" else [ct]
+        cfs.append(SimpleNamespace(name=name, content_types=list(attached),
+                                   save=MagicMock()))
+    eng.nb.extras.custom_fields.all.return_value = cfs
+    eng._ensure_custom_fields()
+    eng.nb.extras.custom_fields.create.assert_not_called()  # all exist
+    prox = next(c for c in cfs if c.name == "proxmox_node")
+    prox.save.assert_called_once()
+    assert "virtualization.virtualmachine" in prox.content_types
+    # Already-attached fields were not re-saved.
+    others = [c for c in cfs if c.name != "proxmox_node"]
+    assert all(c.save.call_count == 0 for c in others)
 
 
 def test_ensure_custom_fields_swallows_api_error():
