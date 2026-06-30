@@ -110,6 +110,59 @@ def test_sync_vms_update_core_save_lands_even_if_custom_fields_fail():
     assert existing_vm.save.call_count == 2   # core save + (failed) cf PATCH
 
 
+# ── Adopt-by-name self-heal: the "name must be unique per cluster" 400 ────────
+#
+# A NetBox VM occupies (name, cluster) but has no/mismatched proxmox_unique_id
+# (a stale/manual record, or one whose uid changed after a node rename). The
+# uid index misses it, so without a name+cluster fallback the create branch
+# 400s. The fix resolves existing by uid first, then by (name, cluster) —
+# adopting the record and stamping the incoming proxmox_unique_id.
+
+def test_sync_vms_adopts_existing_vm_by_name_when_uid_missing():
+    # Existing NetBox VM with the same name+cluster but NO proxmox_unique_id.
+    existing_row = {"id": 7, "name": "vm100",
+                    "cluster": {"id": 999, "name": "c1"}, "custom_fields": {}}
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[existing_row])
+    existing_vm = _Obj(id=7, custom_fields={})
+    eng.nb.virtualization.virtual_machines.get.return_value = existing_vm
+
+    res = eng.sync_vms(vms=[_VM], tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    # Adopted, NOT recreated — the 400 trap is avoided.
+    eng.nb.virtualization.virtual_machines.create.assert_not_called()
+    # The incoming proxmox_unique_id is stamped so future syncs match by uid.
+    assert existing_vm.custom_fields.get("proxmox_unique_id") == "pxmx:100"
+    assert existing_vm.name == "vm100"
+    existing_vm.save.assert_called()   # core update + cf PATCH
+
+
+def test_sync_vms_uid_match_takes_precedence_over_name_cluster():
+    # Two rows: one matching by uid (id=7), one matching by name+cluster (id=8,
+    # different uid). The uid match must win so the right record is updated.
+    uid_row = {"id": 7, "name": "vm100",
+               "cluster": {"id": 999, "name": "c1"},
+               "custom_fields": {"proxmox_unique_id": "pxmx:100"}}
+    name_row = {"id": 8, "name": "vm100",
+                "cluster": {"id": 999, "name": "c1"},
+                "custom_fields": {"proxmox_unique_id": "pxmx:other"}}
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[uid_row, name_row])
+    uid_vm = _Obj(id=7, custom_fields={"proxmox_unique_id": "pxmx:100"})
+    eng.nb.virtualization.virtual_machines.get.return_value = uid_vm
+
+    res = eng.sync_vms(vms=[_VM], tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    # The uid-matched row (id=7) was the one fetched/updated, not id=8.
+    eng.nb.virtualization.virtual_machines.get.assert_called_once_with(7)
+    eng.nb.virtualization.virtual_machines.create.assert_not_called()
+
+
 # ── VM IP/MAC gathering: _assign_vm_primary_ip4 builds vminterfaces + IPs ─────
 
 def _engine_real_assign():

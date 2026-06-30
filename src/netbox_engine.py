@@ -1473,6 +1473,7 @@ class NetboxEngine:
             # (proxmox-sourced) — cluster-wide, so replace-delete can remove
             # VMs destroyed in Proxmox regardless of which tenant owns them.
             existing: Dict[str, dict] = {}  # uid -> raw row dict (carries "id")
+            existing_by_nc: Dict[tuple, dict] = {}  # (name, cluster_id) -> row
             try:
                 rows = self._api_get_all("/api/virtualization/virtual-machines/",
                                          {"limit": 500})
@@ -1487,6 +1488,20 @@ class NetboxEngine:
                 uid = str((cf.get("proxmox_unique_id") or "").strip())
                 if uid:
                     existing[uid] = row
+                # Secondary index by (name, cluster_id) — NetBox enforces name
+                # uniqueness per cluster, so at most one row per key. Used as a
+                # fallback when a NetBox VM occupies the name+cluster but has no
+                # /mismatched proxmox_unique_id (a stale/manual record, or a VM
+                # whose uid changed after a node rename): without this the uid
+                # lookup misses and the create branch 400s with "Virtual machine
+                # name must be unique per cluster." Adopting by name self-heals
+                # — the update stamps the incoming proxmox_unique_id so future
+                # syncs match by uid.
+                rname = str(row.get("name") or "").strip()
+                rcl = row.get("cluster")
+                rcid = (rcl.get("id") if isinstance(rcl, dict) else rcl)
+                if rname and rcid:
+                    existing_by_nc[(rname, int(rcid))] = row
 
             # Replace-delete (cluster-wide): drop proxmox-sourced NetBox VMs
             # whose uid is no longer in the incoming full set. Attribute each
@@ -1537,8 +1552,15 @@ class NetboxEngine:
                         "last_seen": datetime.now(timezone.utc).strftime(
                             "%Y-%m-%dT%H:%M:%SZ"),
                     }
-                    if uid in existing:
-                        obj = self.nb.virtualization.virtual_machines.get(existing[uid]["id"])
+                    # Resolve the existing NetBox VM: by proxmox_unique_id first
+                    # (the steady-state match), then by (name, cluster) as a
+                    # fallback that adopts a stale/manual record occupying the
+                    # name — see the existing_by_nc comment above.
+                    match_row = existing.get(uid)
+                    if match_row is None and cluster_id:
+                        match_row = existing_by_nc.get((name, cluster_id))
+                    if match_row is not None:
+                        obj = self.nb.virtualization.virtual_machines.get(match_row["id"])
                         if not obj:
                             errors += 1
                             b["errors"] += 1
