@@ -335,3 +335,77 @@ def test_sync_vms_external_sot_overwrites_existing_vm():
     assert res["status"] == "SUCCESS", res
     assert existing_vm.name == "vm-renamed"          # overwritten
     assert existing_vm.custom_fields.get("proxmox_node") == "pve1"  # linkage refreshed
+
+
+# ── Case-insensitive tenant resolution ────────────────────────────────────────
+#
+# A VM's Proxmox label (or a configured tenant_slug) can arrive in mixed case,
+# and the label may be the tenant's display NAME rather than its slug. sync_vms
+# builds a lower(slug) ∪ lower(name) → canonical-slug lookup once per batch and
+# resolves the incoming tenant_slug through it, so "LRB" / "Lrb" / "LRB Labs"
+# all land on tenant slug "lrb".
+
+def _ci_engine(tenant_rows):
+    """Engine whose _api_get_all returns tenant_rows for the tenancy/tenants
+    path and [] (no existing VMs) otherwise; tenants.get returns a real-ish
+    tenant object only for the canonical slug "lrb"."""
+    eng = _engine()
+
+    def fake_get_all(path, params=None, **kw):
+        if "tenancy/tenants" in path:
+            return tenant_rows
+        return []
+    eng._api_get_all = MagicMock(side_effect=fake_get_all)
+
+    tenant_obj = MagicMock()
+    tenant_obj.id = 11
+    # tenants.get(slug="lrb") → the tenant; any other slug → None (not found).
+
+    def tenants_get(slug=None, **kw):
+        return tenant_obj if slug == "lrb" else None
+    eng.nb.tenancy.tenants.get = MagicMock(side_effect=tenants_get)
+    eng.nb.virtualization.virtual_machines.create.return_value = _Obj(id=42)
+    return eng
+
+
+def test_sync_vms_resolves_tenant_slug_case_insensitively():
+    eng = _ci_engine([{"id": 11, "slug": "lrb", "name": "LRB Labs"}])
+    # Mixed-case slug "LRB" must resolve to canonical "lrb".
+    res = eng.sync_vms(vms=[{**_VM, "tenant_slug": "LRB"}],
+                       tenant_slug="", replace=False)
+    assert res["status"] == "SUCCESS", res
+    eng.nb.tenancy.tenants.get.assert_called_with(slug="lrb")
+    ck = eng.nb.virtualization.virtual_machines.create.call_args.kwargs
+    assert ck["tenant"] == 11
+
+
+def test_sync_vms_resolves_tenant_by_display_name_case_insensitive():
+    eng = _ci_engine([{"id": 11, "slug": "lrb", "name": "LRB Labs"}])
+    # The VM label is the tenant's display NAME in mixed case — must still
+    # resolve to slug "lrb" via the lower(name) index.
+    res = eng.sync_vms(vms=[{**_VM, "tenant_slug": "lrb labs"}],
+                       tenant_slug="", replace=False)
+    assert res["status"] == "SUCCESS", res
+    eng.nb.tenancy.tenants.get.assert_called_with(slug="lrb")
+    assert eng.nb.virtualization.virtual_machines.create.call_args.kwargs["tenant"] == 11
+
+
+def test_sync_vms_slug_match_wins_over_name_collision():
+    # Two tenants: slug "alpha" and a tenant whose NAME is "Alpha" (slug "a2").
+    # An incoming "alpha" must resolve to slug "alpha" (the slug), not "a2".
+    eng = _ci_engine([{"id": 11, "slug": "lrb", "name": "LRB Labs"}])
+
+    def tenants_get(slug=None, **kw):
+        return MagicMock(id=11) if slug == "lrb" else (
+            MagicMock(id=22) if slug == "a2" else None)
+    eng.nb.tenancy.tenants.get = MagicMock(side_effect=tenants_get)
+    eng._api_get_all = MagicMock(side_effect=lambda path, params=None, **kw: [
+        {"id": 11, "slug": "lrb", "name": "LRB Labs"},
+        {"id": 22, "slug": "a2", "name": "lrb"},  # name collides with slug "lrb"
+    ] if "tenancy/tenants" in path else [])
+
+    res = eng.sync_vms(vms=[{**_VM, "tenant_slug": "LRB"}],
+                       tenant_slug="", replace=False)
+    assert res["status"] == "SUCCESS", res
+    # slug.lower() "lrb" was inserted before name.lower() "lrb" → canonical "lrb"
+    eng.nb.tenancy.tenants.get.assert_called_with(slug="lrb")

@@ -1467,14 +1467,37 @@ class NetboxEngine:
         # slug -> tenant object cache (None for unassigned). '' → None.
         tenant_cache: Dict[str, Any] = {}
 
+        # Case-insensitive tenant lookup table: map lower(slug) AND lower(name)
+        # → the tenant's canonical NetBox slug, built once per batch. NetBox
+        # slugs are conventionally lowercase, but a VM's Proxmox label (or a
+        # configured tenant_slug) can arrive in mixed case, and the label may
+        # be the tenant's display NAME rather than its slug. We resolve the
+        # incoming value to the canonical slug first (slug match wins over a
+        # name match on collision), then do the exact pynetbox fetch — so a VM
+        # labeled "LRB" / "Lrb" / "LRB Labs" still attributes to tenant slug
+        # "lrb". Falls back to the raw value if the index build failed.
+        tenant_lut: Dict[str, str] = {}
+        try:
+            for t in self._api_get_all("/api/tenancy/tenants/"):
+                slug = str((t or {}).get("slug") or "").strip()
+                if not slug:
+                    continue
+                tenant_lut.setdefault(slug.lower(), slug)
+                nm = str((t or {}).get("name") or "").strip()
+                if nm:
+                    tenant_lut.setdefault(nm.lower(), slug)
+        except Exception as e:
+            logger.debug("sync_vms: build tenant lookup failed: %s", e)
+
         def _resolve_tenant(slug: Optional[str]):
             s = str(slug or "").strip()
             if not s:
                 return None
             if s in tenant_cache:
                 return tenant_cache[s]
+            canon = tenant_lut.get(s.lower()) or s
             try:
-                t = self.nb.tenancy.tenants.get(slug=s)
+                t = self.nb.tenancy.tenants.get(slug=canon)
             except Exception as e:
                 logger.debug("sync_vms: resolve tenant %s failed: %s", s, e)
                 t = None
