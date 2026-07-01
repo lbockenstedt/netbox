@@ -2322,8 +2322,32 @@ class NetboxEngine:
                                 f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id,
                                 tenant=tenant, hostname=hostname, mac=mac,
                                 source=source_tag)
-                            devobj.primary_ip4 = ipobj.id
-                            devobj.save()
+                            # Set primary_ip4 on a FRESH fetch so the save does
+                            # not re-send the best-effort custom_fields merged onto
+                            # ``devobj`` above (the discovered_from/last_seen/
+                            # mac_address stamp). When the deployed NetBox hasn't
+                            # attached those custom fields to dcim.device yet (a
+                            # provisioning gap — _ensure_custom_fields self-heals
+                            # it, but there's a first-sync window + a restricted
+                            # token can't create them), re-sending them 400s
+                            # ("Custom field 'X' does not exist for this object
+                            # type") and used to kill the whole upsert: the device
+                            # was created but primary_ip4 was never set, so the
+                            # next sync couldn't match it (no primary_ip4, no
+                            # mac_address cf) → re-create + 400 every cycle (the
+                            # persistent 100+ errors/tenant in the hub log). A fresh
+                            # get carries only NetBox's actually-provisioned cfs,
+                            # so the save sends only valid fields. Best-effort: a
+                            # failure here is logged DEBUG and the device still
+                            # counts as pushed (it was created above).
+                            try:
+                                fresh = self.nb.dcim.devices.get(devobj.id)
+                                if fresh:
+                                    fresh.primary_ip4 = ipobj.id
+                                    fresh.save()
+                            except Exception as e:
+                                logger.debug("sync_devices: set primary_ip4 %s on %s failed: %s",
+                                              real_ip, name, e)
                             self._journal("ipam.ipaddress", ipobj.id,
                                           source_tag,
                                           note=f"IP {real_ip}/{mask} → {name}")

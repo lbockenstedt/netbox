@@ -64,6 +64,12 @@ def test_sync_devices_creates_new_owned_device():
     eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
     dev = _Obj(id=42)
     eng.nb.dcim.devices.create.return_value = dev
+    # primary_ip4 is set on a FRESH fetch (devices.get), not on the created
+    # dev, so the save re-sends only NetBox's actually-provisioned custom_fields
+    # — re-sending the best-effort cf stamp 400s when the deployed NetBox hasn't
+    # attached those fields yet. See test_sync_devices_missing_custom_field_is_graceful.
+    fresh = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = fresh
     iface = _Iface(id=100)
     eng.nb.dcim.interfaces.create.return_value = iface
     ip = _Obj(id=555)
@@ -99,8 +105,10 @@ def test_sync_devices_creates_new_owned_device():
     assert ik["assigned_object_id"] == 100
     assert ik["dns_name"] == "ws-05"
     assert ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"  # normalized
-    # primary_ip4 set from the created IP.
-    assert dev.primary_ip4 == 555
+    # primary_ip4 set from the created IP — on the FRESH fetch, not on dev
+    # (re-sending dev's best-effort cf stamp would 400 when fields are unprovisioned).
+    assert fresh.primary_ip4 == 555
+    assert fresh.save.called
 
 
 def test_sync_devices_updates_existing_by_ip_no_duplicate():
@@ -166,7 +174,7 @@ def test_sync_devices_no_delete_when_unscoped():
 
     assert res["status"] == "SUCCESS"
     assert res["deleted"] == 0
-    eng.nb.dcim.devices.get.assert_not_called()  # no delete path entered
+    eng.nb.dcim.devices.delete.assert_not_called()  # no delete path entered
 
 
 def test_sync_devices_missing_custom_field_is_graceful():
@@ -175,10 +183,15 @@ def test_sync_devices_missing_custom_field_is_graceful():
     # must swallow it and still create the device + IP.
     eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
     dev = _Obj(id=42)
-    # First save (the discovered_from tag) raises; the second (primary_ip4) must
-    # succeed so the device + IP are still created.
-    dev.save.side_effect = [Exception("custom field discovered_from not found"), None]
+    # The discovered_from/last_seen/mac_address cf stamp save raises (NetBox
+    # rejects unprovisioned custom fields). It is swallowed, so the device is
+    # still created. primary_ip4 is set on a FRESH fetch whose save carries only
+    # NetBox's actually-provisioned cfs, so it succeeds — the device is not left
+    # IP-less (which used to make the next sync re-create + 400 every cycle).
+    dev.save.side_effect = Exception("custom field discovered_from not found")
     eng.nb.dcim.devices.create.return_value = dev
+    fresh = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = fresh
     ip = _Obj(id=555)
     eng.nb.ipam.ip_addresses.create.return_value = ip
 
@@ -188,6 +201,9 @@ def test_sync_devices_missing_custom_field_is_graceful():
 
     assert res["status"] == "SUCCESS"
     assert res["pushed"] == 1  # device still counts as pushed despite the tag failure
+    # primary_ip4 landed on the fresh fetch even though the cf-stamp save raised.
+    assert fresh.primary_ip4 == 555
+    assert fresh.save.called
 
 
 # ── name + tenant unique-constraint fix (DHCP IP-move collision) ────────────
@@ -245,8 +261,9 @@ def test_sync_devices_unowned_name_collision_uniquifies_does_not_clobber():
     assert res["status"] == "SUCCESS", res
     assert res["pushed"] == 1
     assert res["errors"] == 0
-    # The human device was NOT touched (no devices.get for a delete).
-    eng.nb.dcim.devices.get.assert_not_called()
+    # The human device was NOT touched (no delete). NB: the create branch now
+    # calls devices.get for the fresh primary_ip4 fetch, so get IS called here.
+    eng.nb.dcim.devices.delete.assert_not_called()
     # We created under a uniquified name (mac suffix), not the colliding one.
     ck = eng.nb.dcim.devices.create.call_args.kwargs
     assert ck["name"] != "device-aabbccddeeff"
@@ -430,6 +447,8 @@ def test_sync_devices_reuses_existing_global_ip_instead_of_duplicate_create():
     eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
     dev = _Obj(id=42)
     eng.nb.dcim.devices.create.return_value = dev
+    fresh = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = fresh
     eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
     existing_ip = _Obj(id=901, custom_fields={})
     eng.nb.ipam.ip_addresses.get.return_value = existing_ip   # global duplicate
@@ -446,7 +465,7 @@ def test_sync_devices_reuses_existing_global_ip_instead_of_duplicate_create():
     assert existing_ip.assigned_object_type == "dcim.interface"
     assert existing_ip.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
     existing_ip.save.assert_called()
-    assert dev.primary_ip4 == 901   # device points at the reused IP
+    assert fresh.primary_ip4 == 901   # device points at the reused IP (fresh fetch)
 
 
 # ── change-log journal stamps ───────────────────────────────────────────────
@@ -656,7 +675,7 @@ def test_sync_devices_hostname_match_against_non_bare_device_uniquifies():
     assert ck["name"] != "ks205"
     assert ck["name"].startswith("ks205-")
     # The human device 77 was NOT deleted (no reclaim of an unowned name).
-    eng.nb.dcim.devices.get.assert_not_called()
+    eng.nb.dcim.devices.delete.assert_not_called()
 
 
 def test_sync_devices_mac_only_record_matches_existing_by_mac_no_duplicate():
@@ -756,8 +775,9 @@ def test_sync_devices_duplicate_allowed_when_hostname_same_and_mac_ip_both_diffe
     assert ck["name"] != "ks205"
     assert ck["name"].startswith("ks205-")
     # The existing owned device 77 was NOT deleted (different machine, not a
-    # reclaimable orphan) — no devices.get for a delete.
-    eng.nb.dcim.devices.get.assert_not_called()
+    # reclaimable orphan) — no delete. NB: the create branch's fresh primary_ip4
+    # fetch now calls devices.get, so get IS called here.
+    eng.nb.dcim.devices.delete.assert_not_called()
 
 
 def test_sync_devices_same_mac_merges_no_duplicate_on_dhcp_move():
