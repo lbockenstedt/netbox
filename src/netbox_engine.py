@@ -1214,7 +1214,7 @@ class NetboxEngine:
         except Exception as e:
             logger.debug("stamp_last_seen on %r failed: %s", obj, e)
 
-    def _assign_vm_primary_ip4(self, vm_obj, vm: dict, tenant=None) -> None:
+    def _assign_vm_primary_ip4(self, vm_obj, vm: dict, tenant=None):
         """Build the VM's interfaces in NetBox from the per-interface records
         the pxmx agent gathers, set ``primary_ip4`` from the first IP, and
         journal-stamp each created vminterface + IP.
@@ -1227,7 +1227,16 @@ class NetboxEngine:
         the interface MAC. Falls back to a single ``eth0`` vminterface + the
         legacy flat ``vm["ips"]`` list when the agent sent no interface records
         (older spoke). Never raises — a missing/unassignable IP must not break
-        the VM record it follows."""
+        the VM record it follows.
+
+        Returns ``(build_failures, first_build_err)``: the count of vminterface
+        / IP / primary_ip4 build failures and the first one's human-readable
+        text (None when 0). A real-world pynetbox failure (e.g. the IP already
+        exists in IPAM assigned to a discovered dcim.device, so reuse/reassign
+        raises) used to be swallowed at DEBUG with nothing reported back — the
+        VM ended up IP-less with 0 errors. The first failure is now logged at
+        WARNING (``[sync-error]``) so it reaches the spoke log + GET_ERROR_LOGS;
+        the caller folds the count + first error into the sync result."""
         ifaces_in = list((vm or {}).get("interfaces") or [])
         # Back-compat: an older pxmx agent that sent only a flat ``ips`` list
         # (no per-interface MAC) → one eth0 vminterface holding those IPs.
@@ -1246,6 +1255,28 @@ class NetboxEngine:
             existing = []
         by_name = {getattr(i, "name", ""): i for i in existing}
         first_ip_id = None
+        # Surface IP/interface build failures instead of swallowing them at
+        # DEBUG: a real-world pynetbox failure (e.g. the VM's IP already exists
+        # in IPAM assigned to a discovered dcim.device, so the reuse/reassign
+        # path raises) used to leave the VM IP-less with 0 reported errors —
+        # impossible to diagnose. Count failures + capture the first error text
+        # so sync_vms can fold them into its result + [sync-error] marker.
+        build_failures = 0
+        first_build_err: Optional[str] = None
+        vm_name = str(getattr(vm_obj, "name", "") or "")
+
+        def _record_fail(msg: str, exc: BaseException) -> None:
+            nonlocal build_failures, first_build_err
+            build_failures += 1
+            if first_build_err is None:
+                first_build_err = msg
+            # First failure → WARNING (lands in the spoke log + GET_ERROR_LOGS);
+            # later ones → DEBUG (avoid log spam on a batch-wide outage).
+            if build_failures == 1:
+                logger.warning("[sync-error] assign_vm_primary_ip4: %s: %s", msg, exc)
+            else:
+                logger.debug("assign_vm_primary_ip4: %s: %s", msg, exc)
+
         for ifc in ifaces_in:
             name = str(ifc.get("name") or "").strip() or "eth0"
             mac = self._norm_mac(str(ifc.get("mac") or ""))
@@ -1274,7 +1305,7 @@ class NetboxEngine:
                             logger.debug("assign_vm_primary_ip4: mac refresh %s: %s",
                                          name, e)
             except Exception as e:
-                logger.debug("assign_vm_primary_ip4: vminterface %s failed: %s", name, e)
+                _record_fail(f"vminterface {name} for VM {vm_name} failed", e)
                 continue
             for ip_str in ips:
                 if not ip_str:
@@ -1291,23 +1322,23 @@ class NetboxEngine:
                         ip_kwargs["tenant"] = tenant.id
                     ip_obj = self._reuse_or_create_ip(
                         full, ip_kwargs, ip_str, iface.id, tenant,
-                        hostname=str(getattr(vm_obj, "name", "") or ""),
+                        hostname=vm_name,
                         mac=mac, source="hypervisor-vm-sync",
                         iface_type="virtualization.vminterface")
                     self._journal("ipam.ipaddress", ip_obj.id,
                                    "hypervisor-vm-sync",
-                                   note=f"VM {getattr(vm_obj, 'name', '')} {name}")
+                                   note=f"VM {vm_name} {name}")
                     if first_ip_id is None:
                         first_ip_id = getattr(ip_obj, "id", None)
                 except Exception as e:
-                    logger.debug("assign_vm_primary_ip4: IP %s on %s failed: %s",
-                                 ip_str, name, e)
+                    _record_fail(f"IP {ip_str} on {name} for VM {vm_name} failed", e)
         if first_ip_id is not None:
             try:
                 vm_obj.primary_ip4 = first_ip_id
                 vm_obj.save()
             except Exception as e:
-                logger.debug("assign_vm_primary_ip4: set primary_ip4 failed: %s", e)
+                _record_fail(f"set primary_ip4 for VM {vm_name} failed", e)
+        return build_failures, first_build_err
 
     # ---- firewall→NetBox device discovery sync helpers ---------------------
 
@@ -1628,41 +1659,45 @@ class NetboxEngine:
                         # NOT overwrite any field Proxmox would otherwise clobber
                         # (name/cluster/status/vcpus/disk/memory/tenant/proxmox_*).
                         # We still refresh last_seen (a staleness signal, not a
-                        # truth field) so a seen VM isn't swept. "external"
-                        # (Proxmox is the source of truth) overwrites as before.
+                        # truth field) so a seen VM isn't swept. The per-interface
+                        # vminterfaces/IPs are GATHERED data, not a truth field, so
+                        # only-add-missing still builds them — a pre-existing VM
+                        # that predates the IP-gathering feature must still get its
+                        # IPs added. (Was: ``continue``d here, so a netbox-SoT VM
+                        # never got ``_assign_vm_primary_ip4`` → IP-less with 0
+                        # reported errors.) "external" (Proxmox is the source of
+                        # truth) overwrites the truth fields as before.
                         if source_of_truth == "netbox":
                             self._stamp_last_seen(obj)
-                            pushed += 1
-                            b["pushed"] += 1
-                            continue
-                        obj.name = name
-                        if cluster_id:
-                            obj.cluster = cluster_id
-                        obj.status = status
-                        if vcpus:
-                            obj.vcpus = vcpus
-                        if disk_gb:
-                            obj.disk = int(disk_gb)
-                        if mem_mb:
-                            obj.memory = mem_mb
-                        # Set/clear so a VM that changed tags moves tenant
-                        # (or drops to unassigned) without a delete+recreate.
-                        obj.tenant = tenant.id if tenant else None
-                        obj.save()  # core fields — always syncs even if cf unprovisioned
-                        # proxmox_* linkage is best-effort: the deployed NetBox
-                        # may not have the custom fields attached to
-                        # virtualization.virtualmachine yet, and a 400 here must
-                        # NOT undo the core update above. The create path sets
-                        # them once the fields exist (next sync after ensure).
-                        try:
-                            merged = dict(obj.custom_fields or {})
-                            merged.update(cf)
-                            obj.custom_fields = merged
-                            obj.save()
-                        except Exception as e:
-                            logger.warning("sync_vms: custom_fields update %s skipped "
-                                           "(field unprovisioned?): %s", uid, e)
-                        # last_seen is folded into ``cf`` above → rides the cf PATCH.
+                        else:
+                            obj.name = name
+                            if cluster_id:
+                                obj.cluster = cluster_id
+                            obj.status = status
+                            if vcpus:
+                                obj.vcpus = vcpus
+                            if disk_gb:
+                                obj.disk = int(disk_gb)
+                            if mem_mb:
+                                obj.memory = mem_mb
+                            # Set/clear so a VM that changed tags moves tenant
+                            # (or drops to unassigned) without a delete+recreate.
+                            obj.tenant = tenant.id if tenant else None
+                            obj.save()  # core fields — always syncs even if cf unprovisioned
+                            # proxmox_* linkage is best-effort: the deployed NetBox
+                            # may not have the custom fields attached to
+                            # virtualization.virtualmachine yet, and a 400 here must
+                            # NOT undo the core update above. The create path sets
+                            # them once the fields exist (next sync after ensure).
+                            try:
+                                merged = dict(obj.custom_fields or {})
+                                merged.update(cf)
+                                obj.custom_fields = merged
+                                obj.save()
+                            except Exception as e:
+                                logger.warning("sync_vms: custom_fields update %s skipped "
+                                               "(field unprovisioned?): %s", uid, e)
+                            # last_seen is folded into ``cf`` above → rides the cf PATCH.
                     else:
                         # Create WITHOUT inline custom_fields: a create carrying
                         # custom_fields 400s ("Custom field 'proxmox_node' does
@@ -1697,7 +1732,15 @@ class NetboxEngine:
                         # last_seen folded into ``cf`` above → rides the cf save.
                     # vminterfaces + all IPs + primary_ip4 (best-effort) — built
                     # from the per-interface records the pxmx agent gathers.
-                    self._assign_vm_primary_ip4(obj, vm, tenant)
+                    # Returns (failures, first_err): a real-world pynetbox failure
+                    # (e.g. the IP already exists in IPAM on a discovered device)
+                    # is now counted + surfaced instead of silently DEBUG-logged.
+                    ip_fail, ip_err = self._assign_vm_primary_ip4(obj, vm, tenant)
+                    if ip_fail:
+                        errors += ip_fail
+                        b["errors"] += ip_fail
+                        if first_err is None and ip_err:
+                            first_err = ip_err
                     pushed += 1
                     b["pushed"] += 1
                 except Exception as e:

@@ -38,7 +38,7 @@ def _engine():
     eng._api_get_all = MagicMock(return_value=[])          # no existing VMs
     eng._ensure_vm_cluster = MagicMock(return_value=999)   # cluster id
     eng._vm_status_map = MagicMock(return_value="active")
-    eng._assign_vm_primary_ip4 = MagicMock()               # no-op (ips best-effort)
+    eng._assign_vm_primary_ip4 = MagicMock(return_value=(0, None))  # no-op (ips best-effort); returns (failures, first_err)
     eng._ensure_custom_fields = MagicMock()                # skip self-heal here
     return eng
 
@@ -335,6 +335,84 @@ def test_sync_vms_external_sot_overwrites_existing_vm():
     assert res["status"] == "SUCCESS", res
     assert existing_vm.name == "vm-renamed"          # overwritten
     assert existing_vm.custom_fields.get("proxmox_node") == "pve1"  # linkage refreshed
+
+
+def test_sync_vms_netbox_sot_still_builds_vminterfaces_and_ips():
+    # Regression: source_of_truth="netbox" used to ``continue`` BEFORE
+    # ``_assign_vm_primary_ip4`` ran, so an existing VM in only-add-missing mode
+    # NEVER got its vminterfaces/IPs built (IP-less with 0 errors). The IP data
+    # is gathered, not a truth field, so only-add-missing must still ADD it.
+    # Truth fields stay untouched; only last_seen + the IP build run.
+    eng = _engine()
+    existing_row = {"id": 7, "custom_fields": {"proxmox_unique_id": "pxmx:100"}}
+    eng._api_get_all = MagicMock(return_value=[existing_row])
+    existing_vm = _Obj(id=7, custom_fields={"proxmox_unique_id": "pxmx:100"})
+    existing_vm.name = "original-name"
+    eng.nb.virtualization.virtual_machines.get.return_value = existing_vm
+
+    res = eng.sync_vms(
+        vms=[{**_VM, "name": "vm-renamed", "interfaces": [
+            {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]}],
+        tenant_slug="lrb", replace=False, source_of_truth="netbox")
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["errors"] == 0
+    # Truth fields NOT overwritten (only-add-missing).
+    assert existing_vm.name == "original-name"
+    # ...but the IP build DID run (the fix) — _assign_vm_primary_ip4 was called.
+    eng._assign_vm_primary_ip4.assert_called_once()
+    called_vm = eng._assign_vm_primary_ip4.call_args.args[1]
+    assert called_vm["interfaces"][0]["ips"] == ["10.0.0.5"]
+
+
+def test_assign_vm_primary_ip4_surfaces_build_failures(caplog):
+    # A real-world pynetbox failure (the IP already exists in IPAM on a
+    # discovered dcim.device, so reuse/reassign raises) used to be swallowed at
+    # DEBUG with nothing reported — the VM ended up IP-less with 0 errors.
+    # Now the failure is counted + the first error returned + logged WARNING.
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "vm100"
+    eng.nb.virtualization.vminterfaces.filter.return_value = []
+    eng.nb.virtualization.vminterfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.ipam.ip_addresses.get.return_value = None        # no exact-prefix match
+    eng.nb.ipam.ip_addresses.create.side_effect = Exception(
+        "Duplicate IP address found in global table")       # create 400s
+    eng.nb.ipam.ip_addresses.filter.return_value = []      # bare-IP fallback empty
+
+    import logging
+    caplog.set_level(logging.WARNING, logger="NetboxEngine")
+    failures, first_err = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    assert failures == 1                       # the IP build failed → counted
+    assert first_err is not None
+    assert "10.0.0.5" in first_err
+    assert vm_obj.primary_ip4 is None          # no IP landed → no primary_ip4
+    # The first failure is a WARNING ([sync-error]) so it reaches the spoke log
+    # + GET_ERROR_LOGS — the silent DEBUG swallow is gone.
+    assert any("[sync-error]" in r.message and "10.0.0.5" in r.message
+               for r in caplog.records)
+
+
+def test_assign_vm_primary_ip4_success_returns_zero_failures():
+    # Happy path: all vminterfaces + IPs built → returns (0, None).
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "vm100"
+    eng.nb.virtualization.vminterfaces.filter.return_value = []
+    eng.nb.virtualization.vminterfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=1001)
+
+    failures, first_err = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    assert failures == 0
+    assert first_err is None
+    assert vm_obj.primary_ip4 == 1001
 
 
 # ── Case-insensitive tenant resolution ────────────────────────────────────────
