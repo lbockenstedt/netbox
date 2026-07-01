@@ -1247,7 +1247,14 @@ class NetboxEngine:
         if not ifaces_in:
             return
         try:
-            existing = list(self.nb.virtualization.vminterfaces.filter(
+            # pynetbox accessor is ``virtualization.interfaces`` — the REST
+            # endpoint is /api/virtualization/interfaces/ (VMInterfaceViewSet),
+            # NOT /api/virtualization/vminterfaces/ (which 404s "could not be
+            # found" and left every VM IP-less). The model is ``vminterface``
+            # (the content-type string used in assigned_object_type below), but
+            # the endpoint path is ``interfaces`` — a name collision masked by
+            # the mocked tests, which is why this 404'd in production only.
+            existing = list(self.nb.virtualization.interfaces.filter(
                 virtual_machine_id=vm_obj.id))
         except Exception as e:
             logger.debug("assign_vm_primary_ip4: list vminterfaces %s failed: %s",
@@ -1290,7 +1297,7 @@ class NetboxEngine:
                     kw: Dict[str, Any] = {"virtual_machine": vm_obj.id, "name": name}
                     if mac:
                         kw["mac_address"] = mac
-                    iface = self.nb.virtualization.vminterfaces.create(**kw)
+                    iface = self.nb.virtualization.interfaces.create(**kw)
                     self._journal("virtualization.vminterface", iface.id,
                                    "hypervisor-vm-sync",
                                    note=f"vminterface {name} for VM "

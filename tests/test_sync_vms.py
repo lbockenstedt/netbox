@@ -222,8 +222,8 @@ def test_assign_vm_primary_ip4_builds_vminterfaces_with_macs_and_all_ips():
     eng = _engine_real_assign()
     vm_obj = _Obj(id=42, custom_fields={})
     vm_obj.name = "vm100"
-    eng.nb.virtualization.vminterfaces.filter.return_value = []  # none exist
-    eng.nb.virtualization.vminterfaces.create.side_effect = [_Iface(100, "eth0"),
+    eng.nb.virtualization.interfaces.filter.return_value = []  # none exist
+    eng.nb.virtualization.interfaces.create.side_effect = [_Iface(100, "eth0"),
                                                               _Iface(101, "eth1")]
     ip_objs = [_Obj(id=1001), _Obj(id=1002), _Obj(id=1003)]
     eng.nb.ipam.ip_addresses.create.side_effect = ip_objs
@@ -235,7 +235,7 @@ def test_assign_vm_primary_ip4_builds_vminterfaces_with_macs_and_all_ips():
     eng._assign_vm_primary_ip4(vm_obj, vm, tenant=None)
 
     # Two vminterfaces created, each with its MAC.
-    vmi_calls = eng.nb.virtualization.vminterfaces.create.call_args_list
+    vmi_calls = eng.nb.virtualization.interfaces.create.call_args_list
     assert len(vmi_calls) == 2
     assert vmi_calls[0].kwargs["name"] == "eth0"
     assert vmi_calls[0].kwargs["mac_address"] == "aa:bb:cc:dd:ee:01"
@@ -258,14 +258,14 @@ def test_assign_vm_primary_ip4_reuses_existing_vminterface_by_name():
     vm_obj = _Obj(id=42, custom_fields={})
     vm_obj.name = "vm100"
     existing = _Iface(100, "eth0", mac_address=None)   # exists but MAC-less
-    eng.nb.virtualization.vminterfaces.filter.return_value = [existing]
+    eng.nb.virtualization.interfaces.filter.return_value = [existing]
     eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=1001)
 
     eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
         {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
         tenant=None)
 
-    eng.nb.virtualization.vminterfaces.create.assert_not_called()  # reused
+    eng.nb.virtualization.interfaces.create.assert_not_called()  # reused
     assert existing.mac_address == "aa:bb:cc:dd:ee:01"             # MAC refreshed
     existing.save.assert_called()
     ipk = eng.nb.ipam.ip_addresses.create.call_args.kwargs
@@ -279,13 +279,13 @@ def test_assign_vm_primary_ip4_backcompat_flat_ips():
     eng = _engine_real_assign()
     vm_obj = _Obj(id=42, custom_fields={})
     vm_obj.name = "vm100"
-    eng.nb.virtualization.vminterfaces.filter.return_value = []
-    eng.nb.virtualization.vminterfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
     eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=1001)
 
     eng._assign_vm_primary_ip4(vm_obj, {"ips": ["10.0.0.5"]}, tenant=None)
 
-    vmi = eng.nb.virtualization.vminterfaces.create.call_args.kwargs
+    vmi = eng.nb.virtualization.interfaces.create.call_args.kwargs
     assert vmi["name"] == "eth0"
     assert "mac_address" not in vmi          # no MAC known → MAC-less eth0
     assert eng.nb.ipam.ip_addresses.create.call_args.kwargs["address"] == "10.0.0.5/32"
@@ -374,8 +374,8 @@ def test_assign_vm_primary_ip4_surfaces_build_failures(caplog):
     eng = _engine_real_assign()
     vm_obj = _Obj(id=42, custom_fields={})
     vm_obj.name = "vm100"
-    eng.nb.virtualization.vminterfaces.filter.return_value = []
-    eng.nb.virtualization.vminterfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
     eng.nb.ipam.ip_addresses.get.return_value = None        # no exact-prefix match
     eng.nb.ipam.ip_addresses.create.side_effect = Exception(
         "Duplicate IP address found in global table")       # create 400s
@@ -402,8 +402,8 @@ def test_assign_vm_primary_ip4_success_returns_zero_failures():
     eng = _engine_real_assign()
     vm_obj = _Obj(id=42, custom_fields={})
     vm_obj.name = "vm100"
-    eng.nb.virtualization.vminterfaces.filter.return_value = []
-    eng.nb.virtualization.vminterfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
     eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=1001)
 
     failures, first_err = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
