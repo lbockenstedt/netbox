@@ -54,7 +54,12 @@ CUSTOM_FIELDS_SPEC = [
     # firewall discovery syncs. Attached to both ipam.ipaddress and dcim.device.
     ("mac_address", "text", "MAC address", "ipam.ipaddress"),
     ("mac_address", "text", "MAC address", "dcim.device"),
-    # Access-tracker (NAC→IPAM reverse sync) endpoint topology (dcim.device)
+    # Access-tracker (NAC→IPAM reverse sync) + network-devices (nw) ARP/MAC-table
+    # endpoint topology (dcim.device). switch_name is the source switch's name
+    # (ClearPass nas_name / nw fleet device name); switch_ip its mgmt IP;
+    # switch_port the port the endpoint MAC was last seen on. Together they
+    # answer "where is this MAC?" — recorded on the endpoint device itself.
+    ("switch_name", "text", "Switch name", "dcim.device"),
     ("switch_ip", "text", "Switch IP", "dcim.device"),
     ("switch_port", "text", "Switch port", "dcim.device"),
     # Staleness-sweep "last seen" clock on every sync-owned object type so the

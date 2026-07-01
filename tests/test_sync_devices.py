@@ -83,6 +83,10 @@ def test_sync_devices_creates_new_owned_device():
     assert ck["name"] == "ws-05"
     # Ownership tag applied to the device.
     assert dev.custom_fields.get("discovered_from") == "opnsense"
+    # MAC stamped on the DEVICE (not just the IP) so a recurrence MAC-matches
+    # this device instead of duplicate-creating — the linchpin of the registry
+    # dedup fix.
+    assert dev.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
     dev.save.assert_called()
     # mgmt interface created via the top-level dcim.interfaces endpoint
     # (device=<id>) — NOT devobj.interfaces.create (nested accessor unsupported
@@ -465,7 +469,10 @@ def test_sync_devices_journals_created_device_and_ip_with_module_and_timestamp()
     assert ctypes == {"dcim.device", "ipam.ipaddress"}
     for c in calls:
         assert c.kwargs["kind"] == "info"
-        assert "firewall-discovery" in c.kwargs["comment"]      # module
+        # The journal names the REAL source (default firewall → "opnsense"),
+        # not a hardcoded "firewall-discovery" string — provenance in the
+        # NetBox change log so the user can tell which sync created each device.
+        assert "opnsense" in c.kwargs["comment"]                 # source tag
         assert " at " in c.kwargs["comment"]                     # timestamp
 
 
@@ -676,3 +683,176 @@ def test_sync_devices_mac_only_record_matches_existing_by_mac_no_duplicate():
     eng.nb.dcim.devices.create.assert_not_called()   # matched by MAC, no new device
     # The existing IP's mac_address was refreshed.
     assert ipobj.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+
+
+# ── unified-registry pass: no-MAC/no-IP dedup, duplicate rule, provenance ─────
+
+def test_sync_devices_hostname_only_record_not_skipped_added_by_name():
+    # A no-MAC/no-IP record carrying just a hostname is ADDED (not skipped),
+    # keyed by host:<name> so a later cross-batch record for the same hostname
+    # adopts it (the bare-hostname adoption is covered by
+    # test_sync_devices_bare_hostname_match_adopts_in_place_assigns_ip). Here we
+    # assert the no-skip: a name-only row produces a bare owned device, counted
+    # as pushed with skipped == 0.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    bare = _Obj(id=42, custom_fields={})
+    eng.nb.dcim.devices.create.return_value = bare
+
+    res = eng.sync_devices(
+        devices=[{"ip": "", "mac": "", "hostname": "printer-x"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    assert res["skipped"] == 0
+    eng.nb.dcim.devices.create.assert_called_once()
+    assert eng.nb.dcim.devices.create.call_args.kwargs["name"] == "printer-x"
+    # Bare owned device: ownership tag set, no mac_address (none supplied).
+    assert bare.custom_fields.get("discovered_from") == "opnsense"
+    assert not bare.custom_fields.get("mac_address")
+
+
+def test_sync_devices_truly_empty_record_is_skipped():
+    # No ip, no mac, no usable hostname → nothing to key on → skipped (the only
+    # remaining skip case now that hostname-only records are kept).
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    res = eng.sync_devices(
+        devices=[{"ip": "", "mac": "", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 0
+    assert res["skipped"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_sync_devices_duplicate_allowed_when_hostname_same_and_mac_ip_both_differ():
+    # The ONE case the registry allows a duplicate: an OWNED device "ks205" at
+    # 10.0.0.5 carrying mac ee01, and a DIFFERENT machine reporting the SAME
+    # hostname from 10.0.0.9 with a different mac ee09. Both mac & ip differ on
+    # both sides → provably different → NOT adopted → the new machine gets its
+    # own uniquified device, and the existing owned device is left in place
+    # (NOT deleted — it's a different machine, not a stale orphan).
+    row = {"id": 77, "name": "ks205",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "mac_address": "aa:bb:cc:dd:ee:01"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    new_dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = new_dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:09", "hostname": "ks205"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    # A NEW device was created (the duplicate the rule allows) under a
+    # uniquified name — not "ks205" (which the existing machine keeps).
+    eng.nb.dcim.devices.create.assert_called_once()
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["name"] != "ks205"
+    assert ck["name"].startswith("ks205-")
+    # The existing owned device 77 was NOT deleted (different machine, not a
+    # reclaimable orphan) — no devices.get for a delete.
+    eng.nb.dcim.devices.get.assert_not_called()
+
+
+def test_sync_devices_same_mac_merges_no_duplicate_on_dhcp_move():
+    # Owned "ks205" at 10.0.0.5 with mac ee01; same machine DHCP-moves to
+    # 10.0.0.9 (same MAC). MAC-match adopts the existing device, repoints it at
+    # the new IP, no duplicate — the "same MAC → merge" half of the rule.
+    row = {"id": 77, "name": "ks205",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "mac_address": "aa:bb:cc:dd:ee:01"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    existing = _Obj(id=77, custom_fields={"discovered_from": "opnsense",
+                                          "mac_address": "aa:bb:cc:dd:ee:01"})
+    eng.nb.dcim.devices.get.return_value = existing
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:01", "hostname": "ks205"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()   # adopted by MAC, no duplicate
+    assert existing.primary_ip4 == 555                # repointed at the new IP
+
+
+def test_sync_devices_source_switch_cfs_stamped_on_created_device():
+    # A MAC-sighting record (e.g. from a switch MAC table) carries the source
+    # switch name/ip/port. The created device records them so NetBox answers
+    # "where is this MAC?".
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-05",
+                  "source_switch_name": "core-sw1",
+                  "source_switch_ip": "10.255.0.2",
+                  "source_switch_port": "GigabitEthernet1/0/24"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    cf = dev.custom_fields
+    assert cf.get("switch_name") == "core-sw1"
+    assert cf.get("switch_ip") == "10.255.0.2"
+    assert cf.get("switch_port") == "GigabitEthernet1/0/24"
+    assert cf.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+
+
+def test_sync_devices_source_switch_cfs_stamped_on_refreshed_device():
+    # An existing device matched by IP gets the source-switch cfs updated when
+    # the feed attaches them (a later sighting on a different port/switch).
+    row = {"id": 77, "name": "ws-05",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "switch_port": "Gi1/0/1"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=901, custom_fields={})
+    existing = _Obj(id=77, custom_fields={"discovered_from": "opnsense",
+                                          "switch_port": "Gi1/0/1"})
+    eng.nb.dcim.devices.get.return_value = existing
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws-05",
+                  "source_switch_name": "core-sw2",
+                  "source_switch_ip": "10.255.0.3",
+                  "source_switch_port": "Gi1/0/24"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    cf = existing.custom_fields
+    assert cf.get("switch_name") == "core-sw2"
+    assert cf.get("switch_ip") == "10.255.0.3"
+    assert cf.get("switch_port") == "Gi1/0/24"   # updated from Gi1/0/1
+    assert cf.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+
+
+def test_sync_devices_journal_uses_real_source_tag():
+    # The NetBox change-log journal entry names the REAL sync source, not a
+    # hardcoded "firewall-discovery" string — so the user can tell which sync
+    # created each device. source="Network Devices" → journal says so.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:ff", "hostname": "ws"}],
+        tenant_slug="lrb", replace=False, defaults={}, source="Network Devices")
+
+    calls = eng.nb.extras.journal_entries.create.call_args_list
+    assert len(calls) == 2
+    for c in calls:
+        assert "Network Devices" in c.kwargs["comment"]
