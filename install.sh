@@ -21,7 +21,7 @@ set -euo pipefail
 
 # ── Defaults ─────────────────────────────────────────────────
 HUB_URL="ws://localhost:8765"
-SPOKE_ID="netbox-spoke-1"
+SPOKE_ID="${SPOKE_ID:-netbox-$(hostname -s)}"
 SPOKE_SECRET=""
 HUB_SECRET=""
 ADMIN_TOKEN=""
