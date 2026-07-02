@@ -415,6 +415,108 @@ def test_assign_vm_primary_ip4_success_returns_zero_failures():
     assert vm_obj.primary_ip4 == 1001
 
 
+# ── reuse/reassign: IP pre-exists in IPAM (e.g. on a discovered dcim.device) ──
+#
+# The most common real-world cause of "the IP record exists but isn't connected
+# to the VM": sync_devices created the IP first on a dcim.interface (and set the
+# device's primary_ip4 to it). sync_vms then reuses the global IP and must
+# REASSIGN it to the VM's vminterface. The old _reassign_ip used ipobj.save()
+# whose diff-detection can omit assigned_object_type (a ContentType fetched as a
+# nested dict) from the PATCH → the save failed → swallowed at DEBUG → the VM's
+# primary_ip4 ended up pointing at an IP still on the device. The fix uses an
+# explicit ipam.ip_addresses.update(id, {...}) PATCH.
+
+def test_assign_vm_primary_ip4_reassigns_existing_ip_to_vminterface_via_update():
+    # The IP already exists globally (on a device) → reuse path must reassign it
+    # to the VM's vminterface via ipam.ip_addresses.update, NOT create a dup.
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "vm100"
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
+    existing_ip = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = existing_ip   # global duplicate
+
+    failures, first_err = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    assert failures == 0
+    assert first_err is None
+    # No duplicate create — the existing record was reused + reassigned.
+    eng.nb.ipam.ip_addresses.create.assert_not_called()
+    # The reassign is an explicit PATCH with the vminterface content-type + the
+    # new iface id (the reliable write that replaced ipobj.save()).
+    eng.nb.ipam.ip_addresses.update.assert_called_once()
+    upd_id, upd_body = eng.nb.ipam.ip_addresses.update.call_args.args
+    assert upd_id == 901
+    assert upd_body["assigned_object_type"] == "virtualization.vminterface"
+    assert upd_body["assigned_object_id"] == 100
+    # VM primary_ip4 now points at the (reassigned) existing IP.
+    assert vm_obj.primary_ip4 == 901
+
+
+def test_assign_vm_primary_ip4_reassign_failure_is_surfaced(caplog):
+    # The reuse path used to swallow a reassign failure at DEBUG (the VM went
+    # IP-less with 0 errors). Now _reassign_ip logs WARNING [sync-error] + returns
+    # False, _reuse_or_create_ip raises, and _assign_vm_primary_ip4 counts it.
+    import logging
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "vm100"
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
+    existing_ip = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = existing_ip
+    eng.nb.ipam.ip_addresses.update.side_effect = Exception("assigned_object_type is required")
+
+    caplog.set_level(logging.WARNING, logger="NetboxEngine")
+    failures, first_err = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    assert failures == 1
+    assert first_err is not None and "10.0.0.5" in first_err
+    assert vm_obj.primary_ip4 is None          # no IP landed → no primary_ip4
+    eng.nb.ipam.ip_addresses.create.assert_not_called()
+    # The reassign failure is a WARNING [sync-error] (reaches GET_ERROR_LOGS).
+    assert any("[sync-error]" in r.message and "10.0.0.5" in r.message
+               for r in caplog.records)
+
+
+def test_assign_vm_primary_ip4_clears_stale_device_primary_ip():
+    # IP is moved OFF a dcim.interface that was a device's primary_ip4 → the
+    # device's primary_ip4 is cleared so it doesn't keep pointing at an IP now
+    # on a VM. old_aot arrives as the nested-dict form pynetbox fetches.
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "vm100"
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
+    existing_ip = _Obj(id=901, custom_fields={})
+    # pynetbox fetches assigned_object_type as a nested dict {app_label, model}.
+    existing_ip.assigned_object_type = {"app_label": "dcim", "model": "interface"}
+    existing_ip.assigned_object_id = 500
+    eng.nb.ipam.ip_addresses.get.return_value = existing_ip
+    # The old dcim.interface belongs to device 7, whose primary_ip4 == this IP.
+    eng.nb.dcim.interfaces.get.return_value = MagicMock(id=500, device={"id": 7})
+    stale_dev = _Obj(id=7, custom_fields={})
+    stale_dev.primary_ip4 = 901
+    eng.nb.dcim.devices.get.return_value = stale_dev
+
+    failures, _ = eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    assert failures == 0
+    # Reassigned to the vminterface...
+    _upd_id, upd_body = eng.nb.ipam.ip_addresses.update.call_args.args
+    assert upd_body["assigned_object_type"] == "virtualization.vminterface"
+    # ...and the stale device primary_ip4 cleared.
+    assert stale_dev.primary_ip4 is None
+    stale_dev.save.assert_called()
+
+
 # ── Case-insensitive tenant resolution ────────────────────────────────────────
 #
 # A VM's Proxmox label (or a configured tenant_slug) can arrive in mixed case,
