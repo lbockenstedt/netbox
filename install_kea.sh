@@ -14,12 +14,17 @@ apt-get install -y kea-dhcp4-server kea-ctrl-agent jq
 
 echo "⚙️ Configuring KEA Control Agent..."
 # The control agent allows updating the DHCP server config via API without restarts
-# We ensure it's listening on localhost
+# We ensure it's listening on localhost. Port 8760 (NOT 8000): the LM hub owns
+# 0.0.0.0:8000 (admin WebUI/API) on any box where a spoke runs in HUB MODE
+# (notably the netbox spoke, which is hub-colocated). KEA CA's default 8000
+# collides with the hub → kea-ctrl-agent fails to bind and the netbox spoke's
+# KEA sync loop POSTs the hub instead, which 405s ("KEA rejected scope: None").
+KEA_CA_PORT=8760
 cat <<EOF > /etc/kea/kea-ctrl-agent.conf
 {
     "control-agent": {
         "http-host": "127.0.0.1",
-        "http-port": 8000,
+        "http-port": ${KEA_CA_PORT},
         "logging": {
             "severity": "INFO",
             "facility": "local7"
@@ -84,5 +89,5 @@ systemctl enable kea-dhcp4-server
 systemctl restart kea-dhcp4-server
 
 echo "✅ KEA DHCP Server and Control Agent installed and running."
-echo "🌐 Control API: http://127.0.0.1:8000"
+echo "🌐 Control API: http://127.0.0.1:${KEA_CA_PORT}"
 echo "📦 Integrated with NetBox via Lab Manager Spoke."

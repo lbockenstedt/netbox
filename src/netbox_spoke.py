@@ -22,7 +22,10 @@ class NetboxSpoke(BaseSpoke):
             url=config.get("netbox_url", os.getenv("NETBOX_URL", "http://localhost:8000")),
             token=config.get("api_token", os.getenv("NETBOX_API_TOKEN", "")),
         )
-        self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8000"))
+        # KEA Control Agent URL. Default port 8760 matches install_kea.sh —
+        # NOT 8000 (the LM hub owns 8000 on hub-colocated boxes; KEA CA on 8000
+        # fails to bind and the sync loop POSTs the hub → 405 "rejected scope").
+        self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8760"))
         self._sync_task = None
         # Self-heal the custom fields the syncs depend on (idempotent, best-effort;
         # a restricted token never breaks the spoke — failures are DEBUG-logged).

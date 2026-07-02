@@ -929,6 +929,47 @@ class NetboxEngine:
     # provision exactly the same set. (name, type, label, content_type).
     _REQUIRED_CUSTOM_FIELDS = CUSTOM_FIELDS_SPEC
 
+    def _cf_types_list(self, cf: Any, types_key: str) -> Any:
+        """Read the attached content-type list off a custom-field record,
+        tolerant of the NetBox 4.x ``content_types`` → ``object_types`` REST
+        rename. ``types_key`` is the best guess; if the record doesn't expose
+        it, fall back to the other attr name so a record cached from a
+        mixed-version box still resolves."""
+        val = getattr(cf, types_key, None)
+        if val is None:
+            alt = "content_types" if types_key == "object_types" else "object_types"
+            val = getattr(cf, alt, None)
+        return val or []
+
+    def _cf_create(self, cf_api: Any, name: str, ftype: str, label: str,
+                   content_type: str, types_key: str) -> tuple:
+        """Create a custom field, flipping ``object_types``↔``content_types``
+        once if the first key is rejected. NetBox 4.x uses ``object_types``;
+        3.x uses ``content_types`` and 400s an unknown ``object_types``. Returns
+        ``(cf, key_used)``; re-raises the last error if both attempts fail (the
+        caller logs it + records the warning). Only retries when the error
+        looks like a serializer field-name rejection, so a permission/timeout
+        failure isn't double-attempted and its real error is preserved."""
+        keys = [types_key]
+        if types_key == "object_types":
+            keys.append("content_types")
+        elif types_key == "content_types":
+            keys.append("object_types")
+        last_err: Optional[Exception] = None
+        for key in keys:
+            try:
+                return cf_api.create(name=name, type=ftype, label=label,
+                                     **{key: [content_type]}), key
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                if not any(tok in msg for tok in (
+                        "object_types", "content_types",
+                        "valid field", "unexpected", "required")):
+                    break  # not a field-name rejection → don't retry
+        assert last_err is not None
+        raise last_err
+
     def _ensure_custom_fields(self, force: bool = False) -> Dict[str, Any]:
         """Ensure each custom field in CUSTOM_FIELDS_SPEC exists AND is attached
         to its content type on NetBox. Idempotent + safe to re-run any number
@@ -979,12 +1020,30 @@ class NetboxEngine:
             report["status"] = "ERROR"
             report["warnings"].append(f"list failed: {e}")
             return report  # leave _cf_ensured unset → next sync retries
+        # NetBox 4.x renamed the CustomField REST serializer field
+        # ``content_types`` → ``object_types``. The old code sent
+        # ``content_types`` on create, which 4.x ignores → it 400s with
+        # ``{'object_types': ['This field is required.']}``, so NO field is ever
+        # created and every sync_vms/sync_devices custom_fields write then 400s
+        # "Custom field 'X' does not exist for this object type." Detect which
+        # key this NetBox speaks from any pre-existing record; default to
+        # ``object_types`` (4.x) and let ``_cf_create`` flip to ``content_types``
+        # on a 3.x box that rejects it. Cached on the engine after the first run.
+        types_key = getattr(self, "_cf_types_key", None)
+        if types_key is None:
+            types_key = "object_types"
+            for f in by_name.values():
+                if hasattr(f, "content_types") and not hasattr(f, "object_types"):
+                    types_key = "content_types"
+                    break
+            self._cf_types_key = types_key
         for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
             cf = by_name.get(name)
             if cf is None:
                 try:
-                    cf = cf_api.create(name=name, type=ftype, label=label,
-                                       content_types=[content_type])
+                    cf, types_key = self._cf_create(
+                        cf_api, name, ftype, label, content_type, types_key)
+                    self._cf_types_key = types_key
                     logger.info("ensure_custom_fields: created %s on %s", name, content_type)
                     report["created"] += 1
                 except Exception as e:
@@ -996,10 +1055,13 @@ class NetboxEngine:
                 report["present"] += 1
             # Verify the content type is attached (create may not attach it on
             # every NetBox version; a pre-existing field may be unattached).
+            # Read/write the detected key (object_types on 4.x, content_types on
+            # 3.x), falling back to the other attr so a record fetched from a
+            # mixed-version cache still resolves.
             try:
-                current = list(getattr(cf, "content_types", None) or [])
+                current = list(self._cf_types_list(cf, types_key))
                 if content_type not in current:
-                    cf.content_types = current + [content_type]
+                    setattr(cf, types_key, current + [content_type])
                     cf.save()
                     logger.info("ensure_custom_fields: attached %s to %s",
                                 name, content_type)
@@ -1216,7 +1278,10 @@ class NetboxEngine:
                              and iface_type != "dcim.interface")
         if updates:
             try:
-                self.nb.ipam.ip_addresses.update(ipobj.id, updates)
+                # pynetbox >=7 removed the 2-arg ``update(id, body)`` form
+                # (``Endpoint.update() takes 2 positional arguments but 3 were
+                # given``); the dict-with-id form works on every version.
+                self.nb.ipam.ip_addresses.update({"id": ipobj.id, **updates})
             except Exception as e:
                 logger.warning("[sync-error] %s: reuse-IP %s reassign failed: %s",
                                source, addr, e)
@@ -1445,8 +1510,9 @@ class NetboxEngine:
                 # ONLY primary_ip4, so the separately-applied custom_fields can
                 # never break the primary-IP assignment (and can't wipe attached
                 # CFs on a healthy box either).
+                # Dict-with-id form (pynetbox >=7 dropped update(id, body)).
                 self.nb.virtualization.virtual_machines.update(
-                    vm_obj.id, {"primary_ip4": first_ip_id})
+                    {"id": vm_obj.id, "primary_ip4": first_ip_id})
             except Exception as e:
                 _record_fail(f"set primary_ip4 for VM {vm_name} failed", e)
         return build_failures, first_build_err
