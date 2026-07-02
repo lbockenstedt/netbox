@@ -247,8 +247,12 @@ def test_assign_vm_primary_ip4_builds_vminterfaces_with_macs_and_all_ips():
     assert ip_calls[0].kwargs["assigned_object_type"] == "virtualization.vminterface"
     assert ip_calls[0].kwargs["assigned_object_id"] == 100
     assert ip_calls[0].kwargs["address"] == "10.0.0.5/32"
-    # primary_ip4 = first IP id.
-    assert vm_obj.primary_ip4 == 1001
+    # primary_ip4 PATCHed via a targeted virtual_machines.update(id, {primary_ip4})
+    # — NOT a full obj.save() that would re-send custom_fields (which 400s on a
+    # NetBox where the CFs aren't yet attached to virtualization.virtualmachine).
+    eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
+        42, {"primary_ip4": 1001})
+    vm_obj.save.assert_not_called()
 
 
 def test_assign_vm_primary_ip4_reuses_existing_vminterface_by_name():
@@ -270,7 +274,8 @@ def test_assign_vm_primary_ip4_reuses_existing_vminterface_by_name():
     existing.save.assert_called()
     ipk = eng.nb.ipam.ip_addresses.create.call_args.kwargs
     assert ipk["assigned_object_id"] == 100     # assigned to the reused vminterface
-    assert vm_obj.primary_ip4 == 1001
+    eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
+        42, {"primary_ip4": 1001})
 
 
 def test_assign_vm_primary_ip4_backcompat_flat_ips():
@@ -289,6 +294,51 @@ def test_assign_vm_primary_ip4_backcompat_flat_ips():
     assert vmi["name"] == "eth0"
     assert "mac_address" not in vmi          # no MAC known → MAC-less eth0
     assert eng.nb.ipam.ip_addresses.create.call_args.kwargs["address"] == "10.0.0.5/32"
+
+
+def test_assign_vm_primary_ip4_no_interfaces_no_ips_returns_zero_none():
+    # A VM the agent reported with NO interfaces AND no flat ips (e.g. the leaked
+    # pxmx-cs-svr-02 record, or a powered-off VM QGA couldn't introspect) must
+    # return (0, None) — honoring the (build_failures, first_build_err) contract.
+    # A bare ``return`` (None) made the caller's
+    # ``ip_fail, ip_err = _assign_vm_primary_ip4(...)`` raise
+    # "cannot unpack non-iterable NoneType", surfacing in sync_vms as
+    # "upsert <uid>: cannot unpack non-iterable NoneType object" (17 errors/run).
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={})
+    vm_obj.name = "phantom"
+    failures, first_err = eng._assign_vm_primary_ip4(
+        vm_obj, {"interfaces": [], "ips": []}, tenant=None)
+    assert failures == 0
+    assert first_err is None
+    eng.nb.virtualization.virtual_machines.update.assert_not_called()
+
+
+def test_assign_vm_primary_ip4_targeted_update_does_not_resend_custom_fields():
+    # primary_ip4 is PATCHed via virtual_machines.update(id, {primary_ip4}) — a
+    # targeted update that sends ONLY primary_ip4, never the custom_fields loaded
+    # on the object. sync_vms sets the proxmox_*/last_seen CFs best-effort just
+    # before this call and swallows the 400 when a CF isn't yet attached to
+    # virtualization.virtualmachine, but the unattached CFs stay on the Python
+    # object — a full obj.save() here would re-send them and 400 ("Custom field
+    # 'last_seen' does not exist for this object type"), leaving the VM IP-less.
+    # The targeted update can't 400 on custom_fields and can't wipe attached CFs.
+    eng = _engine_real_assign()
+    vm_obj = _Obj(id=42, custom_fields={"proxmox_vmid": "100", "last_seen": "x"})
+    vm_obj.name = "vm-with-cfs"
+    eng.nb.virtualization.interfaces.filter.return_value = []
+    eng.nb.virtualization.interfaces.create.return_value = _Iface(100, "eth0")
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=1001)
+
+    eng._assign_vm_primary_ip4(vm_obj, {"interfaces": [
+        {"name": "eth0", "mac": "aa:bb:cc:dd:ee:01", "ips": ["10.0.0.5"]}]},
+        tenant=None)
+
+    # Only primary_ip4 is sent — no custom_fields key in the update payload,
+    # and never a full obj.save() that would re-send the CFs.
+    upd = eng.nb.virtualization.virtual_machines.update.call_args
+    assert upd.args == (42, {"primary_ip4": 1001})
+    vm_obj.save.assert_not_called()
 
 
 # ── source-of-truth gating ───────────────────────────────────────────────────
@@ -412,7 +462,8 @@ def test_assign_vm_primary_ip4_success_returns_zero_failures():
 
     assert failures == 0
     assert first_err is None
-    assert vm_obj.primary_ip4 == 1001
+    eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
+        42, {"primary_ip4": 1001})
 
 
 # ── reuse/reassign: IP pre-exists in IPAM (e.g. on a discovered dcim.device) ──
@@ -452,8 +503,10 @@ def test_assign_vm_primary_ip4_reassigns_existing_ip_to_vminterface_via_update()
     assert upd_id == 901
     assert upd_body["assigned_object_type"] == "virtualization.vminterface"
     assert upd_body["assigned_object_id"] == 100
-    # VM primary_ip4 now points at the (reassigned) existing IP.
-    assert vm_obj.primary_ip4 == 901
+    # VM primary_ip4 now points at the (reassigned) existing IP — PATCHed via a
+    # targeted virtual_machines.update that sends only {primary_ip4}.
+    eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
+        42, {"primary_ip4": 901})
 
 
 def test_assign_vm_primary_ip4_reassign_failure_is_surfaced(caplog):

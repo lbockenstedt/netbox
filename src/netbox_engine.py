@@ -1329,7 +1329,14 @@ class NetboxEngine:
             if flat_ips:
                 ifaces_in = [{"name": "eth0", "mac": "", "ips": flat_ips}]
         if not ifaces_in:
-            return
+            # Honor the (build_failures, first_build_err) contract documented
+            # below — a bare ``return`` yields None, and the caller unpacks it
+            # as ``ip_fail, ip_err = None`` → TypeError "cannot unpack
+            # non-iterable NoneType", which surfaced as "upsert <uid>: cannot
+            # unpack non-iterable NoneType" for VMs the agent reported with no
+            # interfaces AND no flat ips (e.g. the leaked pxmx-cs-svr-02 record
+            # or a powered-off VM QGA couldn't introspect).
+            return 0, None
         try:
             # pynetbox accessor is ``virtualization.interfaces`` — the REST
             # endpoint is /api/virtualization/interfaces/ (VMInterfaceViewSet),
@@ -1425,8 +1432,21 @@ class NetboxEngine:
                     _record_fail(f"IP {ip_str} on {name} for VM {vm_name} failed", e)
         if first_ip_id is not None:
             try:
-                vm_obj.primary_ip4 = first_ip_id
-                vm_obj.save()
+                # PATCH only primary_ip4 via a targeted endpoint update — NOT a
+                # full ``vm_obj.save()``. pynetbox serializes the whole record on
+                # ``save()``, including whatever ``custom_fields`` are loaded on
+                # the object. sync_vms sets the proxmox_*/last_seen CFs best-effort
+                # just before this call and SWALLOWS the 400 when a field isn't
+                # yet attached to virtualization.virtualmachine on the deployed
+                # NetBox — but the unattached CFs stay on the Python object, so a
+                # full ``save()`` here re-sends them and 400s the whole request,
+                # leaving the VM without a primary IP ("Custom field 'last_seen'
+                # does not exist for this object type"). A targeted update sends
+                # ONLY primary_ip4, so the separately-applied custom_fields can
+                # never break the primary-IP assignment (and can't wipe attached
+                # CFs on a healthy box either).
+                self.nb.virtualization.virtual_machines.update(
+                    vm_obj.id, {"primary_ip4": first_ip_id})
             except Exception as e:
                 _record_fail(f"set primary_ip4 for VM {vm_name} failed", e)
         return build_failures, first_build_err
