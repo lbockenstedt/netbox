@@ -805,13 +805,16 @@ fi
 
 # systemd unit
 HUB_SECRET_ARG=""
-[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret ${HUB_SECRET}"
+[ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=${HUB_SECRET}"
 # Only pass --secret when a value is present. Passing it empty makes argparse
 # abort with "argument --secret: expected one argument" and crash-loop the
 # service. Zero-touch omits it (control_plane.py falls back to SPOKE_SECRET
-# from the .env, then awaits admin approval in the WebUI).
+# from the .env, then awaits admin approval in the WebUI). The =-attached form
+# (`--secret=VALUE`) takes the value verbatim, so a hub-generated secret that
+# starts with `-` (e.g. -3s6bm...) is accepted — the space form makes argparse
+# treat it as an option flag and abort with "unrecognized arguments".
 SECRET_ARG=""
-[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret $SPOKE_SECRET"
+[ -n "$SPOKE_SECRET" ] && SECRET_ARG="--secret=$SPOKE_SECRET"
 cat > /etc/systemd/system/lm-netbox.service <<SYSD
 [Unit]
 Description=Lab Manager Spoke - NetBox IPAM
