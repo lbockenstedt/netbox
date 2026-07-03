@@ -65,6 +65,16 @@ done
 # ── Guards ───────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root (sudo)."; exit 1; }
 
+# A successful install chowns $NB_APP_DIR and $LM_DIR/netbox to $SVC_USER (see
+# the chown -R calls below), but every run — including re-runs/updates —
+# executes entirely as root. Root then running `git pull`/`git clone` against a
+# directory owned by a different user trips git's dubious-ownership safety
+# check (CVE-2022-24765 mitigation): "fatal: detected dubious ownership in
+# repository at ...". Whitelist both git-managed paths up front so clone/pull
+# always work regardless of who currently owns them.
+git config --global --add safe.directory "$NB_APP_DIR" 2>/dev/null || true
+git config --global --add safe.directory "$LM_DIR/netbox" 2>/dev/null || true
+
 # ── Helpers ──────────────────────────────────────────────────
 GRN='\033[0;32m'; YLW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 ok()   { echo -e "${GRN}✅  $*${NC}"; }
