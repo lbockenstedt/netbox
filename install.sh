@@ -20,7 +20,7 @@ set -euo pipefail
 # ============================================================
 
 # ── Defaults ─────────────────────────────────────────────────
-HUB_URL="ws://localhost:8765"
+HUB_URL="auto"   # was ws://localhost:8765 (retired bare listener); auto-discover the unified :443 hub
 SPOKE_ID="${SPOKE_ID:-netbox-$(hostname -s)}"
 SPOKE_SECRET=""
 HUB_SECRET=""
