@@ -419,6 +419,13 @@ NBCFG
         warn "Falling back to spoke-only mode. You can complete the NetBox install later."
         INSTALL_APP=false
     else
+        # NetBox's STATICFILES_DIRS includes netbox/project-static/docs, populated
+        # by `mkdocs build`. Without it collectstatic warns (staticfiles.W004:
+        # project-static/docs does not exist) and the in-app help links 404. Build
+        # the docs (best-effort); if mkdocs isn't available, at least create the
+        # dir so the warning is silenced and collectstatic is clean.
+        ( cd "$NB_APP_DIR" && "$NB_APP_DIR/venv/bin/python3" -m mkdocs build >/dev/null 2>&1 ) \
+            || mkdir -p "$NB_APP_DIR/netbox/project-static/docs"
         "$NB_APP_DIR/venv/bin/python3" netbox/manage.py collectstatic --no-input -v 0 2>/dev/null || true
         ok "Migrations and static files complete"
     fi
