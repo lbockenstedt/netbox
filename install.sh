@@ -255,8 +255,12 @@ if [ "$INSTALL_APP" = true ]; then
     # to C.UTF-8 or C. NetBox v4 ICU collations are per-column, not database-level,
     # so C locale works fine as long as the encoding is UTF8.
     _pick_db_locale() {
-        apt-get install -y -q locales 2>/dev/null || true
-        if locale-gen en_US.UTF-8 2>/dev/null && locale -a 2>/dev/null | grep -q 'en_US.UTF-8\|en_US.utf8'; then
+        # This function's STDOUT is captured (DB_LOCALE=$(...)), so every command
+        # here must be silent — apt-get/locale-gen write progress to stdout, and
+        # without >/dev/null that log leaked INTO the locale value, producing an
+        # "invalid LC_COLLATE locale name" with the apt log embedded before C.UTF-8.
+        apt-get install -y -q locales >/dev/null 2>&1 || true
+        if locale-gen en_US.UTF-8 >/dev/null 2>&1 && locale -a 2>/dev/null | grep -q 'en_US.UTF-8\|en_US.utf8'; then
             echo "en_US.UTF-8"
         elif locale -a 2>/dev/null | grep -q 'C.UTF-8\|C.utf8'; then
             echo "C.UTF-8"
