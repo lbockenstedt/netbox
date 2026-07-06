@@ -476,6 +476,13 @@ if [ "$INSTALL_APP" = false ]; then : ; else  # guard: skip if migrations failed
     # Supports NetBox v4 (users.models.Token) and v3 (extras.models.Token).
     # Uses a sentinel line so stdout noise from Django startup doesn't corrupt the result.
     if [ -z "$NETBOX_TOKEN" ]; then
+        # NOTE: `|| true` on BOTH assignments below is load-bearing. Under
+        # `set -euo pipefail`, `VAR=$(cmd)` inherits cmd's exit status as a simple
+        # command, so set -e aborts on it. If token creation emits no LM_TOKEN
+        # line, the `... | grep | cut` pipeline returns 1 (pipefail) and the whole
+        # install died HERE — right after the superuser step, before services or
+        # nginx were ever created (gunicorn inactive, nginx default page served).
+        # The API token is optional; never let it abort the app deploy.
         TOKEN_OUTPUT=$("$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
 import sys, os
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'netbox.settings')
@@ -499,13 +506,13 @@ try:
         sys.stdout.write('LM_TOKEN:' + str(t.key) + '\n')
 except Exception as e:
     sys.stderr.write('Token creation failed: ' + str(e) + '\n')
-" 2>&1)
-        NETBOX_TOKEN=$(echo "$TOKEN_OUTPUT" | grep '^LM_TOKEN:' | cut -d: -f2-)
+" 2>&1) || true
+        NETBOX_TOKEN=$(echo "$TOKEN_OUTPUT" | grep '^LM_TOKEN:' | cut -d: -f2- || true)
         if [ -n "$NETBOX_TOKEN" ]; then
             ok "API token retrieved/created: ${NETBOX_TOKEN:0:8}..."
         else
             warn "Could not create API token. Output was:"
-            echo "$TOKEN_OUTPUT" | grep -v '^LM_TOKEN:' | head -10 >&2
+            echo "$TOKEN_OUTPUT" | grep -v '^LM_TOKEN:' | head -10 >&2 || true
             warn "Set NETBOX_API_TOKEN manually in $LM_DIR/netbox/.env after install"
         fi
     fi
