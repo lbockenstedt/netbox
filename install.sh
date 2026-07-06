@@ -160,27 +160,54 @@ _nb_health_code() {
     curl -sS -o /dev/null -w "%{http_code}" --max-time 10 http://localhost/ 2>/dev/null || echo "000"
 }
 
+_nb_serving_netbox() {
+    # True only if :80 actually serves the NetBox app. A bare HTTP code is NOT
+    # enough: the "Welcome to nginx" default page also returns 200, so a check
+    # that trusts the code alone reports a broken box (default site never removed
+    # / gunicorn unproxied) as healthy. Every NetBox page — including the /login/
+    # redirect target — contains the string "NetBox"; the default page does not.
+    # -L follows the 302 to /login/ when LOGIN_REQUIRED is on.
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -sSL --max-time 10 http://localhost/ 2>/dev/null | grep -qi 'netbox'
+}
+
+_nb_healthy() {
+    # Combined verdict used by every re-check below: :80 answers 200/302 AND the
+    # body is actually NetBox. Guards against declaring a welcome-page 200 "fixed".
+    local c; c=$(_nb_health_code)
+    { [ "$c" = "200" ] || [ "$c" = "302" ]; } && _nb_serving_netbox
+}
+
 if _is_local_netbox_url; then
     if [ -d "$NB_APP_DIR/netbox" ]; then
         step "Verifying local NetBox application health"
         _HC=$(_nb_health_code)
-        if [ "$_HC" = "200" ] || [ "$_HC" = "302" ]; then
-            ok "NetBox app healthy (http://localhost/ → $_HC)"
+        if { [ "$_HC" = "200" ] || [ "$_HC" = "302" ]; } && _nb_serving_netbox; then
+            ok "NetBox app healthy (http://localhost/ → $_HC, NetBox content confirmed)"
             # Ensure the app units are enabled so they survive reboots.
             systemctl enable netbox netbox-rq 2>/dev/null || true
         else
-            warn "NetBox app unhealthy (http://localhost/ → $_HC). Attempting repair..."
+            if [ "$_HC" = "200" ] || [ "$_HC" = "302" ]; then
+                warn "http://localhost/ → $_HC but the response is NOT NetBox (nginx default page / wrong upstream). Attempting repair..."
+            else
+                warn "NetBox app unhealthy (http://localhost/ → $_HC). Attempting repair..."
+            fi
 
-            # Repair 1: restart gunicorn + rq workers (handles OOM/crash/reboot).
+            # Repair 1: re-assert the nginx netbox site + drop the distro default
+            # (fixes a welcome-page 200), then restart gunicorn + rq workers
+            # (handles OOM/crash/reboot). Belt-and-suspenders — the full nginx
+            # config is rewritten later if we escalate, but this heals the common
+            # case without a full reinstall.
+            rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+            nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
             systemctl daemon-reload 2>/dev/null || true
             systemctl enable netbox netbox-rq 2>/dev/null || true
             systemctl restart netbox netbox-rq 2>/dev/null || true
             sleep 4
-            _HC=$(_nb_health_code)
 
             # Repair 2: still bad → re-run migrations + collectstatic, fix perms, restart.
-            if [ "$_HC" != "200" ] && [ "$_HC" != "302" ]; then
-                warn "Restart did not restore NetBox (→ $_HC). Re-running migrations..."
+            if ! _nb_healthy; then
+                warn "Restart did not restore NetBox (→ $(_nb_health_code)). Re-running migrations..."
                 set +e
                 "$NB_APP_DIR/venv/bin/python3" "$NB_APP_DIR/netbox/manage.py" migrate --no-input -v 0 2>&1 | tail -5
                 "$NB_APP_DIR/venv/bin/python3" "$NB_APP_DIR/netbox/manage.py" collectstatic --no-input -v 0 2>/dev/null
@@ -188,14 +215,13 @@ if _is_local_netbox_url; then
                 chown -R "$SVC_USER:$SVC_USER" "$NB_APP_DIR" 2>/dev/null || true
                 systemctl restart netbox netbox-rq 2>/dev/null || true
                 sleep 4
-                _HC=$(_nb_health_code)
             fi
 
-            if [ "$_HC" = "200" ] || [ "$_HC" = "302" ]; then
-                ok "NetBox app repaired (http://localhost/ → $_HC)"
+            if _nb_healthy; then
+                ok "NetBox app repaired (http://localhost/ → $(_nb_health_code))"
             else
                 # Repair 3: escalate to a full application reinstall below.
-                warn "NetBox app still unhealthy (→ $_HC). Escalating to full reinstall."
+                warn "NetBox app still unhealthy (→ $(_nb_health_code)). Escalating to full reinstall."
                 INSTALL_APP=true
                 SPOKE_ONLY=false
             fi
@@ -737,21 +763,27 @@ NGINX
     # it and, if it's down, surface the gunicorn journal (the real cause) + retry.
     step "Verifying NetBox WebUI"
     sleep 2
-    _code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ 2>/dev/null || echo 000)
-    if [ "$_code" != "200" ] && [ "$_code" != "302" ]; then
-        warn "WebUI health check: HTTP $_code (expected 200/302) — NetBox app is not answering on :80."
-        warn "gunicorn (netbox.service) recent log:"
-        journalctl -u netbox -n 25 --no-pager 2>/dev/null | sed 's/^/      /' || true
+    if _nb_healthy; then
+        ok "WebUI is up (HTTP $(_nb_health_code) on :80, NetBox content confirmed)"
+    else
+        _code=$(_nb_health_code)
+        if [ "$_code" = "200" ] || [ "$_code" = "302" ]; then
+            warn "WebUI on :80 returns $_code but serves NON-NetBox content (nginx default page). Re-asserting nginx site..."
+        else
+            warn "WebUI health check: HTTP $_code — NetBox app is not answering on :80."
+            warn "gunicorn (netbox.service) recent log:"
+            journalctl -u netbox -n 25 --no-pager 2>/dev/null | sed 's/^/      /' || true
+        fi
+        # Self-heal both cases: drop the distro default site + restart gunicorn.
+        rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
         systemctl restart netbox netbox-rq 2>/dev/null || true
         sleep 3
-        _code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ 2>/dev/null || echo 000)
-        if [ "$_code" = "200" ] || [ "$_code" = "302" ]; then
-            ok "WebUI is up after a service restart (HTTP $_code)"
+        if _nb_healthy; then
+            ok "WebUI is up after self-heal (HTTP $(_nb_health_code) on :80)"
         else
-            warn "WebUI still HTTP $_code — diagnose: systemctl status netbox ; journalctl -u netbox -n 50 ; ls -l /etc/nginx/sites-enabled/"
+            warn "WebUI still unhealthy (→ $(_nb_health_code)) — diagnose: systemctl status netbox ; journalctl -u netbox -n 50 ; ls -l /etc/nginx/sites-enabled/"
         fi
-    else
-        ok "WebUI is up (HTTP $_code on :80)"
     fi
 
     NETBOX_URL="http://localhost"
