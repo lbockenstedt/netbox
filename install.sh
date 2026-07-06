@@ -68,6 +68,19 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# ── Normalize --hub: accept a bare IP/host ───────────────────
+# `--hub 172.16.1.31` works the same as `--hub wss://172.16.1.31:443`. A value
+# that already carries a ws://|wss:// scheme, or the "auto" auto-discovery
+# sentinel, is left untouched. The spoke appends /ws/spoke itself, so no path is
+# added here; a bare host with no port defaults to the unified :443.
+if [ -n "${HUB_URL:-}" ] && [ "$HUB_URL" != "auto" ]; then
+    case "$HUB_URL" in
+        ws://*|wss://*) : ;;                              # already a full URL
+        *:[0-9]*)       HUB_URL="wss://${HUB_URL}" ;;     # host:port → add scheme
+        *)              HUB_URL="wss://${HUB_URL}:443" ;; # bare host → scheme + :443
+    esac
+fi
+
 # ── Guards ───────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || { echo "❌ Must be run as root (sudo)."; exit 1; }
 
