@@ -28,6 +28,11 @@ ADMIN_TOKEN=""
 NETBOX_URL=""          # Set to skip local NetBox install
 NETBOX_TOKEN=""        # Pre-existing token; auto-generated if empty
 SPOKE_ONLY=false       # --spoke-only: skip app install, just wire up the LM spoke
+INFRA_ONLY=false       # --infra-only: install the NetBox APP (Postgres/Redis/gunicorn/
+                       #   nginx + WebUI) but SKIP the LM spoke unit. Used by the
+                       #   generic agent's "netbox-server" deploy role: the server is
+                       #   deployed here, and the separate "netbox" (IPAM) role sub-spoke
+                       #   is the module that talks to it. Inverse of --spoke-only.
 NB_VERSION="stable"    # "stable" → latest GitHub release tag
 DB_NAME="netbox"
 DB_USER="netbox"
@@ -56,6 +61,7 @@ while [[ "$#" -gt 0 ]]; do
         --supermail)       NB_SUPERMAIL="$2";  shift ;;
         --netbox-version)  NB_VERSION="$2";    shift ;;
         --spoke-only)      SPOKE_ONLY=true ;;
+        --infra-only)      INFRA_ONLY=true ;;
         --all-prereqs) ;;  # no-op; accepted for LM hub compat
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
@@ -88,8 +94,17 @@ gen_secret() { python3 -c "import secrets; print(secrets.token_urlsafe(50))" 2>/
 step "Lab Manager — NetBox IPAM Installer"
 
 # ── Determine if we install the NetBox application ───────────
+[ "$INFRA_ONLY" = true ] && [ "$SPOKE_ONLY" = true ] && \
+    die "--infra-only and --spoke-only are mutually exclusive"
 INSTALL_APP=true
-if [ "$SPOKE_ONLY" = true ]; then
+if [ "$INFRA_ONLY" = true ]; then
+    # Deploy the NetBox app only; the LM spoke is provided separately by the
+    # generic agent's "netbox" (IPAM) role. Force the app install regardless of
+    # any NETBOX_URL/token env and skip the spoke section below (see the
+    # INFRA_ONLY exit before section E).
+    INSTALL_APP=true
+    ok "Infra-only mode — installing the NetBox application (no LM spoke unit)"
+elif [ "$SPOKE_ONLY" = true ]; then
     INSTALL_APP=false
     ok "Spoke-only mode — skipping local NetBox application install"
 elif [ -n "$NETBOX_URL" ] && [ -n "$NETBOX_TOKEN" ]; then
@@ -686,6 +701,25 @@ NGINX
     NETBOX_URL="http://localhost"
 fi  # end migration-succeeded guard
 fi  # end INSTALL_APP
+
+# ── Infra-only exit: app is deployed, the LM spoke is NOT this script's job ──
+# The generic agent's "netbox-server" deploy role runs us with --infra-only to
+# stand up the NetBox application (WebUI). The separate "netbox" (IPAM) role
+# sub-spoke is the module that talks to it, so we stop here — no lm-netbox
+# systemd unit, no spoke .env. Surface everything the admin needs to point the
+# IPAM role's connection settings at this server.
+if [ "$INFRA_ONLY" = true ]; then
+    _HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    step "Infra-only: NetBox application ready"
+    ok "WebUI:     http://${_HOST_IP:-<this-host>}/   (nginx :80 → gunicorn 127.0.0.1:$NB_PORT)"
+    ok "API base:  http://${_HOST_IP:-<this-host>}/api/  (local: http://127.0.0.1/api/)"
+    ok "Superuser: $NB_SUPERUSER  /  ${NB_SUPERPASS:-<existing>}"
+    if [ -n "${NETBOX_TOKEN:-}" ]; then
+        ok "API token: $NETBOX_TOKEN"
+    fi
+    ok "Next: in the LM WebUI, set the NetBox (IPAM) module's connection to the URL + token above."
+    exit 0
+fi
 
 # ============================================================
 # E. LM NETBOX SPOKE  (install or update)
