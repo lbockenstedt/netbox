@@ -39,6 +39,8 @@ DB_USER="netbox"
 DB_PASS=""             # Auto-generated if empty
 NB_SUPERUSER="admin"
 NB_SUPERPASS=""        # Auto-generated if empty
+SUPERPASS_EXPLICIT=false   # true when --superpass/--admin-password/--reset-admin-password given → reset an existing admin too
+RESET_ADMIN_ONLY=false     # true for --reset-admin-password: reset the password on an installed NetBox and exit
 NB_SUPERMAIL="admin@localhost"
 SVC_USER="svc_lm"
 NB_APP_DIR="/opt/netbox-app"   # NetBox application checkout
@@ -56,9 +58,13 @@ while [[ "$#" -gt 0 ]]; do
         --netbox-url)      NETBOX_URL="$2";    shift ;;
         --netbox-token)    NETBOX_TOKEN="$2";  shift ;;
         --db-pass)         DB_PASS="$2";       shift ;;
-        --superuser)       NB_SUPERUSER="$2";  shift ;;
-        --superpass)       NB_SUPERPASS="$2";  shift ;;
+        --superuser|--admin-user)      NB_SUPERUSER="$2"; shift ;;
+        --superpass|--admin-password)  NB_SUPERPASS="$2"; SUPERPASS_EXPLICIT=true; shift ;;
         --supermail)       NB_SUPERMAIL="$2";  shift ;;
+        # Reset the admin password on an ALREADY-installed NetBox and exit — a
+        # fast path (no app reinstall) the LM hub/agent calls for the "reset admin
+        # password" knob. Implies the given value is the new password.
+        --reset-admin-password) NB_SUPERPASS="$2"; SUPERPASS_EXPLICIT=true; RESET_ADMIN_ONLY=true; shift ;;
         --netbox-version)  NB_VERSION="$2";    shift ;;
         --spoke-only)      SPOKE_ONLY=true ;;
         --infra-only)      INFRA_ONLY=true ;;
@@ -105,6 +111,33 @@ gen_secret() { python3 -c "import secrets; print(secrets.token_urlsafe(50))" 2>/
                || openssl rand -base64 40 | tr -d '=+/\n'; }
 
 step "Lab Manager — NetBox IPAM Installer"
+
+# ── Reset-admin-password fast path ───────────────────────────
+# `--reset-admin-password <pw>` resets the Django superuser's password on an
+# ALREADY-installed NetBox and exits — no app reinstall. This is what the LM
+# "reset admin password" knob calls via the agent that deployed this server.
+# The new password is passed to Python through an env var (NOT interpolated into
+# the source) so any characters are safe. get_or_create so it also (re)creates a
+# missing admin. Idempotent and fast.
+if [ "$RESET_ADMIN_ONLY" = true ]; then
+    step "Resetting NetBox admin password for '$NB_SUPERUSER'"
+    [ -x "$NB_APP_DIR/venv/bin/python3" ] || die "NetBox app not found at $NB_APP_DIR — install it first before resetting the admin password."
+    cd "$NB_APP_DIR"
+    NB_RESET_PW="$NB_SUPERPASS" NB_RESET_USER="$NB_SUPERUSER" NB_RESET_MAIL="$NB_SUPERMAIL" \
+        "$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
+import os
+from django.contrib.auth import get_user_model
+U = get_user_model()
+u, created = U.objects.get_or_create(username=os.environ['NB_RESET_USER'],
+                                     defaults={'email': os.environ.get('NB_RESET_MAIL', '')})
+u.set_password(os.environ['NB_RESET_PW'])
+u.is_staff = u.is_superuser = u.is_active = True
+u.save()
+print('CREATED' if created else 'RESET')
+" || die "Password reset failed — is the NetBox app healthy? Check: systemctl status netbox"
+    ok "Admin password reset for '$NB_SUPERUSER' (login at http://<this-host>/)."
+    exit 0
+fi
 
 # ── Determine if we install the NetBox application ───────────
 [ "$INFRA_ONLY" = true ] && [ "$SPOKE_ONLY" = true ] && \
@@ -468,6 +501,17 @@ if [ "$INSTALL_APP" = false ]; then : ; else  # guard: skip if migrations failed
             "$NB_APP_DIR/venv/bin/python3" netbox/manage.py createsuperuser \
             --username "$NB_SUPERUSER" --email "$NB_SUPERMAIL" --noinput
         ok "Superuser '$NB_SUPERUSER' created"
+    elif [ "$SUPERPASS_EXPLICIT" = true ]; then
+        # Admin already exists AND the caller supplied a password → reset it
+        # (password passed via env, not source-interpolated, so any chars are safe).
+        NB_RESET_PW="$NB_SUPERPASS" NB_RESET_USER="$NB_SUPERUSER" \
+            "$NB_APP_DIR/venv/bin/python3" netbox/manage.py shell -c "
+import os
+from django.contrib.auth import get_user_model
+u = get_user_model().objects.get(username=os.environ['NB_RESET_USER'])
+u.set_password(os.environ['NB_RESET_PW']); u.is_staff = u.is_superuser = u.is_active = True; u.save()
+" 2>/dev/null && ok "Superuser '$NB_SUPERUSER' password reset" \
+          || warn "Could not reset '$NB_SUPERUSER' password (continuing)"
     else
         ok "Superuser '$NB_SUPERUSER' already exists"
     fi
