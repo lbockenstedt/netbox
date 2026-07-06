@@ -687,7 +687,9 @@ SYSD
 
     systemctl daemon-reload
     systemctl enable netbox netbox-rq
-    systemctl restart netbox netbox-rq
+    # Non-fatal: Type=simple returns 0 as soon as gunicorn forks, so this rarely
+    # errors, but never let a service-manager hiccup abort before nginx is set up.
+    systemctl restart netbox netbox-rq || warn "netbox service restart reported an error — the health check below verifies the WebUI"
     ok "NetBox services started (gunicorn on 127.0.0.1:$NB_PORT)"
 
     # ── nginx ────────────────────────────────────────────────
@@ -718,9 +720,39 @@ server {
 NGINX
 
     ln -sf /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/netbox
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-    nginx -t && systemctl enable --now nginx && systemctl reload nginx
-    ok "nginx configured — NetBox accessible on port 80"
+    # Remove the distro default site — it owns :80 as default_server and would
+    # serve the "Welcome to nginx" page over NetBox. Cover both possible locations.
+    rm -f /etc/nginx/sites-enabled/default /etc/nginx/conf.d/default.conf 2>/dev/null || true
+    if nginx -t 2>/tmp/nginx-sim-test.log; then
+        systemctl enable --now nginx && systemctl reload nginx
+        ok "nginx configured — NetBox accessible on port 80"
+    else
+        warn "nginx config test FAILED — NetBox site NOT activated:"
+        sed 's/^/      /' /tmp/nginx-sim-test.log 2>/dev/null || true
+    fi
+
+    # Verify the WebUI actually answers. Type=simple makes `systemctl restart`
+    # return 0 as soon as gunicorn forks, so an install can "complete" while :80
+    # serves a 502 / the nginx default page if gunicorn is crash-looping. Probe
+    # it and, if it's down, surface the gunicorn journal (the real cause) + retry.
+    step "Verifying NetBox WebUI"
+    sleep 2
+    _code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ 2>/dev/null || echo 000)
+    if [ "$_code" != "200" ] && [ "$_code" != "302" ]; then
+        warn "WebUI health check: HTTP $_code (expected 200/302) — NetBox app is not answering on :80."
+        warn "gunicorn (netbox.service) recent log:"
+        journalctl -u netbox -n 25 --no-pager 2>/dev/null | sed 's/^/      /' || true
+        systemctl restart netbox netbox-rq 2>/dev/null || true
+        sleep 3
+        _code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 http://127.0.0.1/ 2>/dev/null || echo 000)
+        if [ "$_code" = "200" ] || [ "$_code" = "302" ]; then
+            ok "WebUI is up after a service restart (HTTP $_code)"
+        else
+            warn "WebUI still HTTP $_code — diagnose: systemctl status netbox ; journalctl -u netbox -n 50 ; ls -l /etc/nginx/sites-enabled/"
+        fi
+    else
+        ok "WebUI is up (HTTP $_code on :80)"
+    fi
 
     NETBOX_URL="http://localhost"
 fi  # end migration-succeeded guard
