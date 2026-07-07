@@ -251,7 +251,7 @@ def test_assign_vm_primary_ip4_builds_vminterfaces_with_macs_and_all_ips():
     # — NOT a full obj.save() that would re-send custom_fields (which 400s on a
     # NetBox where the CFs aren't yet attached to virtualization.virtualmachine).
     eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
-        {"id": 42, "primary_ip4": 1001})
+        [{"id": 42, "primary_ip4": 1001}])
     vm_obj.save.assert_not_called()
 
 
@@ -275,7 +275,7 @@ def test_assign_vm_primary_ip4_reuses_existing_vminterface_by_name():
     ipk = eng.nb.ipam.ip_addresses.create.call_args.kwargs
     assert ipk["assigned_object_id"] == 100     # assigned to the reused vminterface
     eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
-        {"id": 42, "primary_ip4": 1001})
+        [{"id": 42, "primary_ip4": 1001}])
 
 
 def test_assign_vm_primary_ip4_backcompat_flat_ips():
@@ -337,7 +337,7 @@ def test_assign_vm_primary_ip4_targeted_update_does_not_resend_custom_fields():
     # Only primary_ip4 is sent — no custom_fields key in the update payload,
     # and never a full obj.save() that would re-send the CFs.
     upd = eng.nb.virtualization.virtual_machines.update.call_args
-    assert upd.args == ({"id": 42, "primary_ip4": 1001},)
+    assert upd.args == ([{"id": 42, "primary_ip4": 1001}],)
     vm_obj.save.assert_not_called()
 
 
@@ -463,7 +463,7 @@ def test_assign_vm_primary_ip4_success_returns_zero_failures():
     assert failures == 0
     assert first_err is None
     eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
-        {"id": 42, "primary_ip4": 1001})
+        [{"id": 42, "primary_ip4": 1001}])
 
 
 # ── reuse/reassign: IP pre-exists in IPAM (e.g. on a discovered dcim.device) ──
@@ -499,14 +499,14 @@ def test_assign_vm_primary_ip4_reassigns_existing_ip_to_vminterface_via_update()
     # The reassign is an explicit PATCH with the vminterface content-type + the
     # new iface id (the reliable write that replaced ipobj.save()).
     eng.nb.ipam.ip_addresses.update.assert_called_once()
-    upd_body = eng.nb.ipam.ip_addresses.update.call_args.args[0]
+    upd_body = eng.nb.ipam.ip_addresses.update.call_args.args[0][0]
     assert upd_body["id"] == 901
     assert upd_body["assigned_object_type"] == "virtualization.vminterface"
     assert upd_body["assigned_object_id"] == 100
     # VM primary_ip4 now points at the (reassigned) existing IP — PATCHed via a
     # targeted virtual_machines.update that sends only {primary_ip4}.
     eng.nb.virtualization.virtual_machines.update.assert_called_once_with(
-        {"id": 42, "primary_ip4": 901})
+        [{"id": 42, "primary_ip4": 901}])
 
 
 def test_assign_vm_primary_ip4_reassign_failure_is_surfaced(caplog):
@@ -563,7 +563,7 @@ def test_assign_vm_primary_ip4_clears_stale_device_primary_ip():
 
     assert failures == 0
     # Reassigned to the vminterface...
-    upd_body = eng.nb.ipam.ip_addresses.update.call_args.args[0]
+    upd_body = eng.nb.ipam.ip_addresses.update.call_args.args[0][0]
     assert upd_body["assigned_object_type"] == "virtualization.vminterface"
     # ...and the stale device primary_ip4 cleared.
     assert stale_dev.primary_ip4 is None

@@ -151,10 +151,12 @@ class ChangelogMixin:
                              and iface_type != "dcim.interface")
         if updates:
             try:
-                # pynetbox >=7 removed the 2-arg ``update(id, body)`` form
-                # (``Endpoint.update() takes 2 positional arguments but 3 were
-                # given``); the dict-with-id form works on every version.
-                self.nb.ipam.ip_addresses.update({"id": ipobj.id, **updates})
+                # pynetbox >=7's Endpoint.update() is a BULK op: it takes a LIST
+                # of dicts/Records, each carrying its ``id``. A single dict raises
+                # "Objects passed must be list[dict|Record] - was <dict>" (the
+                # earlier 2-arg ``update(id, body)`` form was also wrong — "takes 2
+                # positional arguments but 3 were given"). Wrap the one dict in a list.
+                self.nb.ipam.ip_addresses.update([{"id": ipobj.id, **updates}])
             except Exception as e:
                 logger.warning("[sync-error] %s: reuse-IP %s reassign failed: %s",
                                source, addr, e)

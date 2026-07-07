@@ -418,9 +418,11 @@ class VmSyncMixin:
                 # ONLY primary_ip4, so the separately-applied custom_fields can
                 # never break the primary-IP assignment (and can't wipe attached
                 # CFs on a healthy box either).
-                # Dict-with-id form (pynetbox >=7 dropped update(id, body)).
+                # pynetbox >=7's Endpoint.update() is a BULK op — a LIST of
+                # dicts each with its id. A single dict raises "Objects passed
+                # must be list[dict|Record]". Wrap the one dict in a list.
                 self.nb.virtualization.virtual_machines.update(
-                    {"id": vm_obj.id, "primary_ip4": first_ip_id})
+                    [{"id": vm_obj.id, "primary_ip4": first_ip_id}])
             except Exception as e:
                 _record_fail(f"set primary_ip4 for VM {vm_name} failed", e)
         return build_failures, first_build_err
