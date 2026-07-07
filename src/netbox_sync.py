@@ -304,6 +304,13 @@ class SyncMixin:
             role = self._ensure_device_role(defaults.get("role") or "discovered")
             dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
             site = self._resolve_site(defaults.get("site") or "", tenant)
+            # When a create fails because NetBox requires a site (no site
+            # resolvable), the SAME 400 hits every record — previously ~one error
+            # per device (185 in a batch). Detect that on the first create and
+            # stop attempting further creates, aggregating the rest into one clear
+            # message, instead of spamming an identical 400 for every record. Set
+            # from the create handler below.
+            _site_required_abort = False
 
             for ip_str, rec in incoming.items():
                 mac = rec["mac"]
@@ -547,6 +554,12 @@ class SyncMixin:
                             logger.debug("sync_devices: hostname %s already used this batch; "
                                          "creating as %s", orig, name)
                         used_names.add(name.lower())
+                        # A prior create already 400'd on a missing site — the same
+                        # 400 hits every record, so stop attempting creates (count
+                        # once, aggregate) instead of spamming an identical error.
+                        if _site_required_abort:
+                            errors += 1
+                            continue
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                         if role:
                             create_kwargs["role"] = role.id
@@ -649,6 +662,19 @@ class SyncMixin:
                     errors += 1
                     if first_err is None:
                         first_err = f"upsert {ip_str}: {e}"
+                    # If a create failed because NetBox requires a site (none
+                    # resolvable), the same 400 will hit every remaining record —
+                    # flip the abort flag so the create guard above skips the rest
+                    # and log ONE clear, actionable message instead of 185 dupes.
+                    _es = str(e).lower()
+                    if not _site_required_abort and "site" in _es and "required" in _es:
+                        _site_required_abort = True
+                        logger.warning(
+                            "[sync-error] sync_devices tenant=%s: NetBox requires a "
+                            "site for device creation but none resolved (defaults.site="
+                            "%r) — set a valid 'site' slug for this sync or create a "
+                            "site in NetBox; skipping remaining creates.",
+                            tenant_slug or "—", defaults.get("site"))
                     logger.debug("sync_devices: upsert %s failed: %s", ip_str, e)
 
             msg = (f"{pushed} device(s) upserted, {deleted} deleted, "
