@@ -105,37 +105,47 @@ class StalenessMixin:
                 status_val = str((st.get("value") if isinstance(st, dict)
                                   else st) or "")
                 decomm = str(cf.get("decommissioned_at") or "").strip()
+                # Decide from the bulk-list row FIRST — the list already carries
+                # status + custom_fields, so rows that need no action skip the
+                # per-row ``.get(id)`` round-trip entirely (was an N+1 fetch on
+                # every device, even ones far from any threshold). Only fetch
+                # the live object when we're actually about to mutate it.
+                action = None  # "delete" | "decommission" | None
+                if status_val == "offline" and decomm:
+                    dage = _age_days(decomm)
+                    if dage is not None and dage >= cutoff_delete:
+                        action = "delete"
+                if action is None and age >= cutoff_stale and status_val != "offline":
+                    action = "decommission"
+                if action is None:
+                    continue
                 try:
                     obj = self.nb.dcim.devices.get(row["id"])
                     if not obj:
                         continue
-                    # 30-day delete: already offline + decommissioned_at aged out.
-                    if status_val == "offline" and decomm:
-                        dage = _age_days(decomm)
-                        if dage is not None and dage >= cutoff_delete:
-                            obj.delete()
-                            deleted += 1
-                            _bucket(tslug)["deleted"] += 1
-                            self._journal("dcim.device", row["id"], "staleness-sweep",
-                                           note=f"deleted: offline since {decomm}")
-                            continue
+                    if action == "delete":
+                        obj.delete()
+                        deleted += 1
+                        _bucket(tslug)["deleted"] += 1
+                        self._journal("dcim.device", row["id"], "staleness-sweep",
+                                       note=f"deleted: offline since {decomm}")
+                        continue
                     # 7-day decommission: unseen past stale_days + not yet offline.
-                    if age >= cutoff_stale and status_val != "offline":
-                        try:
-                            obj.status = "offline"
-                            m = dict(obj.custom_fields or {})
-                            m["decommissioned_at"] = now_iso
-                            obj.custom_fields = m
-                            obj.save()
-                            decommissioned += 1
-                            _bucket(tslug)["decommissioned"] += 1
-                            self._journal("dcim.device", row["id"], "staleness-sweep",
-                                           note=f"decommissioned: not seen since {ls}")
-                        except Exception as e:
-                            errors += 1
-                            _bucket(tslug)["errors"] += 1
-                            if first_err is None:
-                                first_err = f"decomm device {row['id']}: {e}"
+                    try:
+                        obj.status = "offline"
+                        m = dict(obj.custom_fields or {})
+                        m["decommissioned_at"] = now_iso
+                        obj.custom_fields = m
+                        obj.save()
+                        decommissioned += 1
+                        _bucket(tslug)["decommissioned"] += 1
+                        self._journal("dcim.device", row["id"], "staleness-sweep",
+                                       note=f"decommissioned: not seen since {ls}")
+                    except Exception as e:
+                        errors += 1
+                        _bucket(tslug)["errors"] += 1
+                        if first_err is None:
+                            first_err = f"decomm device {row['id']}: {e}"
                 except Exception as e:
                     errors += 1
                     _bucket(tslug)["errors"] += 1
@@ -166,37 +176,45 @@ class StalenessMixin:
                 status_val = str((status.get("value") if isinstance(status, dict)
                                   else status) or "")
                 decomm = str(cf.get("decommissioned_at") or "").strip()
+                # Decide from the bulk-list row FIRST (see devices loop): skip
+                # the per-row .get(id) round-trip for VMs that need no action.
+                action = None
+                if status_val == "offline" and decomm:
+                    dage = _age_days(decomm)
+                    if dage is not None and dage >= cutoff_delete:
+                        action = "delete"
+                if action is None and age >= cutoff_stale and status_val != "offline":
+                    action = "decommission"
+                if action is None:
+                    continue
                 try:
                     obj = self.nb.virtualization.virtual_machines.get(row["id"])
                     if not obj:
                         continue
-                    if status_val == "offline" and decomm:
-                        dage = _age_days(decomm)
-                        if dage is not None and dage >= cutoff_delete:
-                            obj.delete()
-                            deleted += 1
-                            _bucket(tslug)["deleted"] += 1
-                            self._journal("virtualization.virtualmachine", row["id"],
-                                           "staleness-sweep",
-                                           note=f"deleted: offline since {decomm}")
-                            continue
-                    if age >= cutoff_stale and status_val != "offline":
-                        try:
-                            obj.status = "offline"
-                            m = dict(obj.custom_fields or {})
-                            m["decommissioned_at"] = now_iso
-                            obj.custom_fields = m
-                            obj.save()
-                            decommissioned += 1
-                            _bucket(tslug)["decommissioned"] += 1
-                            self._journal("virtualization.virtualmachine", row["id"],
-                                           "staleness-sweep",
-                                           note=f"decommissioned: not seen since {ls}")
-                        except Exception as e:
-                            errors += 1
-                            _bucket(tslug)["errors"] += 1
-                            if first_err is None:
-                                first_err = f"decomm VM {row['id']}: {e}"
+                    if action == "delete":
+                        obj.delete()
+                        deleted += 1
+                        _bucket(tslug)["deleted"] += 1
+                        self._journal("virtualization.virtualmachine", row["id"],
+                                       "staleness-sweep",
+                                       note=f"deleted: offline since {decomm}")
+                        continue
+                    try:
+                        obj.status = "offline"
+                        m = dict(obj.custom_fields or {})
+                        m["decommissioned_at"] = now_iso
+                        obj.custom_fields = m
+                        obj.save()
+                        decommissioned += 1
+                        _bucket(tslug)["decommissioned"] += 1
+                        self._journal("virtualization.virtualmachine", row["id"],
+                                       "staleness-sweep",
+                                       note=f"decommissioned: not seen since {ls}")
+                    except Exception as e:
+                        errors += 1
+                        _bucket(tslug)["errors"] += 1
+                        if first_err is None:
+                            first_err = f"decomm VM {row['id']}: {e}"
                 except Exception as e:
                     errors += 1
                     _bucket(tslug)["errors"] += 1

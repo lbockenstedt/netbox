@@ -27,6 +27,15 @@ class NetboxSpoke(BaseSpoke):
         # fails to bind and the sync loop POSTs the hub → 405 "rejected scope").
         self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8760"))
         self._sync_task = None
+        # Short-TTL cache for read-only picklist commands that populate WebUI
+        # dropdowns (sites/racks/tenants/device-form-options). These change
+        # rarely but the UI re-fetches them on every form open / view switch,
+        # so a 60s TTL cuts a round-trip per open without staling long enough
+        # to hide a just-added site. Invalidated by _picklist_invalidate() on
+        # any mutation (add/update/delete/claim/allocate/release/sync) and on
+        # UPDATE_CONFIG (token/url change).
+        self._picklist_cache: Dict[str, Any] = {}
+        self._picklist_ttl = 60.0
         # Self-heal the custom fields the syncs depend on (idempotent, best-effort;
         # a restricted token never breaks the spoke — failures are DEBUG-logged).
         self.engine._ensure_custom_fields()
@@ -106,9 +115,48 @@ class NetboxSpoke(BaseSpoke):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
+    def _picklist_invalidate(self):
+        """Drop all cached picklist data — call after any mutation that could
+        change the dropdown contents (add/update/delete/claim/allocate/release/
+        sync, or an UPDATE_CONFIG that repoints NetBox)."""
+        if self._picklist_cache:
+            self._picklist_cache.clear()
+
+    async def _run_picklist(self, key: str, fn, *args, **kwargs):
+        """TTL-gated read for picklist commands. ``key`` is a stable string
+        encoding the command + its filter args so filtered reads (e.g.
+        NETBOX_GET_RACKS?site=X) cache separately. Returns a deep-enough copy
+        of the cached result (the engine returns plain dicts/lists, so a
+        shallow copy is fine — callers don't mutate)."""
+        import time as _time
+        entry = self._picklist_cache.get(key)
+        if entry and (_time.time() - entry["ts"]) < self._picklist_ttl:
+            return entry["value"]
+        value = await self._run_sync(fn, *args, **kwargs)
+        self._picklist_cache[key] = {"ts": _time.time(), "value": value}
+        return value
+
+    # Commands that change NetBox state and so could stale a cached picklist.
+    _PICKLIST_MUTATIONS = frozenset({
+        "NETBOX_ADD_RACK", "NETBOX_UPDATE_RACK", "NETBOX_DELETE_RACK",
+        "NETBOX_ADD_DEVICE", "NETBOX_CLAIM_DEVICE", "NETBOX_DELETE_DEVICE",
+        "NETBOX_UPDATE_DEVICE", "NETBOX_ALLOCATE_PREFIX", "NETBOX_CLAIM_PREFIX",
+        "NETBOX_UPDATE_PREFIX", "NETBOX_DELETE_PREFIX", "NETBOX_ALLOCATE_IP",
+        "NETBOX_RELEASE_IP", "NETBOX_UPDATE_IP", "NETBOX_UPDATE_IP_ADDR",
+        "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
+        "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
+        "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
+    })
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         normalized = command_type.upper()
         logger.info(f"NetBox command: {normalized}")
+
+        # A mutation could change the dropdown contents a picklist feeds — drop
+        # the cache up front so the next read sees fresh data. (UPDATE_CONFIG
+        # invalidates itself below.)
+        if normalized in self._PICKLIST_MUTATIONS:
+            self._picklist_invalidate()
 
         if normalized == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
@@ -129,6 +177,8 @@ class NetboxSpoke(BaseSpoke):
             if data.get("kea_ctrl_url"):
                 self.kea_url = data["kea_ctrl_url"]
             self.config.update(data)
+            # Repointing NetBox (or KEA) makes any cached picklist data stale.
+            self._picklist_invalidate()
             return {"status": "SUCCESS", "message": "NetBox config updated"}
 
         if normalized == "SPOKE_UPDATE":
@@ -149,11 +199,13 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine.get_system_health)
 
         if normalized == "NETBOX_GET_SITES":
-            return await self._run_sync(self.engine.get_sites)
+            return await self._run_picklist("GET_SITES", self.engine.get_sites)
 
         if normalized == "NETBOX_GET_RACKS":
-            return await self._run_sync(self.engine.get_racks,
-                                        site=data.get("site"), tenant=data.get("tenant"))
+            return await self._run_picklist(
+                f"GET_RACKS|site={data.get('site')}|tenant={data.get('tenant')}",
+                self.engine.get_racks,
+                site=data.get("site"), tenant=data.get("tenant"))
 
         if normalized == "NETBOX_ADD_RACK":
             return await self._run_sync(
@@ -194,7 +246,7 @@ class NetboxSpoke(BaseSpoke):
             )
 
         if normalized == "NETBOX_GET_DEVICE_FORM_OPTIONS":
-            return await self._run_sync(self.engine.get_device_form_options)
+            return await self._run_picklist("GET_DEVICE_FORM_OPTIONS", self.engine.get_device_form_options)
 
         if normalized == "NETBOX_CLAIM_DEVICE":
             return await self._run_sync(
@@ -320,7 +372,7 @@ class NetboxSpoke(BaseSpoke):
             )
 
         if normalized == "NETBOX_GET_TENANTS":
-            return await self._run_sync(self.engine.get_tenants)
+            return await self._run_picklist("GET_TENANTS", self.engine.get_tenants)
 
         if normalized == "NETBOX_SYNC_DHCP":
             await self.start_kea_sync()
@@ -439,7 +491,10 @@ class NetboxSpoke(BaseSpoke):
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
-        health = self.engine.get_system_health()
+        # get_system_health() issues a pynetbox HTTP round-trip; run it in a
+        # thread so the spoke's asyncio loop stays free to heartbeats / inbound
+        # commands while NetBox (or its DB) is slow to answer.
+        health = await self._run_sync(self.engine.get_system_health)
         return {
             "spoke_id": self.spoke_id,
             "module": "netbox",
