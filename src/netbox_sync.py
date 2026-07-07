@@ -107,12 +107,12 @@ class SyncMixin:
         NetBox device). Best-effort."""
         slug = (slug or "").strip().lower()
         if slug:
-            try:
-                s = self.nb.dcim.sites.get(slug=slug)
-                if s:
-                    return s
-            except Exception as e:
-                logger.warning("resolve_site '%s' failed: %s", slug, e)
+            # perf-scan D1b: TTL-cached so a fleet poll doesn't re-fetch the
+            # same slug once per device.
+            s = self._cached_ref("site", slug,
+                                  lambda: self.nb.dcim.sites.get(slug=slug))
+            if s:
+                return s
         try:
             sites = list(self.nb.dcim.sites.filter(limit=1))
             if sites:
@@ -794,8 +794,32 @@ class SyncMixin:
                             "interfaces_total": len(interfaces or []), "device_id": None}
                 try:
                     dt = self.nb.dcim.device_types.get(slug=dt_slug)
-                    role = self.nb.dcim.device_roles.get(slug=role_slug)
-                    site = self.nb.dcim.sites.get(slug=site_slug)
+                    # perf-scan D1b: role + site TTL-cached — a fleet POLL NOW
+                    # otherwise re-fetches the same two slugs once per device.
+                    role = self._cached_ref(
+                        "device_role", role_slug,
+                        lambda: self.nb.dcim.device_roles.get(slug=role_slug))
+                    site = self._cached_ref(
+                        "site", site_slug,
+                        lambda: self.nb.dcim.sites.get(slug=site_slug))
+                    # A configured-but-nonexistent slug resolves to None; guard
+                    # so it's a clear, actionable error instead of an
+                    # AttributeError on .id.
+                    _unresolved = [k for k, v in (("device_type", dt),
+                                                  ("role", role),
+                                                  ("site", site)) if v is None]
+                    if _unresolved:
+                        return {"status": "ERROR",
+                                "message": f"cannot create nw device {name!r}: "
+                                           f"default(s) not found in NetBox: "
+                                           f"{', '.join(_unresolved)} "
+                                           f"(create them in NetBox or fix the "
+                                           f"slug in Setup → Network Devices → "
+                                           f"IPAM Sync defaults)",
+                                "pushed": 0, "errors": 1, "skipped": 0,
+                                "deleted": 0,
+                                "interfaces_total": len(interfaces or []),
+                                "device_id": None}
                     ck: Dict[str, Any] = {"name": name, "device_type": dt.id,
                                           "role": role.id, "site": site.id}
                     if tenant:

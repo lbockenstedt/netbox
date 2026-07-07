@@ -46,11 +46,23 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
     """
     NetBox API client. Covers DCIM (devices/racks) and IPAM (prefixes/IPs).
     """
+    # perf-scan D1b: TTL for the reference-data (site/role) resolver cache.
+    # Sites and device-roles are created out-of-band in NetBox and change
+    # rarely; a short TTL keeps a fleet-wide POLL NOW from re-fetching the
+    # same slug once per device while still picking up an added site within
+    # a few minutes. Override via LM_NETBOX_REF_TTL for testing.
+    import os as _os
+    _ref_cache_ttl = float(_os.environ.get("LM_NETBOX_REF_TTL", "300") or 300)
+
     def __init__(self, url: str, token: str):
         self.url = url
         self.token = _clean_token(token)
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
+        # perf-scan D1b: shared slug→object cache for reference data (sites,
+        # device-roles). Keyed "kind:slug"; each entry {"ts", "value"}. Shared
+        # across every mixin because they all share `self`.
+        self._ref_cache: Dict[str, Any] = {}
         logger.info(f"Initialized NetboxEngine v{version} → {url}")
 
     def reconnect(self, url: str, token: str):
@@ -58,6 +70,34 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         self.token = _clean_token(token)
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
+        # A new API target invalidates any slug→object mappings from the old one.
+        self._ref_cache = {}
+
+    def _cached_ref(self, kind: str, slug: str, fetch):
+        """TTL-cached slug→object resolver for rarely-changing reference data.
+
+        ``kind`` namespaces the key ("site", "device_role"); ``fetch`` is a
+        zero-arg callable that performs the actual ``self.nb`` lookup on a miss.
+        A ``None`` result (slug not found) is cached too, so a fleet of devices
+        pointing at a bogus slug doesn't re-hit the API once per device. TTL-only
+        expiry — there is no site/role mutation command to invalidate against.
+        Best-effort: on fetch error, returns None without caching (so a
+        transient API blip retries next call)."""
+        import time as _time
+        key = f"{kind}:{(slug or '').strip().lower()}"
+        entry = getattr(self, "_ref_cache", None)
+        if entry is None:  # defensive: pre-__init__ / reconnect race
+            self._ref_cache = entry = {}
+        hit = entry.get(key)
+        if hit is not None and (_time.time() - hit["ts"]) < self._ref_cache_ttl:
+            return hit["value"]
+        try:
+            value = fetch()
+        except Exception as e:  # noqa: BLE001 — don't poison cache on transient error
+            logger.warning("ref-cache %s lookup failed: %s", key, e)
+            return None
+        entry[key] = {"ts": _time.time(), "value": value}
+        return value
 
     def _apply_auth(self) -> None:
         """Pin the Authorization header onto the shared http_session.
