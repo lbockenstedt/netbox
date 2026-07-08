@@ -169,7 +169,14 @@ class NetboxSpoke(BaseSpoke):
                     url or self.engine.url,
                     token or self.engine.token,
                 )
-                self.engine._ensure_custom_fields()
+                # Offload to a thread: _ensure_custom_fields does sync pynetbox
+                # I/O (list + per-field GET + save) that can block for seconds
+                # when NetBox is slow/down. This spoke shares the lm-svcs agent's
+                # event loop with the dns/dhcp sub-spokes; a blocking call here
+                # stalls the whole shared loop and surfaces as simultaneous
+                # Request Timeouts from lm-svcs/lm-svcs-dhcp/lm-svcs-dns (the
+                # shared-loop stall). _run_sync runs it in the executor.
+                await self._run_sync(self.engine._ensure_custom_fields)
                 if token:
                     self._persist_env("NETBOX_API_TOKEN", token)
                 if url:
