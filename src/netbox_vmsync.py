@@ -165,10 +165,22 @@ class VmSyncMixin:
         types_key = getattr(self, "_cf_types_key", None)
         if types_key is None:
             types_key = "object_types"
-            for f in by_name.values():
-                if hasattr(f, "content_types") and not hasattr(f, "object_types"):
-                    types_key = "content_types"
-                    break
+            try:
+                for f in by_name.values():
+                    # hasattr() on a pynetbox record triggers full_details() (a
+                    # per-id GET) when the attr isn't in the list payload — that
+                    # call can fail INDEPENDENTLY of cf_api.all() above if NetBox
+                    # flaps down between the list and the detail fetch
+                    # (ConnectionRefused). Default to the 4.x key on any failure;
+                    # _cf_create flips to content_types on a 3.x box that rejects
+                    # object_types.
+                    if hasattr(f, "content_types") and not hasattr(f, "object_types"):
+                        types_key = "content_types"
+                        break
+            except Exception as e:
+                logger.warning(
+                    "ensure_custom_fields: content_types/object_types detection "
+                    "failed (%s); defaulting to object_types", e)
             self._cf_types_key = types_key
         for name, ftype, label, content_type in self._REQUIRED_CUSTOM_FIELDS:
             cf = by_name.get(name)
