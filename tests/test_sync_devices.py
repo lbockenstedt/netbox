@@ -111,6 +111,33 @@ def test_sync_devices_creates_new_owned_device():
     assert fresh.save.called
 
 
+def test_sync_devices_autocreates_site_when_none_exists():
+    # Regression: NetBox REQUIRES a site on every device. When none is configured
+    # (defaults={}) and none exist, _resolve_site must auto-create one — mirroring
+    # role/device_type — so creates succeed instead of 400ing every record. This
+    # is the failure behind "fw-discovery: 183 errors, site required".
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.sites.get.return_value = None          # no configured slug resolves
+    eng.nb.dcim.sites.filter.return_value = []          # no existing site to adopt
+    eng.nb.dcim.sites.create.return_value = _Obj(id=777)
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "AA-BB-CC-DD-EE-01", "hostname": "ws-09"}],
+        tenant_slug="lrb", replace=True, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    # A fallback 'discovered' site was auto-created once for the batch...
+    eng.nb.dcim.sites.create.assert_called_once()
+    assert eng.nb.dcim.sites.create.call_args.kwargs["slug"] == "discovered"
+    # ...and the device was created WITH it (no more 'site required' 400).
+    assert eng.nb.dcim.devices.create.call_args.kwargs["site"] == 777
+
+
 def test_sync_devices_updates_existing_by_ip_no_duplicate():
     # Existing device (ours, tagged) with primary IP 10.0.0.5 → PUT-refresh, no new device.
     row = {"id": 77, "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},

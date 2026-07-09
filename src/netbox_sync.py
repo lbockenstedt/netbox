@@ -103,8 +103,11 @@ class SyncMixin:
 
     def _resolve_site(self, slug: str = "", tenant=None):
         """Resolve a site for device creation. Configured slug first; else the
-        first site as a fallback. None if none resolve (site is optional for a
-        NetBox device). Best-effort."""
+        first existing site; else AUTO-CREATE a fallback site. NetBox REQUIRES
+        every dcim.device to carry a site, so on the create path this must not
+        return None — it mirrors _ensure_device_role / _ensure_device_type, which
+        auto-provision the other two required refs. Returns None only if the
+        auto-create itself fails (e.g. a permissions issue — logged)."""
         slug = (slug or "").strip().lower()
         if slug:
             # perf-scan D1b: TTL-cached so a fleet poll doesn't re-fetch the
@@ -118,9 +121,22 @@ class SyncMixin:
             if sites:
                 return sites[0]
         except Exception as e:
-            # site is optional for a device, so this stays best-effort — but
             # warn so a permissions issue is visible rather than silent.
             logger.warning("resolve_site first-site fallback failed: %s", e)
+        # Nothing configured and no site exists — auto-create one so device
+        # creation (which REQUIRES a site) succeeds instead of 400ing every
+        # record (the failure behind "fw-discovery: 183 errors, site required").
+        # Use the configured slug if given, else a default 'discovered' (mirrors
+        # _ensure_device_role/_type). Created once; the first-site fallback above
+        # adopts it on subsequent syncs.
+        create_slug = slug or "discovered"
+        try:
+            return self.nb.dcim.sites.create(
+                name=create_slug.replace("-", " ").replace("_", " ").title(),
+                slug=create_slug, status="active")
+        except Exception as e:
+            logger.warning("resolve_site auto-create '%s' failed (device creates "
+                           "will 400 on the required site): %s", create_slug, e)
         return None
 
     def sync_devices(self, devices: list, tenant_slug: str = "",
