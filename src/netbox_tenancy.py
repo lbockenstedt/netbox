@@ -26,6 +26,15 @@ class TenancyMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def get_dhcp_prefixes(self) -> Dict[str, Any]:
+        """Read every NetBox prefix as a KEA DHCP scope source.
+
+        Returns ``{status, scopes}`` where each scope is
+        ``{prefix, gateway, mask, id}`` — ``gateway`` comes from the prefix's
+        ``gateway`` custom field (None when unset). Called by the spoke's
+        ``_kea_sync_loop`` (every 300s); each scope is POSTed to the KEA
+        Control Agent as ``subnet4-add`` with a derived pool range and the
+        gateway as the ``routers`` option. Paginated via ``_api_get_all`` so a
+        large prefix table doesn't truncate."""
         try:
             rows = self._api_get_all("/api/ipam/prefixes/")
             scopes = [
