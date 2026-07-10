@@ -54,22 +54,27 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
     import os as _os
     _ref_cache_ttl = float(_os.environ.get("LM_NETBOX_REF_TTL", "300") or 300)
 
-    def __init__(self, url: str, token: str):
+    def __init__(self, url: str, token: str, verify_ssl: bool = True):
         self.url = url
         self.token = _clean_token(token)
+        self.verify_ssl = bool(verify_ssl)
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
+        self._apply_ssl()
         # perf-scan D1b: shared slug→object cache for reference data (sites,
         # device-roles). Keyed "kind:slug"; each entry {"ts", "value"}. Shared
         # across every mixin because they all share `self`.
         self._ref_cache: Dict[str, Any] = {}
         logger.info(f"Initialized NetboxEngine v{version} → {url}")
 
-    def reconnect(self, url: str, token: str):
+    def reconnect(self, url: str, token: str, verify_ssl: bool = None):
         self.url = url
         self.token = _clean_token(token)
+        if verify_ssl is not None:
+            self.verify_ssl = bool(verify_ssl)
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
+        self._apply_ssl()
         # A new API target invalidates any slug→object mappings from the old one.
         self._ref_cache = {}
 
@@ -110,6 +115,32 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         session ourselves makes the direct GETs authenticate; it is a no-op for
         the ORM methods, which inject their own header per-request."""
         self.nb.http_session.headers.update({"Authorization": f"Token {self.token}"})
+
+    def _apply_ssl(self) -> None:
+        """Toggle TLS certificate verification on the shared http_session.
+
+        Both the pynetbox ORM methods and _api_get()'s direct
+        ``http_session.get()`` calls go through ``self.nb.http_session``, so
+        setting ``verify`` there covers every request. Verify defaults ON; a
+        deployment pointing at a NetBox server with a self-signed cert (e.g. the
+        Azure NetBox behind a public IP) can turn it OFF via the module's
+        ``netbox_verify_ssl`` setting / ``NETBOX_VERIFY_SSL=0``. When OFF we
+        silence urllib3's per-request InsecureRequestWarning (otherwise the sync
+        loops would flood the log) and warn ONCE that the cert is unverified —
+        no silent downgrade."""
+        self.nb.http_session.verify = self.verify_ssl
+        if not self.verify_ssl:
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+            logger.warning(
+                "NetBox TLS verification is OFF (netbox_verify_ssl=0) — the "
+                "NetBox server cert at %s is NOT authenticated; an on-path MITM "
+                "can read/forge the API traffic. Use only with a trusted "
+                "self-signed NetBox; set netbox_verify_ssl=1 once a CA-signed "
+                "cert is deployed.", self.url)
 
     def _api_get(self, path: str, params: dict = None) -> dict:
         """Single-page GET — uses the existing pynetbox session (auth already set).

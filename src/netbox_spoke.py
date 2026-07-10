@@ -12,6 +12,22 @@ from netbox_engine import NetboxEngine
 
 logger = logging.getLogger("NetboxSpoke")
 
+
+def _as_bool(val, default: bool = True) -> bool:
+    """Parse a config/env value into a bool. Accepts real bools, and the strings
+    0/1/true/false/yes/no/on/off (case-insensitive). Anything else → default."""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 class NetboxSpoke(BaseSpoke):
     """
     NetBox spoke: DCIM (rack/device) and IPAM (prefix/IP) management + KEA DHCP sync.
@@ -21,6 +37,11 @@ class NetboxSpoke(BaseSpoke):
         self.engine = NetboxEngine(
             url=config.get("netbox_url", os.getenv("NETBOX_URL", "http://localhost:8000")),
             token=config.get("api_token", os.getenv("NETBOX_API_TOKEN", "")),
+            # Verify the NetBox server's TLS cert by default; turn OFF for a
+            # NetBox behind a self-signed cert (e.g. the Azure NetBox on a public
+            # IP) via the WebUI toggle / NETBOX_VERIFY_SSL=0.
+            verify_ssl=_as_bool(config.get("netbox_verify_ssl",
+                                           os.getenv("NETBOX_VERIFY_SSL", "1")), default=True),
         )
         # KEA Control Agent URL. Default port 8760 matches install_kea.sh —
         # NOT 8000 (the LM hub owns 8000 on hub-colocated boxes; KEA CA on 8000
@@ -164,10 +185,16 @@ class NetboxSpoke(BaseSpoke):
         if normalized == "UPDATE_CONFIG":
             url = data.get("netbox_url") or data.get("url")
             token = data.get("api_token")
-            if url or token:
+            # TLS-verify toggle — reconnect when it (or url/token) changes so the
+            # new http_session picks up verify on/off immediately.
+            verify_ssl = None
+            if "netbox_verify_ssl" in data:
+                verify_ssl = _as_bool(data.get("netbox_verify_ssl"), default=self.engine.verify_ssl)
+            if url or token or verify_ssl is not None:
                 self.engine.reconnect(
                     url or self.engine.url,
                     token or self.engine.token,
+                    verify_ssl=verify_ssl,
                 )
                 # Offload to a thread: _ensure_custom_fields does sync pynetbox
                 # I/O (list + per-field GET + save) that can block for seconds
@@ -181,6 +208,8 @@ class NetboxSpoke(BaseSpoke):
                     self._persist_env("NETBOX_API_TOKEN", token)
                 if url:
                     self._persist_env("NETBOX_URL", url)
+                if verify_ssl is not None:
+                    self._persist_env("NETBOX_VERIFY_SSL", "1" if verify_ssl else "0")
             if data.get("kea_ctrl_url"):
                 self.kea_url = data["kea_ctrl_url"]
             self.config.update(data)
