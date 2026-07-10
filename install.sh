@@ -278,7 +278,7 @@ if [ "$INSTALL_APP" = true ]; then
         python3 python3-venv python3-pip python3-dev \
         build-essential libxml2-dev libxslt1-dev libffi-dev \
         libpq-dev libssl-dev zlib1g-dev \
-        nginx git curl jq
+        nginx git curl jq openssl
     ok "System packages ready"
 fi
 
@@ -769,8 +769,38 @@ SYSD
     systemctl restart netbox netbox-rq || warn "netbox service restart reported an error — the health check below verifies the WebUI"
     ok "NetBox services started (gunicorn on 127.0.0.1:$NB_PORT)"
 
+    # ── TLS cert (self-signed) for HTTPS on :443 ────────────────
+    # NetBox is public / Azure-facing, so serve it over HTTPS as well as :80.
+    # Generate a self-signed cert ONCE (idempotent — reused on re-install) with
+    # SANs for the hostname + optional NETBOX_FQDN / NETBOX_IP (mirrors the hub
+    # installer's LM_HUB_FQDN / LM_HUB_IP). A module connecting to this
+    # self-signed NetBox turns verification off (WebUI TLS toggle /
+    # NETBOX_VERIFY_SSL=0); drop a CA-signed cert in at these paths to keep
+    # verification ON.
+    NB_TLS_DIR="/etc/lm/netbox/tls"
+    NB_TLS_CRT="$NB_TLS_DIR/netbox.crt"
+    NB_TLS_KEY="$NB_TLS_DIR/netbox.key"
+    if [ ! -s "$NB_TLS_CRT" ] || [ ! -s "$NB_TLS_KEY" ]; then
+        step "Generating self-signed TLS certificate for NetBox HTTPS"
+        mkdir -p "$NB_TLS_DIR"
+        _nb_host="$(hostname -f 2>/dev/null || hostname)"
+        _nb_san="DNS:${_nb_host},DNS:localhost,IP:127.0.0.1"
+        [ -n "${NETBOX_FQDN:-}" ] && _nb_san="${_nb_san},DNS:${NETBOX_FQDN}"
+        [ -n "${NETBOX_IP:-}" ]   && _nb_san="${_nb_san},IP:${NETBOX_IP}"
+        if openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -keyout "$NB_TLS_KEY" -out "$NB_TLS_CRT" \
+                -subj "/CN=${NETBOX_FQDN:-$_nb_host}" \
+                -addext "subjectAltName=${_nb_san}" >/dev/null 2>&1; then
+            chmod 600 "$NB_TLS_KEY"
+            ok "Self-signed cert generated (SAN=${_nb_san})"
+        else
+            warn "openssl cert generation failed — serving HTTP :80 only (no HTTPS :443)"
+            rm -f "$NB_TLS_CRT" "$NB_TLS_KEY" 2>/dev/null || true
+        fi
+    fi
+
     # ── nginx ────────────────────────────────────────────────
-    step "Configuring nginx reverse proxy"
+    step "Configuring nginx reverse proxy (:80 + HTTPS :443)"
     cat > /etc/nginx/sites-available/netbox <<NGINX
 server {
     listen 80;
@@ -795,6 +825,41 @@ server {
     }
 }
 NGINX
+
+    # Append the TLS server (443) when a cert is present. Same proxy target as
+    # :80; X-Forwarded-Proto is pinned https so NetBox builds https:// URLs.
+    if [ -s "$NB_TLS_CRT" ] && [ -s "$NB_TLS_KEY" ]; then
+        cat >> /etc/nginx/sites-available/netbox <<NGINX
+
+server {
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate     $NB_TLS_CRT;
+    ssl_certificate_key $NB_TLS_KEY;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 25m;
+
+    location /static/ {
+        alias $NB_APP_DIR/netbox/static/;
+    }
+
+    location / {
+        proxy_pass         http://127.0.0.1:$NB_PORT;
+        proxy_set_header   Host              \$http_host;
+        proxy_set_header   X-Forwarded-Host  \$http_host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-Proto https;
+        proxy_read_timeout 120s;
+        proxy_buffer_size       32k;
+        proxy_buffers           8 32k;
+        proxy_busy_buffers_size 64k;
+    }
+}
+NGINX
+        ok "HTTPS :443 enabled (self-signed)"
+    fi
 
     ln -sf /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/netbox
     # Remove the distro default site — it owns :80 as default_server and would
