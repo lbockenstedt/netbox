@@ -84,3 +84,68 @@ way the LM hub's own OIDC provider does).
 The pipeline module is written on every run but is only imported once
 `SOCIAL_AUTH_PIPELINE` references it — i.e. once SSO is configured via the
 `--netbox-sso-*` flags (see the Entra setup section below).
+
+### Entra setup
+
+SSO is applied by **re-running `install.sh` with the `--netbox-sso-*` flags**
+(or the `LM_NETBOX_SSO_*` env equivalents). There is no live WebUI push and no
+sudoers grant — the installer writes a guarded, sentinel-delimited block into
+`configuration.py` and restarts `netbox`/`netbox-rq`. Re-running with the same
+flags is a no-op (the block matches → unchanged → no restart); re-running with
+changed flags replaces the block in place (idempotent, never clobbers the rest
+of `configuration.py`); omitting the flags leaves an existing SSO block intact
+(we never silently disable a working setup — edit `configuration.py` to remove
+it by hand).
+
+**1. App registration (Entra):** create a new app registration in your Entra
+tenant (separate from the LM hub's cert-auth app — NetBox uses a client
+secret, not a certificate). Note the **tenant (directory) id**, the
+**client (application) id**, and generate a **client secret**. Add a web
+redirect URI of `https://<netbox-host>/oauth/complete/oidc/` (trailing slash;
+the `oidc` segment is the social-auth backend name). Under **Token
+configuration → Add groups claim**, select **Groups assigned to the
+application** (or Security groups) emitted as **group object IDs** (the
+`groups` claim) — this is what `sync_entra_groups` maps. Apply a
+**conditional-access policy enforcing MFA** on this app (NetBox trusts Entra
+to enforce MFA at the IdP).
+
+**2. Pre-create NetBox groups + permissions:** in NetBox admin, create the
+target groups named exactly as in your group map (e.g. `netbox-admins`) and
+assign NetBox **permissions** to them once. With
+`REMOTE_AUTH_AUTO_CREATE_GROUPS=True` (the installer default) the groups
+auto-create on first login, but pre-creating lets you assign permissions ahead
+of time. Entra group membership drives which NetBox groups a user lands in; a
+dropped Entra group drops the NetBox group on the next login.
+
+**3. Apply** (re-run the installer with the flags):
+
+```bash
+sudo bash install.sh \
+  --hub wss://lm-hub:443 \
+  --netbox-sso-tenant          <directory-id> \
+  --netbox-sso-client-id       <application-id> \
+  --netbox-sso-client-secret   <client-secret> \
+  --netbox-sso-redirect-uri    https://<netbox-host>/oauth/complete/oidc/ \
+  --netbox-sso-group-map       '{"<entra-group-obj-id>": "netbox-admins"}' \
+  --netbox-sso-allowed-group   <entra-group-obj-id>   # optional login gate
+```
+
+Flags (all optional; `tenant` + `client-id` + `client-secret` together enable
+SSO):
+
+| Flag | Env | Purpose |
+|------|-----|---------|
+| `--netbox-sso-tenant` | `LM_NETBOX_SSO_TENANT` | Entra directory (tenant) id |
+| `--netbox-sso-client-id` | `LM_NETBOX_SSO_CLIENT_ID` | Entra application (client) id |
+| `--netbox-sso-client-secret` | `LM_NETBOX_SSO_CLIENT_SECRET` | Entra client secret (quoted safely into `configuration.py`) |
+| `--netbox-sso-redirect-uri` | `LM_NETBOX_SSO_REDIRECT_URI` | The URI registered in Entra (recorded as a comment; social-auth derives the actual redirect) |
+| `--netbox-sso-group-map` | `LM_NETBOX_SSO_GROUP_MAP` | JSON `{"<entra-group-obj-id>": "<netbox-group-name>"}` |
+| `--netbox-sso-allowed-group` | `LM_NETBOX_SSO_ALLOWED_GROUP` | Entra group obj-id; when set, only its members may log in |
+
+The resulting `configuration.py` block sets `REMOTE_AUTH_*` +
+`SOCIAL_AUTH_OIDC_*` + a `SOCIAL_AUTH_PIPELINE` extended with
+`lm_sso_pipeline.sync_entra_groups`, plus `NETBOX_SSO_GROUP_MAP` and
+`NETBOX_SSO_ALLOWED_GROUP`. **Break-glass:** a local NetBox superuser (created
+by the installer) still logs in via NetBox's local Django auth when Entra is
+unreachable. **Secret rotation** = re-run the installer with a new
+`--netbox-sso-client-secret`.

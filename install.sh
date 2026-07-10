@@ -47,6 +47,18 @@ NB_APP_DIR="/opt/netbox-app"   # NetBox application checkout
 LM_DIR="/opt/lm"               # LM installation root
 NB_PORT=8001                   # gunicorn bind port; nginx proxies :80 → this
 
+# ── Entra ID (OIDC) SSO for the NetBox web app ─────────────────────────
+# All optional; applied by re-running install.sh with the --netbox-sso-* flags
+# below (or LM_NETBOX_SSO_* env). When tenant + client-id + client-secret are all
+# set, the guarded REMOTE_AUTH_* / SOCIAL_AUTH_OIDC_* block is (re)written into
+# configuration.py and NetBox is restarted. See README → "Entra ID (OIDC) SSO".
+NB_SSO_TENANT="${LM_NETBOX_SSO_TENANT:-}"
+NB_SSO_CLIENT_ID="${LM_NETBOX_SSO_CLIENT_ID:-}"
+NB_SSO_CLIENT_SECRET="${LM_NETBOX_SSO_CLIENT_SECRET:-}"
+NB_SSO_REDIRECT_URI="${LM_NETBOX_SSO_REDIRECT_URI:-}"
+NB_SSO_GROUP_MAP="${LM_NETBOX_SSO_GROUP_MAP:-}"          # JSON: {"<entra-obj-id>": "<netbox-group>"}
+NB_SSO_ALLOWED_GROUP="${LM_NETBOX_SSO_ALLOWED_GROUP:-}"  # Entra group obj-id; restricts login
+
 # ── Argument parsing ─────────────────────────────────────────
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -66,6 +78,16 @@ while [[ "$#" -gt 0 ]]; do
         # password" knob. Implies the given value is the new password.
         --reset-admin-password) NB_SUPERPASS="$2"; SUPERPASS_EXPLICIT=true; RESET_ADMIN_ONLY=true; shift ;;
         --netbox-version)  NB_VERSION="$2";    shift ;;
+        # ── Entra ID (OIDC) SSO for the NetBox web app (re-run to apply) ──
+        # All optional. tenant+client-id+client-secret together enable SSO;
+        # group-map is JSON {"<entra-group-obj-id>": "<netbox-group-name>"};
+        # allowed-group is an Entra group obj-id that restricts who may log in.
+        --netbox-sso-tenant)         NB_SSO_TENANT="$2";        shift ;;
+        --netbox-sso-client-id)      NB_SSO_CLIENT_ID="$2";     shift ;;
+        --netbox-sso-client-secret)  NB_SSO_CLIENT_SECRET="$2"; shift ;;
+        --netbox-sso-redirect-uri)   NB_SSO_REDIRECT_URI="$2"; shift ;;
+        --netbox-sso-group-map)      NB_SSO_GROUP_MAP="$2";     shift ;;
+        --netbox-sso-allowed-group)  NB_SSO_ALLOWED_GROUP="$2"; shift ;;
         --spoke-only)      SPOKE_ONLY=true ;;
         --infra-only)      INFRA_ONLY=true ;;
         --all-prereqs) ;;  # no-op; accepted for LM hub compat
@@ -890,6 +912,156 @@ NBCUST
         systemctl restart netbox netbox-rq 2>/dev/null || true
     else
         ok "CUSTOM_VALIDATORS already present in configuration.py"
+    fi
+
+    # ── Entra ID (OIDC) SSO — guarded configuration.py block ───────────
+    # Applied when --netbox-sso-tenant + --netbox-sso-client-id + --netbox-sso-
+    # client-secret are all set (re-run the installer to enable or change). The
+    # block is sentinel-delimited so a re-run with NEW values replaces it in
+    # place (idempotent, never clobbers the rest of configuration.py). The values
+    # are written by a Python helper using repr() so the client secret and group
+    # names quote safely regardless of their characters. The pipeline step
+    # referenced here (lm_sso_pipeline.sync_entra_groups) was written above.
+    NB_SSO_ENABLED=false
+    if [ -n "$NB_SSO_TENANT" ] && [ -n "$NB_SSO_CLIENT_ID" ] && [ -n "$NB_SSO_CLIENT_SECRET" ]; then
+        NB_SSO_ENABLED=true
+    fi
+    if [ "$NB_SSO_ENABLED" = true ]; then
+        # NB_CFG is set inside INSTALL_APP above (configuration.py path).
+        # Write the helper to a temp file (a heredoc inside $(...) confuses the
+        # bash parser), run it with the SSO values via env, capture the verdict.
+        _SSO_HELPER="$(mktemp /tmp/lm-sso-cfg.XXXXXX.py)"
+        cat > "$_SSO_HELPER" <<'LMSSOCFG'
+"""Write the Entra ID (OIDC) SSO block into NetBox's configuration.py.
+
+Reads the SSO settings from env (passed by install.sh) and writes a sentinel-
+delimited ``REMOTE_AUTH_*`` / ``SOCIAL_AUTH_OIDC_*`` / ``SOCIAL_AUTH_PIPELINE``
+block. On re-run, an existing sentinel block is REPLACED in place with the new
+values (so changing --netbox-sso-* flags updates SSO); otherwise the block is
+appended. Values are emitted via ``repr()`` / ``json`` so the client secret and
+group names are quoted safely for any character. Prints ``CHANGED`` or
+``UNCHANGED`` (exit 0) on success; exits 2 on an invalid group map.
+"""
+import json
+import os
+import sys
+
+cfg_path = os.environ["NB_CFG"]
+tenant = os.environ["NB_SSO_TENANT"]
+client_id = os.environ["NB_SSO_CLIENT_ID"]
+client_secret = os.environ["NB_SSO_CLIENT_SECRET"]
+redirect_uri = os.environ.get("NB_SSO_REDIRECT_URI", "") or ""
+group_map_json = os.environ.get("NB_SSO_GROUP_MAP", "") or "{}"
+allowed_group = os.environ.get("NB_SSO_ALLOWED_GROUP", "") or ""
+
+try:
+    group_map = json.loads(group_map_json or "{}")
+except Exception as exc:  # noqa: BLE001
+    sys.stderr.write("invalid --netbox-sso-group-map (expected JSON object): %s\n" % exc)
+    sys.exit(2)
+if not isinstance(group_map, dict):
+    sys.stderr.write("invalid --netbox-sso-group-map: expected a JSON object\n")
+    sys.exit(2)
+# Normalise keys/values to strings (Entra object ids + NetBox group names).
+group_map = {str(k): str(v) for k, v in group_map.items()}
+
+BEGIN = "# --- BEGIN LM SSO (Entra ID / OIDC) managed by install.sh --netbox-sso-* ---"
+END = "# --- END LM SSO ---"
+
+endpoint = "https://login.microsoftonline.com/%s/v2.0" % tenant
+lines = [
+    BEGIN,
+    "# Do not edit by hand — re-run install.sh with --netbox-sso-* flags to change.",
+    "REMOTE_AUTH_ENABLED = True",
+    "REMOTE_AUTH_BACKEND = ['social_core.backends.openid_connect.OpenIdConnectAuth']",
+    "REMOTE_AUTH_AUTO_CREATE_USER = True",
+    "REMOTE_AUTH_AUTO_CREATE_GROUPS = True",
+    "SOCIAL_AUTH_OIDC_OIDC_ENDPOINT = %s" % repr(endpoint),
+    "SOCIAL_AUTH_OIDC_KEY = %s" % repr(client_id),
+    "SOCIAL_AUTH_OIDC_SECRET = %s" % repr(client_secret),
+    "SOCIAL_AUTH_OIDC_SCOPE = ['openid', 'profile', 'email', 'offline_access']",
+    "SOCIAL_AUTH_OIDC_USERNAME_KEY = 'preferred_username'",
+    "NETBOX_SSO_GROUP_MAP = %s" % json.dumps(group_map),
+    "NETBOX_SSO_ALLOWED_GROUP = %s" % repr(allowed_group),
+]
+if redirect_uri:
+    lines.append("# Redirect URI registered in Entra: %s" % redirect_uri)
+lines += [
+    "SOCIAL_AUTH_PIPELINE = (",
+    "    'social_core.pipeline.social_auth.social_details',",
+    "    'social_core.pipeline.social_auth.social_uid',",
+    "    'social_core.pipeline.social_auth.auth_allowed',",
+    "    'social_core.pipeline.social_auth.social_user',",
+    "    'social_core.pipeline.user.get_username',",
+    "    'social_core.pipeline.user.create_user',",
+    "    'social_core.pipeline.social_auth.associate_user',",
+    "    'social_core.pipeline.social_auth.load_extra_data',",
+    "    'social_core.pipeline.user_details',",
+    "    'lm_sso_pipeline.sync_entra_groups',",
+    ")",
+    END,
+]
+new_block = "\n".join(lines) + "\n"
+
+with open(cfg_path, "r") as f:
+    cur = f.read()
+
+b = cur.find(BEGIN)
+if b != -1:
+    e = cur.find(END, b)
+    if e == -1:
+        new = cur.rstrip() + "\n\n" + new_block
+    else:
+        e_end = cur.find("\n", e)
+        if e_end == -1:
+            e_end = len(cur)
+        else:
+            e_end += 1
+        new = cur[:b] + new_block + cur[e_end:]
+else:
+    new = cur.rstrip() + "\n\n" + new_block
+
+if new != cur:
+    with open(cfg_path, "w") as f:
+        f.write(new)
+    print("CHANGED")
+else:
+    print("UNCHANGED")
+LMSSOCFG
+        set +e
+        _SSO_OUT=$(NB_CFG="$NB_CFG" \
+            NB_SSO_TENANT="$NB_SSO_TENANT" \
+            NB_SSO_CLIENT_ID="$NB_SSO_CLIENT_ID" \
+            NB_SSO_CLIENT_SECRET="$NB_SSO_CLIENT_SECRET" \
+            NB_SSO_REDIRECT_URI="$NB_SSO_REDIRECT_URI" \
+            NB_SSO_GROUP_MAP="$NB_SSO_GROUP_MAP" \
+            NB_SSO_ALLOWED_GROUP="$NB_SSO_ALLOWED_GROUP" \
+            "$NB_APP_DIR/venv/bin/python3" "$_SSO_HELPER")
+        _SSO_RC=$?
+        set -e
+        rm -f "$_SSO_HELPER"
+        if [ $_SSO_RC -ne 0 ]; then
+            warn "Entra ID SSO config NOT written (rc=$_SSO_RC) — check --netbox-sso-group-map is a JSON object. Continuing."
+        else
+            case "$_SSO_OUT" in
+                *CHANGED*)
+                    ok "Entra ID SSO configured in configuration.py (REMOTE_AUTH + SOCIAL_AUTH_OIDC + group-sync pipeline)"
+                    systemctl restart netbox netbox-rq 2>/dev/null || true
+                    ;;
+                *UNCHANGED*)
+                    ok "Entra ID SSO already configured in configuration.py (unchanged)"
+                    ;;
+            esac
+        fi
+    else
+        # SSO not requested. If a previous run configured it and the operator
+        # now omits the flags, leave the block in place (we never silently
+        # disable a working SSO setup). Surface a hint to remove it by hand.
+        if grep -q "^# --- BEGIN LM SSO" "$NB_CFG" 2>/dev/null; then
+            ok "Entra ID SSO already configured; --netbox-sso-* flags not given this run (left as-is)"
+        else
+            ok "Entra ID SSO not requested (pass --netbox-sso-tenant/client-id/client-secret to enable)"
+        fi
     fi
 
     # NOTE: Lab Manager custom fields (vmid_start/vmid_end, proxmox_vmid,
