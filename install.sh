@@ -412,6 +412,18 @@ if [ "$INSTALL_APP" = true ]; then
     "$NB_APP_DIR/venv/bin/pip" install -r "$NB_APP_DIR/requirements.txt" --no-cache-dir
     ok "NetBox Python requirements installed"
 
+    # social-auth-app-django + social-auth-core ship in NetBox's requirements but
+    # WITHOUT the [openidconnect] extra that pulls python-jose. The stock
+    # social_core.backends.openid_connect.OpenIdConnectAuth backend imports jose at
+    # load time, so OIDC SSO crashes with ModuleNotFoundError until the extra is
+    # installed. Install it so Entra ID SSO works. Idempotent (pip no-op when
+    # already satisfied); best-effort so an air-gapped box still installs NetBox.
+    if "$NB_APP_DIR/venv/bin/pip" install 'social-auth-core[openidconnect]' --no-cache-dir 2>/dev/null; then
+        ok "social-auth-core[openidconnect] installed (OIDC SSO ready)"
+    else
+        warn "social-auth-core[openidconnect] install failed — OIDC SSO will be unavailable"
+    fi
+
     # ── configuration.py — create on first run, preserve on update ──
     NB_CFG="$NB_APP_DIR/netbox/netbox/configuration.py"
     # Generate API_TOKEN_PEPPERS entry if not present regardless of whether
@@ -681,6 +693,183 @@ class ProxmoxVmidInRangeValidator(CustomValidator):
                       field="custom_fields")
 LMCV
     ok "lm_custom_validators.py written"
+
+    # 1b) Entra ID SSO pipeline module — written to the project root (same place
+    #     as lm_custom_validators.py) so configuration.py's SOCIAL_AUTH_PIPELINE
+    #     can `import lm_sso_pipeline`. Overwritten each run (it is ours). The
+    #     pipeline step maps Entra group object IDs -> NetBox groups (with a
+    #     >200-groups Microsoft Graph fallback) and is wired into
+    #     SOCIAL_AUTH_PIPELINE by the --netbox-sso-* flag block below. Writing the
+    #     module unconditionally is harmless: it's only imported when
+    #     SOCIAL_AUTH_PIPELINE references it (i.e. when SSO is configured).
+    cat > "$NB_PROJECT_DIR/lm_sso_pipeline.py" <<'LMSSO'
+"""Lab Manager Entra ID SSO pipeline for NetBox.
+
+Loaded via ``SOCIAL_AUTH_PIPELINE`` in ``configuration.py`` (configured by the
+Lab Manager NetBox installer's ``--netbox-sso-*`` flags). social-auth-app-django
+runs the OIDC Authorization-Code flow against Entra ID through the stock
+``social_core.backends.openid_connect.OpenIdConnectAuth`` backend; this module
+contributes ONE custom pipeline step, :func:`sync_entra_groups`, appended to
+the end of the pipeline:
+
+  * Maps the user's Entra group object IDs (the id-token ``groups`` claim, or
+    Microsoft Graph ``/me/transitiveMemberOf`` when the claim overflows >200
+    groups) to NetBox group names via the ``NETBOX_SSO_GROUP_MAP`` setting, and
+    sets the NetBox user's groups to EXACTLY that mapped set — so Entra is the
+    source of truth for group membership (a dropped Entra group drops the NetBox
+    group on the next login).
+  * Optional ``NETBOX_SSO_ALLOWED_GROUP`` gate: when set, a user who is not a
+    member of that Entra group is refused (``AuthForbidden``) before any NetBox
+    user record is provisioned.
+
+MFA is enforced by Entra conditional access at the IdP (NetBox trusts the IdP);
+social-auth does not expose the ``amr`` claim for a hub-side hard-check the way
+the LM hub's own OIDC provider (``lm/core/src/security/oidc.py``) does.
+
+Django/NetBox model imports are deferred into the function body: this module is
+imported by ``configuration.py`` at Django startup, before the apps registry is
+ready. The pipeline runs later (after ``create_user``), so the apps are loaded
+by then. The Graph fallback is ported from the LM hub's
+``security.oidc.fetch_member_groups_via_graph`` and uses stdlib ``urllib`` so it
+adds no dependency to the NetBox venv.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import urllib.request
+
+logger = logging.getLogger("lm_sso")
+
+
+def _decode_id_token_claims(id_token):
+    """Base64-decode a JWT's payload WITHOUT re-verifying its signature.
+
+    social-auth's ``OpenIdConnectAuth`` backend already verified the id-token
+    signature against the Entra JWKS before our pipeline step runs, so we only
+    need to read the claims the IdP authenticated — re-verifying here would
+    duplicate work and require a JWKS fetch. Returns the claims dict, or ``{}``
+    on any decode failure (we never crash the login over a malformed token).
+    """
+    if not id_token or not isinstance(id_token, str) or id_token.count(".") != 2:
+        return {}
+    try:
+        _, payload, _ = id_token.split(".")
+        pad = "=" * (-len(payload) % 4)  # JWT base64url is unpadded
+        return json.loads(base64.urlsafe_b64decode(payload + pad).decode("utf-8")) or {}
+    except Exception as exc:  # noqa: BLE001 — best-effort claim read
+        logger.warning("lm_sso: could not decode id_token claims: %s", exc)
+        return {}
+
+
+def _member_groups(claims, access_token):
+    """Return the user's Entra group object IDs.
+
+    Prefers the id-token ``groups`` claim. Entra OMITS ``groups`` when the user
+    is in >200 groups (the overflow case) and emits ``_claim_names`` /
+    ``_claim_sources`` pointing at Graph instead; when ``groups`` is absent and
+    ``_claim_names`` references it, fall back to Microsoft Graph
+    ``/me/transitiveMemberOf?$select=id`` via the access token (ported from the
+    LM hub's ``security.oidc.fetch_member_groups_via_graph``). A present-but-
+    empty ``groups: []`` is NOT an overflow — the user is in zero groups.
+    """
+    g = claims.get("groups")
+    if isinstance(g, list):
+        return [str(x) for x in g]  # claim present (even empty) — use it
+    # groups claim absent — overflow? Entra emits a _claim_names.groups pointer.
+    claim_names = claims.get("_claim_names")
+    if not (isinstance(claim_names, dict) and "groups" in claim_names):
+        return []  # no groups claim and no overflow pointer -> user in no groups
+    if not access_token:
+        logger.warning("lm_sso: groups claim overflowed but no access_token to "
+                       "call Graph; group sync will be empty for this login.")
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://graph.microsoft.com/v1.0/me/transitiveMemberOf?$select=id",
+            headers={"Authorization": "Bearer " + access_token})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+        return [v["id"] for v in data.get("value", []) if "id" in v]
+    except Exception as exc:  # noqa: BLE001 — best-effort; never crash login
+        logger.warning("lm_sso: Graph /me/transitiveMemberOf failed: %s", exc)
+        return []
+
+
+def sync_entra_groups(backend, user, response, *args, **kwargs):
+    """social-auth pipeline step (appended to ``SOCIAL_AUTH_PIPELINE``).
+
+    Maps the user's Entra group object IDs -> NetBox groups via
+    ``NETBOX_SSO_GROUP_MAP`` and sets the NetBox user's groups to exactly that
+    set (Entra is the source of truth). Refuses login (``AuthForbidden``) when
+    ``NETBOX_SSO_ALLOWED_GROUP`` is set and the user is not a member of that
+    Entra group. NetBox groups are get-or-created when
+    ``REMOTE_AUTH_AUTO_CREATE_GROUPS`` is on; otherwise only pre-existing groups
+    are assigned (unmapped / missing groups are skipped with a debug log).
+    """
+    from django.conf import settings
+    try:
+        from social_core.exceptions import AuthForbidden
+    except Exception:  # noqa: BLE001 — keep the gate working if social_core moved it
+        AuthForbidden = Exception
+
+    group_map = getattr(settings, "NETBOX_SSO_GROUP_MAP", {}) or {}
+    allowed_group = (getattr(settings, "NETBOX_SSO_ALLOWED_GROUP", "") or "").strip()
+    auto_create = bool(getattr(settings, "REMOTE_AUTH_AUTO_CREATE_GROUPS", False))
+
+    # The token response carries access_token + id_token; some social-auth
+    # versions also expose the decoded id_token on the backend.
+    token_resp = response or {}
+    id_token = token_resp.get("id_token") or getattr(backend, "id_token", "") or ""
+    claims = _decode_id_token_claims(id_token)
+    access_token = token_resp.get("access_token") or ""
+    member_of = _member_groups(claims, access_token)
+
+    # allowed-group gate — refuse before provisioning / group assignment.
+    if allowed_group and allowed_group not in member_of:
+        logger.info("lm_sso: refusing login for %r — not in allowed Entra group %s",
+                    getattr(user, "username", None), allowed_group)
+        raise AuthForbidden(backend)
+
+    # Map Entra object IDs -> NetBox group names (only those listed in the map;
+    # unmapped Entra groups are ignored). Preserve insertion order, de-dupe.
+    target_names = []
+    for gid in member_of:
+        name = group_map.get(gid)
+        if name and name not in target_names:
+            target_names.append(name)
+
+    if user is None:
+        return  # create_user hasn't run — nothing to sync (defensive)
+
+    # Resolve names to NetBox Group objects. Use the model the user's `groups`
+    # M2M actually points at (Django auth.Group or NetBox users.Group depending
+    # on the NetBox version) so this works on either schema.
+    GroupModel = user.groups.model
+    target_groups = []
+    for name in target_names:
+        grp = GroupModel.objects.filter(name=name).first()
+        if grp is not None:
+            target_groups.append(grp)
+            continue
+        if auto_create:
+            try:
+                grp, _ = GroupModel.objects.get_or_create(name=name)
+                target_groups.append(grp)
+            except Exception as exc:  # noqa: BLE001 — extra required fields, etc.
+                logger.warning("lm_sso: could not create NetBox group %r: %s", name, exc)
+        else:
+            logger.debug("lm_sso: mapped NetBox group %r does not exist and "
+                         "REMOTE_AUTH_AUTO_CREATE_GROUPS is off — skipping", name)
+
+    # Set EXACTLY this set — drops groups no longer backed by an Entra membership.
+    user.groups.set(target_groups)
+    logger.info("lm_sso: synced %r -> groups=%s",
+                getattr(user, "username", None),
+                sorted(g.name for g in target_groups))
+LMSSO
+    ok "lm_sso_pipeline.py written"
 
     # 2) Inject CUSTOM_VALIDATORS into configuration.py (guarded, like
     #    API_TOKEN_PEPPERS) — append only if absent, never overwrite.

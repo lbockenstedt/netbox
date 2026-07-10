@@ -54,3 +54,33 @@ records via the `NETBOX_SYNC_VMS` command (`netbox_engine.sync_vms`):
 tenant's `vmid_start`/`vmid_end` + the `proxmox_vmid` values already in use on
 that tenant's VMs (inside the range), used by the LM hub's optional VMID
 auto-allocation knob.
+
+## Entra ID (OIDC) SSO — installer support (`install.sh`)
+
+`install.sh` can wire NetBox for **Azure Entra ID (OIDC) single sign-on** with
+Entra-group → NetBox-group sync (Entra is the source of truth for group
+membership). Two pieces ship in the installer:
+
+- **`social-auth-core[openidconnect]`** is pip-installed into the NetBox venv.
+  NetBox ships `social-auth-core` without the `[openidconnect]` extra (which
+  pulls `python-jose`), so the stock `OpenIdConnectAuth` backend would crash at
+  load (`ModuleNotFoundError: jose`) without this. Idempotent.
+- **`lm_sso_pipeline.py`** is written to the NetBox project root
+  (`/opt/netbox-app/netbox/lm_sso_pipeline.py`, on `sys.path`, alongside
+  `lm_custom_validators.py`). It exports one social-auth pipeline step,
+  `sync_entra_groups`, which maps Entra group object IDs → NetBox groups via the
+  `NETBOX_SSO_GROUP_MAP` setting and sets the NetBox user's groups to exactly
+  that set on every login — so a dropped Entra group drops the NetBox group
+  next login. It also handles the Entra **>200-groups overflow** (when the
+  `groups` claim is omitted) by falling back to Microsoft Graph
+  `/me/transitiveMemberOf` (ported from the LM hub's
+  `security.oidc.fetch_member_groups_via_graph`), and an optional
+  `NETBOX_SSO_ALLOWED_GROUP` login gate.
+
+MFA is enforced by **Entra conditional access at the IdP** — NetBox trusts the
+IdP (social-auth doesn't expose the `amr` claim for a hub-side hard-check the
+way the LM hub's own OIDC provider does).
+
+The pipeline module is written on every run but is only imported once
+`SOCIAL_AUTH_PIPELINE` references it — i.e. once SSO is configured via the
+`--netbox-sso-*` flags (see the Entra setup section below).
