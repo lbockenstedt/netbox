@@ -12,6 +12,22 @@ from netbox_engine import NetboxEngine
 
 logger = logging.getLogger("NetboxSpoke")
 
+# Hub-level system commands handled by BaseControlPlane.handle_system_command
+# (shared /opt/lm/core). A spoke running a STALE core (older than the build that
+# added one of these handlers — e.g. CLEAR_LOGS, added cf37058) returns None from
+# handle_system_command for that command, so dispatch falls through to the
+# module's handle_command. Rather than WARN + ERROR (which cascades to a FAILED
+# mailbox ack → "unknown message ID" noise on the hub), degrade gracefully: the
+# spoke clearly can't honour it until its core updates, so ack success and let
+# the next SPOKE_UPDATE pull current core. Only system commands are muted here;
+# genuinely-unknown MODULE commands still WARN + ERROR (so typos surface).
+_SYSTEM_COMMANDS = frozenset({
+    "HUB_PING", "RUN_COMMAND", "GET_AGENTS",
+    "SPOKE_SET_LOG_LEVEL", "SET_LOG_LEVEL", "CLEAR_LOGS",
+    "SPOKE_GET_STATUS", "SPOKE_UPDATE",
+    "SPOKE_SET_HUB_SECRET", "SPOKE_UPDATE_SESSION_KEY", "SPOKE_SET_HOSTNAME",
+})
+
 
 def _as_bool(val, default: bool = True) -> bool:
     """Parse a config/env value into a bool. Accepts real bools, and the strings
@@ -523,6 +539,16 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine._ensure_custom_fields,
                                         force=True)
 
+        if command_type in _SYSTEM_COMMANDS:
+            # Stale /opt/lm/core: this system command should have been
+            # intercepted by handle_system_command but wasn't (core predates
+            # its handler). Don't WARN+ERROR (FAILED ack cascade); the next
+            # SPOKE_UPDATE pulls current core. See _SYSTEM_COMMANDS above.
+            logger.info("Stale-core fallthrough for system command %s "
+                        "(handle_system_command returned None); update spoke "
+                        "to clear.", command_type)
+            return {"status": "SUCCESS",
+                    "message": f"{command_type} not applied — spoke core stale, update needed"}
         logger.warning(f"Unknown NetBox command: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
