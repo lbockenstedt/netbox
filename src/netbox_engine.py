@@ -1,12 +1,7 @@
-import ipaddress
-import re
 import pynetbox
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
-from custom_fields_spec import CUSTOM_FIELDS_SPEC
+from typing import Any, Dict, Optional
 
 # Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
 # when multiple IPAM queries arrive simultaneously.

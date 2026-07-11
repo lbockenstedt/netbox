@@ -1,9 +1,6 @@
 """Tenancy + DHCP-prefix read methods for NetboxEngine."""
-import ipaddress
-import re
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("NetboxEngine")
 

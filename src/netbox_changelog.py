@@ -1,9 +1,7 @@
 """Change-log journaling + IP-reuse/reassign helpers for NetboxEngine."""
-import ipaddress
-import re
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger("NetboxEngine")
 

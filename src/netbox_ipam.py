@@ -1,8 +1,6 @@
 """IPAM prefix/IP methods incl. free-subnet finder + claim for NetboxEngine."""
 import ipaddress
-import re
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")

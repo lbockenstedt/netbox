@@ -1,8 +1,6 @@
 """DCIM sites/racks/devices + health + universal search methods for NetboxEngine."""
 import ipaddress
-import re
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")
