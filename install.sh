@@ -1426,6 +1426,140 @@ else
     ok "Skipping REST custom-field provisioning (no NETBOX_URL/TOKEN or no python3) — spoke will self-heal at startup"
 fi
 
+# ── TLS cert install helper + sudoers (least-privilege INSTALL_CERT) ────
+# NetBox's spoke runs as unprivileged $SVC_USER and has no cert API, so LE cert
+# distribution can't reach /etc/lm/netbox/tls/ or reload nginx directly. Mirror
+# the hub's lm-self-restart sudoers-helper pattern: a root-owned 0755 helper
+# that the spoke invokes as `sudo -n /usr/local/bin/lm-netbox-install-cert
+# <crt-tmp> <key-tmp>` (sudoers grants ONLY this exact path). The spoke writes
+# fullchain+privkey to 0600 temp files under /tmp and passes the paths; the
+# helper validates (openssl + key/cert pubkey match) BEFORE touching the live
+# files, atomically swaps netbox.{crt,key}, ensures the nginx 443 ssl block
+# exists (an HTTP-only install has none), nginx -t (restores on failure), then
+# reloads nginx. Never bricks nginx. Idempotent. NB_APP_DIR/NB_PORT are baked
+# in at install time (the helper is regenerated on every install.sh run, so a
+# customized NB_APP_DIR/NB_PORT is reflected here); nginx vars are \$-escaped
+# so they survive into the helper as literals for the appended 443 block.
+log_c "⚙️ Configuring NetBox cert-install helper + sudoers for $SVC_USER..."
+cat > /usr/local/bin/lm-netbox-install-cert <<HELPER
+#!/bin/bash
+# Installs a TLS cert (fullchain + privkey) as NetBox's nginx HTTPS cert.
+# Invoked by the lm-netbox spoke ($SVC_USER) via sudoers:
+#   sudo -n /usr/local/bin/lm-netbox-install-cert <crt-tmp> <key-tmp>
+# The spoke validates the cert in-process (ssl.load_cert_chain) BEFORE calling;
+# this helper re-validates (defense in depth) so a bad/mismatched pair never
+# reaches the live nginx paths. Swaps /etc/lm/netbox/tls/netbox.{crt,key}
+# atomically, ensures the nginx 443 ssl server block exists, runs nginx -t
+# (restores the prior cert/key on failure), then reloads nginx. Prints a
+# one-line status to stdout (parsed by the spoke): "OK <msg>" or exits non-zero
+# with "ERROR: <msg>" on stderr. Idempotent + safe — never bricks nginx.
+set -euo pipefail
+
+CRT="\${1:-}"
+KEY="\${2:-}"
+TLS_DIR="/etc/lm/netbox/tls"
+LIVE_CRT="\$TLS_DIR/netbox.crt"
+LIVE_KEY="\$TLS_DIR/netbox.key"
+NGINX_SITE="/etc/nginx/sites-available/netbox"
+NB_APP_STATIC="$NB_APP_DIR/netbox/static/"
+NB_GUNICORN="http://127.0.0.1:$NB_PORT"
+
+err() { echo "ERROR: \$1" >&2; exit 1; }
+
+[ -n "\$CRT" ] && [ -n "\$KEY" ] || err "usage: \$0 <crt-tmp> <key-tmp>"
+[ -r "\$CRT" ] && [ -r "\$KEY" ] || err "temp cert/key files not readable"
+command -v openssl >/dev/null 2>&1 || err "openssl not found"
+command -v nginx  >/dev/null 2>&1 || err "nginx not found"
+
+# Validate cert + key PEM, and that the key belongs to the cert (pubkey match).
+openssl x509 -in "\$CRT" -noout >/dev/null 2>&1 || err "cert is not a valid X.509 PEM"
+openssl pkey -in "\$KEY" -noout -pubout >/dev/null 2>&1 || err "key is not a valid private key PEM"
+cert_pub="\$(openssl x509 -in "\$CRT" -noout -pubkey 2>/dev/null | openssl md5)"
+key_pub="\$(openssl pkey -in "\$KEY" -pubout 2>/dev/null | openssl md5)"
+[ "\$cert_pub" = "\$key_pub" ] || err "private key does not match the certificate"
+
+mkdir -p "\$TLS_DIR"
+
+# Back up the live cert/key so nginx -t failure can restore them.
+BK=0
+if [ -s "\$LIVE_CRT" ] && [ -s "\$LIVE_KEY" ]; then
+    cp -p "\$LIVE_CRT" "\$LIVE_CRT.bak.\$\$" && cp -p "\$LIVE_KEY" "\$LIVE_KEY.bak.\$\$" && BK=1
+fi
+
+# Atomic install: copy to .new next to the target (same fs), then mv -f (rename).
+cp "\$CRT" "\$LIVE_CRT.new"; chmod 0644 "\$LIVE_CRT.new"
+( umask 077; cp "\$KEY" "\$LIVE_KEY.new" ); chmod 0600 "\$LIVE_KEY.new"
+mv -f "\$LIVE_CRT.new" "\$LIVE_CRT"
+mv -f "\$LIVE_KEY.new" "\$LIVE_KEY"
+
+# Ensure the nginx 443 ssl server block exists. An HTTP-only install (openssl
+# was missing at install time) has no 443 block; install it now that a real
+# cert is present. Idempotent (grep guard). Cert paths + proxy target are baked
+# in at install time; nginx vars are literal here (single-quoted heredoc).
+if [ -f "\$NGINX_SITE" ] && ! grep -q "listen 443 ssl;" "\$NGINX_SITE"; then
+    cat >> "\$NGINX_SITE" <<'NGINX'
+
+server {
+    listen 443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/lm/netbox/tls/netbox.crt;
+    ssl_certificate_key /etc/lm/netbox/tls/netbox.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 25m;
+
+    location /static/ {
+        alias NB_APP_STATIC_PLACEHOLDER;
+    }
+
+    location / {
+        proxy_pass         NB_GUNICORN_PLACEHOLDER;
+        proxy_set_header   Host              \$http_host;
+        proxy_set_header   X-Forwarded-Host  \$http_host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-Proto https;
+        proxy_read_timeout 120s;
+        proxy_buffer_size       32k;
+        proxy_buffers           8 32k;
+        proxy_busy_buffers_size 64k;
+    }
+}
+NGINX
+    # Substitute the baked-in paths (the inner heredoc is single-quoted, so it
+    # can't expand them itself — patch the placeholders in place).
+    sed -i "s#NB_APP_STATIC_PLACEHOLDER#\$NB_APP_STATIC#" "\$NGINX_SITE"
+    sed -i "s#NB_GUNICORN_PLACEHOLDER#\$NB_GUNICORN#" "\$NGINX_SITE"
+fi
+
+# nginx -t — abort + restore the prior cert/key on failure so a bad config
+# never goes live. Restore is best-effort (the .bak files may be absent on a
+# first-ever install).
+if ! nginx -t >/dev/null 2>&1; then
+    if [ "\$BK" = "1" ]; then
+        mv -f "\$LIVE_CRT.bak.\$\$" "\$LIVE_CRT" 2>/dev/null || rm -f "\$LIVE_CRT"
+        mv -f "\$LIVE_KEY.bak.\$\$" "\$LIVE_KEY" 2>/dev/null || rm -f "\$LIVE_KEY"
+    else
+        rm -f "\$LIVE_CRT" "\$LIVE_KEY" 2>/dev/null || true
+    fi
+    rm -f "\$LIVE_CRT.bak.\$\$" "\$LIVE_KEY.bak.\$\$" 2>/dev/null || true
+    err "nginx -t failed after cert install (live cert restored/removed)"
+fi
+
+systemctl reload nginx 2>/dev/null || true  # reload fails gracefully if not running; next start picks up the cert
+rm -f "\$LIVE_CRT.bak.\$\$" "\$LIVE_KEY.bak.\$\$" 2>/dev/null || true
+echo "OK installed \$LIVE_CRT + reloaded nginx"
+HELPER
+chown root:root /usr/local/bin/lm-netbox-install-cert
+chmod 0755 /usr/local/bin/lm-netbox-install-cert
+
+# Sudoers: only the exact helper path, nothing broader (least privilege). The
+# spoke stays unprivileged; it can ONLY run this one script as root.
+cat > /etc/sudoers.d/lm-netbox <<SUDOERS
+$SVC_USER ALL=(ALL) NOPASSWD: /usr/local/bin/lm-netbox-install-cert
+SUDOERS
+chmod 440 /etc/sudoers.d/lm-netbox
+
 # systemd unit
 HUB_SECRET_ARG=""
 [ -n "${HUB_SECRET:-}" ] && HUB_SECRET_ARG="--hub-secret=${HUB_SECRET}"

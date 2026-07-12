@@ -3,6 +3,8 @@ import asyncio
 import functools
 import httpx
 import os
+import ssl
+import tempfile
 from typing import Dict, Any
 try:
     from base_spoke import BaseSpoke
@@ -27,6 +29,16 @@ _SYSTEM_COMMANDS = frozenset({
     "SPOKE_GET_STATUS", "SPOKE_UPDATE",
     "SPOKE_SET_HUB_SECRET", "SPOKE_UPDATE_SESSION_KEY", "SPOKE_SET_HOSTNAME",
 })
+
+# Sudoers-allowed cert-install helper (provisioned by netbox/install.sh). The
+# spoke runs as unprivileged svc_lm and NetBox has no cert API, so LE cert
+# distribution invokes this root helper, which swaps /etc/lm/netbox/tls/netbox
+# .{crt,key} + reloads nginx. The spoke writes fullchain+privkey to 0600 temp
+# files under /tmp and passes the two paths as args; the helper validates
+# (openssl + key/cert pubkey match), installs atomically, nginx -t (restores
+# on failure), reloads, and prints a one-line "OK <msg>" / "ERROR: <msg>".
+# See netbox/install.sh + lm/core/src/hub_cert_distribution.py for the pattern.
+_NETBOX_INSTALL_CERT_HELPER = "/usr/local/bin/lm-netbox-install-cert"
 
 
 def _as_bool(val, default: bool = True) -> bool:
@@ -538,6 +550,88 @@ class NetboxSpoke(BaseSpoke):
             # engine's report dict (status/total/present/created/attached/...).
             return await self._run_sync(self.engine._ensure_custom_fields,
                                         force=True)
+
+        if normalized == "INSTALL_CERT":
+            # LE cert distribution (hub-brokered): the hub pulled fullchain +
+            # privkey from the le spoke and pushed INSTALL_CERT here. NetBox
+            # has no cert API and this spoke runs as unprivileged svc_lm, so
+            # we validate the pair in-process (throwaway ssl ctx — same guard
+            # the hub uses in _install_cert_on_hub), write both to 0600 temp
+            # files under /tmp, and hand the paths to the root sudoers helper
+            # which swaps /etc/lm/netbox/tls/netbox.{crt,key} + reloads nginx.
+            # ``identifier`` is ignored (one NetBox HTTPS endpoint). Never
+            # leaves a temp file behind (finally). Logs to the NetboxSpoke
+            # logger → the IPAM/NetBox log tab (this is NetBox's own install
+            # activity, separate from the hub's le.distribution Certificates
+            # tab).
+            domain = data.get("domain", "") or ""
+            fullchain = data.get("fullchain", "") or ""
+            privkey = data.get("privkey", "") or ""
+            if not fullchain or not privkey:
+                logger.warning("[cert] %s → netbox: FAILED — missing cert material", domain)
+                return {"status": "ERROR", "message": "missing cert material"}
+            if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
+                logger.warning("[cert] %s → netbox: FAILED — cert/key not PEM", domain)
+                return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
+
+            # Validate in-process BEFORE calling the helper so a malformed
+            # pair never reaches the live nginx paths. load_cert_chain into a
+            # throwaway ssl context — mirrors _install_cert_on_hub.
+            crt_tmp = key_tmp = None
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".crt.pem",
+                                                 delete=False) as cf:
+                    cf.write(fullchain); crt_tmp = cf.name
+                with tempfile.NamedTemporaryFile("w", suffix=".key.pem",
+                                                 delete=False) as kf:
+                    kf.write(privkey); key_tmp = kf.name
+                os.chmod(crt_tmp, 0o600); os.chmod(key_tmp, 0o600)
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    ctx.load_cert_chain(crt_tmp, key_tmp)
+                except Exception as e:
+                    logger.warning("[cert] %s → netbox: FAILED — cert validation "
+                                   "failed (helper not called): %s", domain, e)
+                    return {"status": "ERROR",
+                            "message": f"cert validation failed (helper not called): {e}"}
+
+                # Hand the temp paths to the root helper. It re-validates +
+                # installs + reloads + prints one line. 20s ceiling (nginx -t
+                # + reload is fast; a hung sudo would otherwise hang the spoke).
+                # FileNotFoundError (sudo/helper missing) or a sudo denial must
+                # surface as ERROR, not propagate — the hub's distribution loop
+                # expects a {"status","message"} from every target.
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "sudo", "-n", _NETBOX_INSTALL_CERT_HELPER, crt_tmp, key_tmp,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    try: proc.kill()
+                    except (ProcessLookupError, UnboundLocalError): pass
+                    logger.warning("[cert] %s → netbox: FAILED — helper timed out", domain)
+                    return {"status": "ERROR", "message": "cert-install helper timed out"}
+                except Exception as e:
+                    logger.warning("[cert] %s → netbox: FAILED — helper invocation "
+                                   "failed: %s", domain, e)
+                    return {"status": "ERROR",
+                            "message": f"cert-install helper invocation failed: {e}"}
+                out = (out_b or b"").decode(errors="replace").strip()
+                err = (err_b or b"").decode(errors="replace").strip()
+                if proc.returncode == 0 and out.startswith("OK"):
+                    logger.info("[cert] %s → netbox: installed — %s", domain, out[2:].strip() or out)
+                    return {"status": "SUCCESS",
+                            "message": out[2:].strip() or out or "installed on netbox"}
+                msg = err or out or f"helper exit {proc.returncode}"
+                logger.warning("[cert] %s → netbox: FAILED — %s", domain, msg)
+                return {"status": "ERROR", "message": msg}
+            finally:
+                for p in (crt_tmp, key_tmp):
+                    if p:
+                        try: os.unlink(p)
+                        except OSError: pass
 
         if command_type in _SYSTEM_COMMANDS:
             # Stale /opt/lm/core: this system command should have been
