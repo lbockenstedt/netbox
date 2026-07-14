@@ -62,8 +62,13 @@ def _real_pair(cn: str = "netbox.test"):
 def _make_spoke():
     """NetboxSpoke instance with __init__ skipped (the INSTALL_CERT handler
     never touches self.engine, so the engine that would hit NetBox is never
-    needed)."""
+    needed). The handler's early ``os.path.exists(_NETBOX_INSTALL_CERT_HELPER)``
+    check would short-circuit on a test machine where the real helper isn't
+    installed, so point the constant at a path that exists HERE — the exec-path
+    tests below exercise the sudo/helper contract. The dedicated absent-helper
+    test overrides this to a missing path."""
     sp = spoke_mod.NetboxSpoke.__new__(spoke_mod.NetboxSpoke)
+    spoke_mod._NETBOX_INSTALL_CERT_HELPER = os.path.abspath(__file__)
     return sp
 
 
@@ -227,8 +232,11 @@ def test_install_cert_helper_stderr_used_when_stdout_empty():
 
 
 def test_install_cert_helper_missing_raises_cleans_temps_and_errors():
-    """If sudo denies / the helper is missing, create_subprocess_exec raises
-    (FileNotFoundError). The handler must surface ERROR + still unlink temps."""
+    """If sudo denies at exec time (helper present but sudo refuses / the binary
+    vanished between the existence check and the exec), create_subprocess_exec
+    raises FileNotFoundError. The handler must surface ERROR + still unlink
+    temps. (A genuinely-absent helper is caught earlier by the os.path.exists
+    check — see test_install_cert_helper_absent_returns_clear_error_no_exec.)"""
     crt, key = _real_pair()
     sp = _make_spoke()
     cap = {}
@@ -241,3 +249,27 @@ def test_install_cert_helper_missing_raises_cleans_temps_and_errors():
     assert res["status"] == "ERROR"
     # Temps written before the helper call are cleaned up in finally.
     assert cap["calls"]  # the call was attempted
+
+
+def test_install_cert_helper_absent_returns_clear_error_no_exec():
+    """The IPAM spoke is API-only (install_all.sh runs install.sh --spoke-only,
+    so the cert helper is NEVER provisioned on this host). When the helper is
+    absent the handler must return a clear, actionable ERROR pointing at the
+    netbox-server target — NOT the raw 'sudo: lm-netbox-install-cert: command
+    not found' that surfaced when the cert target was misconfigured as 'ipam'
+    on a split topology — and must NOT attempt the exec (no sudo call at all)."""
+    crt, key = _real_pair()
+    sp = _make_spoke()
+    orig_helper = spoke_mod._NETBOX_INSTALL_CERT_HELPER
+    spoke_mod._NETBOX_INSTALL_CERT_HELPER = "/tmp/lm-netbox-install-cert.does.not.exist"
+    cap = {}
+    real = _patch_exec(cap)
+    try:
+        res = _run(sp.handle_command("INSTALL_CERT",
+                                     {"domain": "x", "fullchain": crt, "privkey": key}))
+    finally:
+        spoke_mod.asyncio.create_subprocess_exec = real
+        spoke_mod._NETBOX_INSTALL_CERT_HELPER = orig_helper
+    assert res["status"] == "ERROR"
+    assert "netbox-server" in res["message"], res["message"]
+    assert not cap.get("calls"), "exec must not be attempted when the helper is absent"

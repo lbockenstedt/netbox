@@ -573,6 +573,26 @@ class NetboxSpoke(BaseSpoke):
             if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
                 logger.warning("[cert] %s → netbox: FAILED — cert/key not PEM", domain)
                 return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
+            # The IPAM spoke is API-only (install_all.sh runs install.sh with
+            # --spoke-only, so INSTALL_APP=false and the cert helper is NEVER
+            # provisioned on this host). The NetBox HTTPS cert belongs on the
+            # host actually running NetBox's nginx — the netbox-server deploy
+            # role (install.sh --infra-only provisions the helper there). Fail
+            # with a clear, actionable message instead of the raw
+            # 'sudo: lm-netbox-install-cert: command not found' that surfaced
+            # when the cert target was misconfigured as 'ipam' on a split
+            # topology. (In an all-in-one full install the helper IS here, so
+            # this check is a no-op there.)
+            if not os.path.exists(_NETBOX_INSTALL_CERT_HELPER):
+                logger.warning("[cert] %s → netbox(ipam): FAILED — cert helper %s "
+                               "absent (IPAM spoke is API-only). Target "
+                               "'netbox-server' instead, or run install.sh "
+                               "--infra-only on the NetBox web host.", domain,
+                               _NETBOX_INSTALL_CERT_HELPER)
+                return {"status": "ERROR",
+                        "message": (f"cert helper {_NETBOX_INSTALL_CERT_HELPER} not on "
+                                    f"this host — the IPAM spoke is API-only. Target "
+                                    f"'netbox-server' (the NetBox web host) instead.")}
 
             # Validate in-process BEFORE calling the helper so a malformed
             # pair never reaches the live nginx paths. load_cert_chain into a
