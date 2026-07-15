@@ -60,8 +60,15 @@ class NetboxSpoke(BaseSpoke):
     """
     NetBox spoke: DCIM (rack/device) and IPAM (prefix/IP) management + KEA DHCP sync.
     """
-    def __init__(self, spoke_id: str, config: Dict[str, Any]):
+    def __init__(self, spoke_id: str, config: Dict[str, Any],
+                 control_plane: Any = None):
         super().__init__(spoke_id, config)
+        # Reference to the NetboxControlPlane so the API-only INSTALL_CERT
+        # handler can relay the cert install to the netbox-server agent via
+        # request_to_hub (HUB_REQUEST RELAY_NETBOX_CERT). None when constructed
+        # standalone (tests) — the handler then returns a clear ERROR instead
+        # of relaying. Mirrors the le_spoke control_plane pattern.
+        self.control_plane = control_plane
         self.engine = NetboxEngine(
             url=config.get("netbox_url", os.getenv("NETBOX_URL", "http://localhost:8000")),
             token=config.get("api_token", os.getenv("NETBOX_API_TOKEN", "")),
@@ -573,30 +580,23 @@ class NetboxSpoke(BaseSpoke):
             if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
                 logger.warning("[cert] %s → netbox: FAILED — cert/key not PEM", domain)
                 return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
-            # The IPAM spoke is API-only (install_all.sh runs install.sh with
-            # --spoke-only, so INSTALL_APP=false and the cert helper is NEVER
-            # provisioned on this host). The NetBox HTTPS cert belongs on the
-            # host actually running NetBox's nginx — the netbox-server deploy
-            # role (install.sh --infra-only provisions the helper there). Fail
-            # with a clear, actionable message instead of the raw
-            # 'sudo: lm-netbox-install-cert: command not found' that surfaced
-            # when the cert target was misconfigured as 'ipam' on a split
-            # topology. (In an all-in-one full install the helper IS here, so
-            # this check is a no-op there.)
-            if not os.path.exists(_NETBOX_INSTALL_CERT_HELPER):
-                logger.warning("[cert] %s → netbox(ipam): FAILED — cert helper %s "
-                               "absent (IPAM spoke is API-only). Target "
-                               "'netbox-server' instead, or run install.sh "
-                               "--infra-only on the NetBox web host.", domain,
-                               _NETBOX_INSTALL_CERT_HELPER)
-                return {"status": "ERROR",
-                        "message": (f"cert helper {_NETBOX_INSTALL_CERT_HELPER} not on "
-                                    f"this host — the IPAM spoke is API-only. Target "
-                                    f"'netbox-server' (the NetBox web host) instead.")}
 
-            # Validate in-process BEFORE calling the helper so a malformed
-            # pair never reaches the live nginx paths. load_cert_chain into a
-            # throwaway ssl context — mirrors _install_cert_on_hub.
+            # The IPAM spoke owns the cert-install KNOWLEDGE: validate the
+            # fullchain/privkey pair in-process (throwaway ssl ctx — same guard
+            # the hub uses in _install_cert_on_hub) BEFORE anything else so a
+            # malformed pair never reaches the live nginx paths. Then either:
+            #  - helper present (an all-in-one full install where this spoke
+            #    co-located with NetBox nginx): run the local root sudoers
+            #    helper which swaps /etc/lm/netbox/tls/netbox.{crt,key} +
+            #    reloads nginx; OR
+            #  - helper absent (the normal split topology: this is the API-only
+            #    IPAM spoke, install.sh --spoke-only, no nginx here): relay
+            #    RELAY_NETBOX_CERT to the hub, which resolves the netbox-server
+            #    agent (the NetBox web host, install.sh --infra-only provisions
+            #    the helper there) and runs INSTALL_CERT on it. The agent
+            #    self-heals a missing helper. ``identifier`` is "" so the hub
+            #    picks any connected netbox-server agent (one NetBox HTTPS
+            #    endpoint). Never leaves a temp file behind (finally).
             crt_tmp = key_tmp = None
             try:
                 with tempfile.NamedTemporaryFile("w", suffix=".crt.pem",
@@ -611,10 +611,28 @@ class NetboxSpoke(BaseSpoke):
                     ctx.load_cert_chain(crt_tmp, key_tmp)
                 except Exception as e:
                     logger.warning("[cert] %s → netbox: FAILED — cert validation "
-                                   "failed (helper not called): %s", domain, e)
+                                   "failed (helper/relay not called): %s", domain, e)
                     return {"status": "ERROR",
                             "message": f"cert validation failed (helper not called): {e}"}
 
+                # ---- split topology: API-only IPAM spoke → relay to agent ----
+                if not os.path.exists(_NETBOX_INSTALL_CERT_HELPER):
+                    if not self.control_plane:
+                        logger.warning("[cert] %s → netbox(ipam): FAILED — API-only "
+                                       "spoke has no control plane to relay", domain)
+                        return {"status": "ERROR",
+                                "message": ("IPAM spoke is API-only (no cert helper) "
+                                            "and cannot relay without a control plane")}
+                    logger.info("[cert] %s → netbox(ipam): relaying INSTALL_CERT to "
+                                "the netbox-server agent via hub", domain)
+                    return await self.control_plane.request_to_hub(
+                        "RELAY_NETBOX_CERT",
+                        {"domain": domain, "identifier": "",
+                         "cert": {"fullchain": fullchain, "privkey": privkey}},
+                        timeout=35.0,
+                    )
+
+                # ---- all-in-one: helper present → run the local root helper ----
                 # Hand the temp paths to the root helper. It re-validates +
                 # installs + reloads + prints one line. 20s ceiling (nginx -t
                 # + reload is fast; a hung sudo would otherwise hang the spoke).

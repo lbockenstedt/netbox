@@ -72,7 +72,7 @@ class NetboxControlPlane(BaseControlPlane):
     async def run(self):
         """Native LM Spoke behavior: register the NetBox module and start KEA sync."""
         logger.info(f"Starting NetBox Module in HUB MODE -> {self.hub_url}")
-        netbox_spoke = NetboxSpoke(self.spoke_id, self.config)
+        netbox_spoke = NetboxSpoke(self.spoke_id, self.config, control_plane=self)
         self.register_module("netbox", netbox_spoke)
         await netbox_spoke.start_kea_sync()
         try:

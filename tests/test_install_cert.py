@@ -59,17 +59,40 @@ def _real_pair(cn: str = "netbox.test"):
     return crt_pem, key_pem
 
 
-def _make_spoke():
+def _make_spoke(control_plane=None):
     """NetboxSpoke instance with __init__ skipped (the INSTALL_CERT handler
     never touches self.engine, so the engine that would hit NetBox is never
-    needed). The handler's early ``os.path.exists(_NETBOX_INSTALL_CERT_HELPER)``
-    check would short-circuit on a test machine where the real helper isn't
-    installed, so point the constant at a path that exists HERE — the exec-path
-    tests below exercise the sudo/helper contract. The dedicated absent-helper
-    test overrides this to a missing path."""
+    needed). The handler's ``os.path.exists(_NETBOX_INSTALL_CERT_HELPER)``
+    branch decides between the local-root-helper path (helper present) and the
+    relay-to-netbox-server-agent path (helper absent — the API-only IPAM spoke's
+    normal split-topology path). Point the constant at a path that exists HERE
+    so the exec-path tests below exercise the sudo/helper contract; the relay
+    tests override it to a missing path and supply a fake control_plane."""
     sp = spoke_mod.NetboxSpoke.__new__(spoke_mod.NetboxSpoke)
+    sp.control_plane = control_plane
     spoke_mod._NETBOX_INSTALL_CERT_HELPER = os.path.abspath(__file__)
     return sp
+
+
+class _FakeControlPlane:
+    """Stand-in for the NetboxControlPlane — captures the request_to_hub call
+    (the IPAM spoke's relay to the netbox-server agent via the hub) and returns
+    a configured result. ``delay`` simulates a slow hub reply (timeout path)."""
+    def __init__(self, result=None, delay=0.0, exc=None):
+        self.calls = []
+        self._result = result if result is not None else {"status": "SUCCESS",
+                                                           "message": "installed on netbox-server"}
+        self._delay = delay
+        self._exc = exc
+
+    async def request_to_hub(self, req_type, data, timeout=30.0):
+        self.calls.append({"req_type": req_type, "data": data, "timeout": timeout})
+        import asyncio as _aio
+        if self._delay:
+            await _aio.sleep(self._delay)
+        if self._exc is not None:
+            raise self._exc
+        return self._result
 
 
 class _FakeProc:
@@ -251,17 +274,52 @@ def test_install_cert_helper_missing_raises_cleans_temps_and_errors():
     assert cap["calls"]  # the call was attempted
 
 
-def test_install_cert_helper_absent_returns_clear_error_no_exec():
-    """The IPAM spoke is API-only (install_all.sh runs install.sh --spoke-only,
-    so the cert helper is NEVER provisioned on this host). When the helper is
-    absent the handler must return a clear, actionable ERROR pointing at the
-    netbox-server target — NOT the raw 'sudo: lm-netbox-install-cert: command
-    not found' that surfaced when the cert target was misconfigured as 'ipam'
-    on a split topology — and must NOT attempt the exec (no sudo call at all)."""
-    crt, key = _real_pair()
-    sp = _make_spoke()
-    orig_helper = spoke_mod._NETBOX_INSTALL_CERT_HELPER
+def _helper_absent_spoke(control_plane):
+    """Spoke pointed at a missing cert helper (the API-only IPAM spoke's
+    normal split-topology state) with a fake control_plane for the relay."""
+    sp = _make_spoke(control_plane=control_plane)
     spoke_mod._NETBOX_INSTALL_CERT_HELPER = "/tmp/lm-netbox-install-cert.does.not.exist"
+    return sp
+
+
+def test_install_cert_helper_absent_relays_to_agent_no_exec():
+    """The IPAM spoke is API-only (install.sh --spoke-only, no cert helper on
+    this host). When the helper is absent the handler must RELAY INSTALL_CERT to
+    the netbox-server agent via control_plane.request_to_hub("RELAY_NETBOX_CERT")
+    — NOT attempt a local sudo exec (which would surface the raw
+    'sudo: lm-netbox-install-cert: command not found' the split topology hit).
+    The agent's result is returned verbatim."""
+    crt, key = _real_pair()
+    cp = _FakeControlPlane(result={"status": "SUCCESS",
+                                   "message": "installed on netbox-server"})
+    sp = _helper_absent_spoke(cp)
+    cap = {}
+    real = _patch_exec(cap)
+    try:
+        res = _run(sp.handle_command("INSTALL_CERT",
+                                     {"domain": "netbox.test",
+                                      "fullchain": crt, "privkey": key}))
+    finally:
+        spoke_mod.asyncio.create_subprocess_exec = real
+    assert res["status"] == "SUCCESS", res
+    assert "netbox-server" in res["message"]
+    # Relay was called with the right shape.
+    assert len(cp.calls) == 1
+    call = cp.calls[0]
+    assert call["req_type"] == "RELAY_NETBOX_CERT"
+    assert call["data"]["domain"] == "netbox.test"
+    assert call["data"]["identifier"] == ""
+    assert call["data"]["cert"]["fullchain"] == crt
+    assert call["data"]["cert"]["privkey"] == key
+    # No local sudo exec attempted.
+    assert not cap.get("calls"), "exec must not be attempted when the helper is absent"
+
+
+def test_install_cert_helper_absent_no_control_plane_returns_clear_error():
+    """Helper absent AND no control_plane (standalone/test construction): the
+    handler must return a clear ERROR instead of crashing — no relay possible."""
+    crt, key = _real_pair()
+    sp = _helper_absent_spoke(control_plane=None)
     cap = {}
     real = _patch_exec(cap)
     try:
@@ -269,7 +327,42 @@ def test_install_cert_helper_absent_returns_clear_error_no_exec():
                                      {"domain": "x", "fullchain": crt, "privkey": key}))
     finally:
         spoke_mod.asyncio.create_subprocess_exec = real
-        spoke_mod._NETBOX_INSTALL_CERT_HELPER = orig_helper
     assert res["status"] == "ERROR"
-    assert "netbox-server" in res["message"], res["message"]
-    assert not cap.get("calls"), "exec must not be attempted when the helper is absent"
+    assert "control plane" in res["message"], res["message"]
+    assert not cap.get("calls")
+
+
+def test_install_cert_helper_absent_relay_failure_passes_through():
+    """If the relayed agent install fails (helper error on the agent), the spoke
+    must pass the agent's ERROR through to the hub's distribution loop verbatim."""
+    crt, key = _real_pair()
+    cp = _FakeControlPlane(result={"status": "ERROR",
+                                  "message": "ERROR: nginx -t failed"})
+    sp = _helper_absent_spoke(cp)
+    real = _patch_exec({})
+    try:
+        res = _run(sp.handle_command("INSTALL_CERT",
+                                     {"domain": "x", "fullchain": crt, "privkey": key}))
+    finally:
+        spoke_mod.asyncio.create_subprocess_exec = real
+    assert res["status"] == "ERROR"
+    assert "nginx -t failed" in res["message"]
+
+
+def test_install_cert_bad_pair_not_relayed():
+    """A cert whose key doesn't match is rejected by the in-process
+    ssl.load_cert_chain BEFORE the relay — so the netbox-server agent is never
+    asked to install a bad pair. The relay must NOT be called."""
+    crt, _ = _real_pair()
+    _, key = _real_pair()  # DIFFERENT key, not matching crt
+    cp = _FakeControlPlane()
+    sp = _helper_absent_spoke(cp)
+    real = _patch_exec({})
+    try:
+        res = _run(sp.handle_command("INSTALL_CERT",
+                                     {"domain": "x", "fullchain": crt, "privkey": key}))
+    finally:
+        spoke_mod.asyncio.create_subprocess_exec = real
+    assert res["status"] == "ERROR"
+    assert "validation failed" in res["message"]
+    assert cp.calls == [], "relay must not be called for a bad cert pair"
