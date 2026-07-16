@@ -1,10 +1,14 @@
 import logging
 import asyncio
+import base64
 import functools
+import hashlib
 import httpx
+import json
 import os
 import ssl
 import tempfile
+import time
 from typing import Dict, Any
 try:
     from base_spoke import BaseSpoke
@@ -69,6 +73,14 @@ class NetboxSpoke(BaseSpoke):
         # standalone (tests) — the handler then returns a clear ERROR instead
         # of relaying. Mirrors the le_spoke control_plane pattern.
         self.control_plane = control_plane
+        # Cert custodian: hold the current NetBox-host cert, persist it Fernet-
+        # encrypted (key derived from the spoke secret), and deploy it to the
+        # hosted Agent(s) on receipt AND on new-agent connect. Loaded on startup
+        # so a spoke restart still deploys to reconnecting agents.
+        self._cert_material = None  # {"domain","fullchain","privkey"}
+        self._cert_store = os.getenv("LM_NETBOX_CERT_STORE",
+                                     "/var/lib/lm/netbox/cert.enc")
+        self._load_persisted_cert()
         self.engine = NetboxEngine(
             url=config.get("netbox_url", os.getenv("NETBOX_URL", "http://localhost:8000")),
             token=config.get("api_token", os.getenv("NETBOX_API_TOKEN", "")),
@@ -203,6 +215,140 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
     })
+
+    # ── Cert custodian ──────────────────────────────────────────────────────
+    def _cert_fernet(self):
+        """Fernet keyed off the spoke secret (stable per spoke). Encryption at
+        rest for the cached private key; a secret rotation simply invalidates the
+        cache (the spoke re-fetches/re-deploys), which is safe."""
+        from cryptography.fernet import Fernet
+        seed = (getattr(self.control_plane, "secret", "") or self.spoke_id
+                or "lm-netbox").encode()
+        return Fernet(base64.urlsafe_b64encode(hashlib.sha256(seed).digest()))
+
+    def _persist_cert(self):
+        try:
+            enc = self._cert_fernet().encrypt(json.dumps(self._cert_material).encode())
+            d = os.path.dirname(self._cert_store)
+            if d and not os.path.exists(d):
+                os.makedirs(d, mode=0o700, exist_ok=True)
+            tmp = self._cert_store + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(enc)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._cert_store)
+        except Exception as e:  # noqa: BLE001 - best-effort persist
+            logger.warning("[cert] custodian persist failed: %s", e)
+
+    def _load_persisted_cert(self):
+        try:
+            if os.path.exists(self._cert_store):
+                with open(self._cert_store, "rb") as f:
+                    self._cert_material = json.loads(
+                        self._cert_fernet().decrypt(f.read()).decode())
+                logger.info("[cert] custodian: restored cached cert for %s",
+                            (self._cert_material or {}).get("domain"))
+        except Exception as e:  # noqa: BLE001 - corrupt/rotated key → cold
+            logger.debug("[cert] custodian cache load skipped: %s", e)
+            self._cert_material = None
+
+    async def _deploy_cert_to_agent(self, agent_id, fullchain, privkey, domain):
+        """Drive the dumb Agent to install a cert: WRITE_FILE crt + key to 0600
+        temps, then RUN_COMMAND the role-provisioned helper (which swaps the live
+        nginx cert + reloads). The Agent runs; the spoke holds the sequence."""
+        cp = self.control_plane
+        if cp is None or not hasattr(cp, "send_to_agent"):
+            return {"status": "ERROR", "message": "spoke is not an agent host"}
+        ts = str(int(time.time() * 1000))
+        crt_tmp, key_tmp = f"/tmp/lm-netbox-{ts}.crt.pem", f"/tmp/lm-netbox-{ts}.key.pem"
+        try:
+            await cp.send_to_agent("WRITE_FILE", {"path": crt_tmp, "content": fullchain,
+                                                  "mode": 0o600}, agent_id=agent_id, timeout=20.0)
+            await cp.send_to_agent("WRITE_FILE", {"path": key_tmp, "content": privkey,
+                                                  "mode": 0o600}, agent_id=agent_id, timeout=20.0)
+            cmd = f"sudo -n {_NETBOX_INSTALL_CERT_HELPER} {crt_tmp} {key_tmp}"
+            res = await cp.send_to_agent("RUN_COMMAND", {"command": cmd, "allow_shell": True,
+                                                         "timeout": 30}, agent_id=agent_id, timeout=40.0)
+        except Exception as e:  # noqa: BLE001
+            return {"status": "ERROR", "message": f"deploy to agent {agent_id}: {e}"}
+        finally:
+            try:
+                await cp.send_to_agent("RUN_COMMAND",
+                                       {"command": f"rm -f {crt_tmp} {key_tmp}",
+                                        "allow_shell": True, "timeout": 10},
+                                       agent_id=agent_id, timeout=15.0)
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
+        runner = (res or {}).get("result", {}) if isinstance(res, dict) else {}
+        out = (runner.get("stdout") or "").strip()
+        if runner.get("rc") == 0 and out.startswith("OK"):
+            logger.info("[cert] %s → netbox agent %s: installed — %s",
+                        domain, agent_id, out[2:].strip() or out)
+            return {"status": "SUCCESS", "message": out[2:].strip() or "installed on netbox"}
+        msg = (runner.get("stderr") or out or (res or {}).get("message")
+               or "cert helper failed on agent")
+        logger.warning("[cert] %s → netbox agent %s: FAILED — %s", domain, agent_id, msg)
+        return {"status": "ERROR", "message": msg}
+
+    async def deploy_cached_cert_to_agent(self, agent_id):
+        """Deploy the currently-cached cert to a newly-connected agent (called from
+        NetboxControlPlane._on_agent_registered)."""
+        c = self._cert_material
+        if not c:
+            return
+        logger.info("[cert] deploying cached cert (%s) to newly-connected agent %s",
+                    c.get("domain"), agent_id)
+        await self._deploy_cert_to_agent(agent_id, c.get("fullchain", ""),
+                                         c.get("privkey", ""), c.get("domain", ""))
+
+    async def _handle_install_cert(self, data):
+        """Validate → persist → deploy to all connected agents (cert custodian)."""
+        domain = data.get("domain", "") or ""
+        fullchain = data.get("fullchain", "") or ""
+        privkey = data.get("privkey", "") or ""
+        if not fullchain or not privkey:
+            return {"status": "ERROR", "message": "missing cert material"}
+        if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
+            return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
+        # Validate the pair in-process (throwaway ssl ctx via 0600 temps) before
+        # it can reach any live host — same guard the hub uses.
+        crt_tmp = key_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".crt.pem", delete=False) as cf:
+                cf.write(fullchain); crt_tmp = cf.name
+            with tempfile.NamedTemporaryFile("w", suffix=".key.pem", delete=False) as kf:
+                kf.write(privkey); key_tmp = kf.name
+            os.chmod(crt_tmp, 0o600); os.chmod(key_tmp, 0o600)
+            try:
+                ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(crt_tmp, key_tmp)
+            except Exception as e:
+                return {"status": "ERROR", "message": f"cert validation failed: {e}"}
+        finally:
+            for p in (crt_tmp, key_tmp):
+                if p:
+                    try: os.unlink(p)
+                    except OSError: pass
+
+        # Custody: persist (encrypted) so a restart / late-connecting agent gets it.
+        self._cert_material = {"domain": domain, "fullchain": fullchain, "privkey": privkey}
+        self._persist_cert()
+
+        cp = self.control_plane
+        agents = list(getattr(cp, "connected_agents", {}).keys()) if cp else []
+        if not agents:
+            logger.info("[cert] %s → netbox: cached (no agent connected yet — will "
+                        "deploy on connect)", domain)
+            return {"status": "SUCCESS",
+                    "message": "cert cached; no NetBox-host agent connected yet — "
+                               "it will deploy automatically when one connects"}
+        results = [await self._deploy_cert_to_agent(a, fullchain, privkey, domain)
+                   for a in agents]
+        ok = sum(1 for r in results if r.get("status") == "SUCCESS")
+        if ok:
+            return {"status": "SUCCESS",
+                    "message": f"deployed to {ok}/{len(agents)} NetBox-host agent(s)"}
+        return {"status": "ERROR",
+                "message": (results[0].get("message") if results else "deploy failed")}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         normalized = command_type.upper()
@@ -559,117 +705,13 @@ class NetboxSpoke(BaseSpoke):
                                         force=True)
 
         if normalized == "INSTALL_CERT":
-            # LE cert distribution (hub-brokered): the hub pulled fullchain +
-            # privkey from the le spoke and pushed INSTALL_CERT here. NetBox
-            # has no cert API and this spoke runs as unprivileged svc_lm, so
-            # we validate the pair in-process (throwaway ssl ctx — same guard
-            # the hub uses in _install_cert_on_hub), write both to 0600 temp
-            # files under /tmp, and hand the paths to the root sudoers helper
-            # which swaps /etc/lm/netbox/tls/netbox.{crt,key} + reloads nginx.
-            # ``identifier`` is ignored (one NetBox HTTPS endpoint). Never
-            # leaves a temp file behind (finally). Logs to the NetboxSpoke
-            # logger → the IPAM/NetBox log tab (this is NetBox's own install
-            # activity, separate from the hub's le.distribution Certificates
-            # tab).
-            domain = data.get("domain", "") or ""
-            fullchain = data.get("fullchain", "") or ""
-            privkey = data.get("privkey", "") or ""
-            if not fullchain or not privkey:
-                logger.warning("[cert] %s → netbox: FAILED — missing cert material", domain)
-                return {"status": "ERROR", "message": "missing cert material"}
-            if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
-                logger.warning("[cert] %s → netbox: FAILED — cert/key not PEM", domain)
-                return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
-
-            # The IPAM spoke owns the cert-install KNOWLEDGE: validate the
-            # fullchain/privkey pair in-process (throwaway ssl ctx — same guard
-            # the hub uses in _install_cert_on_hub) BEFORE anything else so a
-            # malformed pair never reaches the live nginx paths. Then either:
-            #  - helper present (an all-in-one full install where this spoke
-            #    co-located with NetBox nginx): run the local root sudoers
-            #    helper which swaps /etc/lm/netbox/tls/netbox.{crt,key} +
-            #    reloads nginx; OR
-            #  - helper absent (the normal split topology: this is the API-only
-            #    IPAM spoke, install.sh --spoke-only, no nginx here): relay
-            #    RELAY_NETBOX_CERT to the hub, which resolves the netbox-server
-            #    agent (the NetBox web host, install.sh --infra-only provisions
-            #    the helper there) and runs INSTALL_CERT on it. The agent
-            #    self-heals a missing helper. ``identifier`` is "" so the hub
-            #    picks any connected netbox-server agent (one NetBox HTTPS
-            #    endpoint). Never leaves a temp file behind (finally).
-            crt_tmp = key_tmp = None
-            try:
-                with tempfile.NamedTemporaryFile("w", suffix=".crt.pem",
-                                                 delete=False) as cf:
-                    cf.write(fullchain); crt_tmp = cf.name
-                with tempfile.NamedTemporaryFile("w", suffix=".key.pem",
-                                                 delete=False) as kf:
-                    kf.write(privkey); key_tmp = kf.name
-                os.chmod(crt_tmp, 0o600); os.chmod(key_tmp, 0o600)
-                try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                    ctx.load_cert_chain(crt_tmp, key_tmp)
-                except Exception as e:
-                    logger.warning("[cert] %s → netbox: FAILED — cert validation "
-                                   "failed (helper/relay not called): %s", domain, e)
-                    return {"status": "ERROR",
-                            "message": f"cert validation failed (helper not called): {e}"}
-
-                # ---- split topology: API-only IPAM spoke → relay to agent ----
-                if not os.path.exists(_NETBOX_INSTALL_CERT_HELPER):
-                    if not self.control_plane:
-                        logger.warning("[cert] %s → netbox(ipam): FAILED — API-only "
-                                       "spoke has no control plane to relay", domain)
-                        return {"status": "ERROR",
-                                "message": ("IPAM spoke is API-only (no cert helper) "
-                                            "and cannot relay without a control plane")}
-                    logger.info("[cert] %s → netbox(ipam): relaying INSTALL_CERT to "
-                                "the netbox-server agent via hub", domain)
-                    return await self.control_plane.request_to_hub(
-                        "RELAY_NETBOX_CERT",
-                        {"domain": domain, "identifier": "",
-                         "cert": {"fullchain": fullchain, "privkey": privkey}},
-                        timeout=35.0,
-                    )
-
-                # ---- all-in-one: helper present → run the local root helper ----
-                # Hand the temp paths to the root helper. It re-validates +
-                # installs + reloads + prints one line. 20s ceiling (nginx -t
-                # + reload is fast; a hung sudo would otherwise hang the spoke).
-                # FileNotFoundError (sudo/helper missing) or a sudo denial must
-                # surface as ERROR, not propagate — the hub's distribution loop
-                # expects a {"status","message"} from every target.
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "sudo", "-n", _NETBOX_INSTALL_CERT_HELPER, crt_tmp, key_tmp,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=20.0)
-                except asyncio.TimeoutError:
-                    try: proc.kill()
-                    except (ProcessLookupError, UnboundLocalError): pass
-                    logger.warning("[cert] %s → netbox: FAILED — helper timed out", domain)
-                    return {"status": "ERROR", "message": "cert-install helper timed out"}
-                except Exception as e:
-                    logger.warning("[cert] %s → netbox: FAILED — helper invocation "
-                                   "failed: %s", domain, e)
-                    return {"status": "ERROR",
-                            "message": f"cert-install helper invocation failed: {e}"}
-                out = (out_b or b"").decode(errors="replace").strip()
-                err = (err_b or b"").decode(errors="replace").strip()
-                if proc.returncode == 0 and out.startswith("OK"):
-                    logger.info("[cert] %s → netbox: installed — %s", domain, out[2:].strip() or out)
-                    return {"status": "SUCCESS",
-                            "message": out[2:].strip() or out or "installed on netbox"}
-                msg = err or out or f"helper exit {proc.returncode}"
-                logger.warning("[cert] %s → netbox: FAILED — %s", domain, msg)
-                return {"status": "ERROR", "message": msg}
-            finally:
-                for p in (crt_tmp, key_tmp):
-                    if p:
-                        try: os.unlink(p)
-                        except OSError: pass
+            # Cert custodian (tiered Hub→Spoke→Agent): the SPOKE holds ALL the
+            # logic — validate the pair, persist it (Fernet-encrypted), and deploy
+            # it to the hosted NetBox-host Agent(s) via WRITE_FILE + RUN_COMMAND
+            # (the role-provisioned helper). The Agent is a dumb executor; there is
+            # no hub bounce and no local install. A device that connects later gets
+            # the cached cert automatically (_on_agent_registered → deploy).
+            return await self._handle_install_cert(data)
 
         if command_type in _SYSTEM_COMMANDS:
             # Stale /opt/lm/core: this system command should have been

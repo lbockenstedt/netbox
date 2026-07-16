@@ -19,9 +19,9 @@ import logging
 import argparse
 import os
 try:
-    from core.src.messaging.control_plane import BaseControlPlane
+    from core.src.messaging.agent_hosting import AgentHostingControlPlane
 except ImportError:
-    from messaging.control_plane import BaseControlPlane
+    from messaging.agent_hosting import AgentHostingControlPlane
 from netbox_spoke import NetboxSpoke
 from dotenv import load_dotenv
 
@@ -43,16 +43,35 @@ configure_logging()
 logger = logging.getLogger("NetboxControlPlane")
 
 
-class NetboxControlPlane(BaseControlPlane):
+class NetboxControlPlane(AgentHostingControlPlane):
     """Control plane for the NetBox documentation spoke.
 
     Loads NetBox/KEA connection config from .env, registers the NetboxSpoke module,
     starts the background NetBox -> KEA DHCP sync, and runs the Hub control loop.
+
+    Also an **agent host** (like the pxmx spoke): it serves a ``/ws/agent``
+    listener so the NetBox-host Agent dials THIS spoke (never the hub). The spoke
+    holds the cert-install logic and drives the dumb Agent with WRITE_FILE +
+    RUN_COMMAND. See NetboxSpoke (cert custodian) + _on_agent_registered.
     """
+
+    # NetBox-unique agent-host knobs (must NOT collide with pxmx's 8443/8766 or its
+    # env/config path on a co-located box). Opt-in: the listener only runs when
+    # LM_NETBOX_AGENT_LISTENER=1, so existing API-only ipam spokes are unaffected.
+    MODULE_TYPE = "ipam"
+    AGENT_PORT_ENV = "LM_NETBOX_AGENT_PORT"
+    AGENT_LOOPBACK_ENV = "LM_NETBOX_AGENT_LOOPBACK"
+    AGENT_LISTENER_ENV = "LM_NETBOX_AGENT_LISTENER"
+    AGENT_CONFIG_PATH = "/etc/lm-netbox-agent/config.json"
+    AGENT_LISTENER_OPT_IN = True
+    AGENT_LOOPBACK_PORT = 8444
+    AGENT_WSS_PORT = 8444
+    AGENT_FALLBACK_PORT = 8767
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         super().__init__(spoke_id, secret, hub_secret, hub_url)
         self.module_type = "ipam"
+        self._netbox_spoke = None  # set in run(); used by _on_agent_registered
         load_dotenv()
         self.config = {
             "netbox_url": os.getenv("NETBOX_URL", "http://localhost:8000"),
@@ -70,15 +89,32 @@ class NetboxControlPlane(BaseControlPlane):
         return "lm-netbox"
 
     async def run(self):
-        """Native LM Spoke behavior: register the NetBox module and start KEA sync."""
+        """Native LM Spoke behavior: register the NetBox module and start KEA sync.
+        Also starts the ``/ws/agent`` listener when enabled so the NetBox-host
+        Agent can dial this spoke."""
         logger.info(f"Starting NetBox Module in HUB MODE -> {self.hub_url}")
         netbox_spoke = NetboxSpoke(self.spoke_id, self.config, control_plane=self)
+        self._netbox_spoke = netbox_spoke
         self.register_module("netbox", netbox_spoke)
         await netbox_spoke.start_kea_sync()
+        # Agent host: serve /ws/agent so the NetBox-host Agent dials us (Style 1
+        # remote wss / Style 2 loopback). Gated by AGENT_LISTENER_OPT_IN + the env.
+        if self._agent_listener_enabled():
+            self._start_agent_server_task()
+            logger.info("NetBox agent listener started (spoke hosts the NetBox-host Agent).")
         try:
             await super().run()
         finally:
             await netbox_spoke.stop_kea_sync()
+
+    async def _on_agent_registered(self, agent_id: str):
+        """New-device-connect trigger: when the NetBox-host Agent connects+approves,
+        deploy the spoke's cached cert to it immediately (cert-custodian model)."""
+        if self._netbox_spoke is not None:
+            try:
+                await self._netbox_spoke.deploy_cached_cert_to_agent(agent_id)
+            except Exception as e:  # noqa: BLE001 - never break registration
+                logger.debug("cert auto-deploy on agent %s connect skipped: %s", agent_id, e)
 
 
 if __name__ == "__main__":
