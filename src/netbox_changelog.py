@@ -1,7 +1,7 @@
 """Change-log journaling + IP-reuse/reassign helpers for NetboxEngine."""
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")
 
@@ -221,14 +221,50 @@ class ChangelogMixin:
         except Exception as e:
             logger.debug("%s: mac_address on IP %s skipped: %s", source, addr, e)
 
+    # Quantization window for last_seen rewrites. The staleness sweep's
+    # thresholds are DAYS (7d offline / 30d delete — netbox_staleness.py), so a
+    # second-resolution ``now()`` stamp was pure churn: every sync tick produced
+    # a guaranteed-diff PATCH per object even when nothing else changed. Only
+    # rewrite when the stored stamp is missing/unparsable or ≥1h off.
+    _LAST_SEEN_MAX_AGE_S = 3600
+
+    @staticmethod
+    def _last_seen_stale(stored: Any, now: Optional[datetime] = None,
+                         max_age_s: int = 3600) -> bool:
+        """Whether the stored ``last_seen`` CF value needs a rewrite.
+
+        True when ``stored`` is missing/empty, unparsable (treat as stale), or
+        more than ``max_age_s`` away from ``now`` — in EITHER direction, so a
+        clock-skewed future stamp can't freeze the signal forever. False when
+        the stamp is fresh (within the window), letting the caller skip the
+        save entirely — a no-op sync then produces zero PATCHes."""
+        s = str(stored or "").strip()
+        if not s:
+            return True
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return True
+        now = now or datetime.now(timezone.utc)
+        return abs((now - dt.astimezone(timezone.utc)).total_seconds()) >= max_age_s
+
     def _stamp_last_seen(self, obj: Any, when: str = "") -> None:
         """Write the ``last_seen`` custom field (ISO UTC) on ``obj`` so the
-        staleness sweep can age it. Best-effort: a missing field / save failure
-        is logged at DEBUG and swallowed — a staleness signal must never break
-        the sync that produced it. ``when`` defaults to now (UTC)."""
+        staleness sweep can age it. Quantized: when the stored stamp is already
+        fresh (parsable and <1h old — see ``_last_seen_stale``) the write is
+        skipped, so a steady-state sync no longer PATCHes every object every
+        tick. Best-effort: a missing field / save failure is logged at DEBUG
+        and swallowed — a staleness signal must never break the sync that
+        produced it. ``when`` defaults to now (UTC)."""
         try:
-            ts = when or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             m = dict(obj.custom_fields or {})
+            if not self._last_seen_stale(m.get("last_seen")):
+                return  # fresh within the hour — skip the no-op-diff PATCH
+            ts = when or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if m.get("last_seen") != ts:
                 m["last_seen"] = ts
                 obj.custom_fields = m

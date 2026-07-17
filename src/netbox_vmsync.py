@@ -676,7 +676,14 @@ class VmSyncMixin:
                             # them once the fields exist (next sync after ensure).
                             try:
                                 merged = dict(obj.custom_fields or {})
-                                merged.update(cf)
+                                cf_patch = dict(cf)
+                                # perf FIX A: last_seen is quantized — keep the
+                                # stored stamp while it's fresh (<1h) so an
+                                # otherwise-unchanged VM yields a no-diff save
+                                # (zero PATCHes on a no-op sync).
+                                if not self._last_seen_stale(merged.get("last_seen")):
+                                    cf_patch.pop("last_seen", None)
+                                merged.update(cf_patch)
                                 obj.custom_fields = merged
                                 obj.save()
                             except Exception as e:

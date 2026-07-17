@@ -392,9 +392,13 @@ class SyncMixin:
                         # updates as below.
                         if source_of_truth == "netbox":
                             try:
-                                devobj = self.nb.dcim.devices.get(row["id"])
-                                if devobj:
-                                    self._stamp_last_seen(devobj)
+                                # perf FIX A: the listed row already carries the
+                                # stored last_seen — skip the per-device GET +
+                                # PATCH entirely while the stamp is fresh (<1h).
+                                if self._last_seen_stale(cf.get("last_seen")):
+                                    devobj = self.nb.dcim.devices.get(row["id"])
+                                    if devobj:
+                                        self._stamp_last_seen(devobj)
                             except Exception as e:
                                 logger.debug("sync_devices: last_seen refresh %s: %s",
                                               ip_str, e)
@@ -495,9 +499,12 @@ class SyncMixin:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
                         else:
                             try:
-                                devobj = self.nb.dcim.devices.get(row["id"])
-                                if devobj:
-                                    self._stamp_last_seen(devobj)
+                                # perf FIX A: skip the per-device GET + PATCH
+                                # while the listed row's stamp is fresh (<1h).
+                                if self._last_seen_stale(cf.get("last_seen")):
+                                    devobj = self.nb.dcim.devices.get(row["id"])
+                                    if devobj:
+                                        self._stamp_last_seen(devobj)
                             except Exception as e:
                                 logger.debug("sync_devices: last_seen %s: %s", ip_str, e)
                         pushed += 1
@@ -867,14 +874,18 @@ class SyncMixin:
                             "message": f"existing nw device {existing['id']} vanished",
                             "pushed": 0, "errors": 1, "skipped": 0, "deleted": 0,
                             "interfaces_total": len(interfaces or []), "device_id": None}
-                # Refresh ownership + last_seen (best-effort).
+                # Refresh ownership + last_seen (best-effort). perf FIX A:
+                # last_seen is quantized — keep a fresh (<1h) stamp so an
+                # unchanged device yields a no-diff save (pynetbox skips the
+                # PATCH when nothing moved).
                 try:
                     cf = dict(devobj.custom_fields or {})
                     cf["discovered_from"] = source_tag
                     if nw_id:
                         cf["nw_device_id"] = nw_id
-                    cf["last_seen"] = datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ")
+                    if self._last_seen_stale(cf.get("last_seen")):
+                        cf["last_seen"] = datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ")
                     devobj.custom_fields = cf
                     devobj.save()
                 except Exception as e:
