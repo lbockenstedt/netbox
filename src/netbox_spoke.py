@@ -95,6 +95,15 @@ class NetboxSpoke(BaseSpoke):
         # fails to bind and the sync loop POSTs the hub → 405 "rejected scope").
         self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8760"))
         self._sync_task = None
+        # perf FIX B: prefix → gateway of every scope last SUCCESSFULLY pushed
+        # to Kea. Each tick diffs the NetBox scope set against this map and
+        # only add/removes the deltas — the old loop re-POSTed subnet4-add for
+        # EVERY scope every 300s (Kea rejects an existing subnet, so that was a
+        # guaranteed rejected POST per scope per tick). Cleared on task start,
+        # on a Kea repoint (UPDATE_CONFIG), and on any connection error /
+        # unexpected rejection so the next tick full-syncs (covers Kea
+        # restarts that lost the runtime config).
+        self._kea_synced: Dict[str, str] = {}
         # Short-TTL cache for read-only picklist commands that populate WebUI
         # dropdowns (sites/racks/tenants/device-form-options). These change
         # rarely but the UI re-fetches them on every form open / view switch,
@@ -129,8 +138,15 @@ class NetboxSpoke(BaseSpoke):
         except Exception as e:
             logger.warning(f"Could not persist {key} to .env: {e}")
 
+    # Default gateway used when a NetBox scope carries none — also the value
+    # tracked in _kea_synced so a later gateway edit is detected as a delta.
+    _KEA_DEFAULT_GATEWAY = "10.0.0.1"
+
     async def start_kea_sync(self):
         if self._sync_task is None:
+            # Fresh task → forget pushed state so the first tick pushes
+            # everything (Kea may have restarted while the loop was down).
+            self._kea_synced.clear()
             self._sync_task = asyncio.create_task(self._kea_sync_loop())
 
     async def stop_kea_sync(self):
@@ -143,40 +159,137 @@ class NetboxSpoke(BaseSpoke):
             try:
                 res = await self._run_sync(self.engine.get_dhcp_prefixes)
                 if res.get("status") == "SUCCESS":
-                    for scope in res.get("scopes", []):
-                        await self._sync_scope_to_kea(scope)
+                    await self._kea_apply_scopes(res.get("scopes", []))
             except Exception as e:
                 logger.error(f"KEA sync error: {e}", exc_info=True)
             await asyncio.sleep(300)
 
+    @classmethod
+    def _kea_scope_diff(cls, desired: Dict[str, Dict[str, Any]],
+                        synced: Dict[str, str]) -> tuple:
+        """Pure diff: ``(to_add, to_remove)`` prefix lists given the desired
+        NetBox scope set (prefix → scope dict) and the last-successfully-pushed
+        map (prefix → gateway). A scope whose gateway changed appears in BOTH
+        lists (delete then re-add). Order-stable for deterministic logs."""
+        to_remove = [p for p, gw in synced.items()
+                     if p not in desired
+                     or (desired[p].get("gateway") or cls._KEA_DEFAULT_GATEWAY) != gw]
+        removed = set(to_remove)
+        to_add = [p for p in desired if p not in synced or p in removed]
+        return to_add, to_remove
+
+    async def _kea_apply_scopes(self, scopes: list):
+        """Diff-push the NetBox DHCP scope set to Kea (perf FIX B).
+
+        Only deltas are sent: new/changed scopes → subnet4-add (a changed
+        gateway is removed then re-added), scopes gone from NetBox →
+        subnet4-del. On any Kea connection error or unexpected rejection the
+        pushed-state map is cleared so the NEXT tick full-syncs — covering a
+        Kea restart that lost its runtime config. The first tick after spoke
+        start pushes everything (map starts empty — unchanged behavior)."""
+        desired: Dict[str, Dict[str, Any]] = {}
+        for scope in (scopes or []):
+            p = scope.get("prefix")
+            if p:
+                desired[p] = scope
+        to_add, to_remove = self._kea_scope_diff(desired, self._kea_synced)
+        failed = False
+        # Removals first so a changed-gateway scope is deleted before re-add.
+        for prefix in to_remove:
+            if await self._remove_scope_from_kea(prefix):
+                self._kea_synced.pop(prefix, None)
+            else:
+                failed = True
+        for prefix in to_add:
+            ok = await self._sync_scope_to_kea(desired[prefix])
+            if ok is True:
+                self._kea_synced[prefix] = (desired[prefix].get("gateway")
+                                            or self._KEA_DEFAULT_GATEWAY)
+            elif ok is False:
+                failed = True
+            # ok is None → locally-invalid scope (unparsable prefix): logged,
+            # never pushable — neither tracked nor a reason to full-resync.
+        if failed:
+            logger.warning("KEA sync: connection error / unexpected rejection — "
+                           "clearing pushed-scope state; next tick full-syncs")
+            self._kea_synced.clear()
+
     async def _sync_scope_to_kea(self, scope: Dict[str, Any]):
+        """Push ONE scope via subnet4-add. Returns True when Kea accepted it
+        (or already has it — the duplicate rejection is expected after a spoke
+        restart and means the scope IS present), False on a connection error or
+        unexpected rejection (→ caller full-resyncs next tick), None when the
+        scope is locally invalid (unparsable prefix — never pushable)."""
         prefix = scope.get("prefix")
-        gateway = scope.get("gateway") or "10.0.0.1"
+        gateway = scope.get("gateway") or self._KEA_DEFAULT_GATEWAY
         if not prefix:
-            return
+            return None
         try:
             import ipaddress
             net = ipaddress.ip_network(prefix, strict=False)
             pool_range = f"{net.network_address + 100}-{net.network_address + 200}"
         except Exception as e:
             logger.error(f"Cannot derive KEA pool range from {prefix!r}: {e}")
-            return
-        payload = {
-            "command": "subnet4-add",
-            "service": ["dhcp4"],
-            "arguments": {"subnet4": [{"subnet": prefix, "pools": [{"pool": pool_range}], "option-data": [{"name": "routers", "data": gateway}]}]},
-        }
+            return None
+        arguments = {"subnet4": [{"subnet": prefix,
+                                  "pools": [{"pool": pool_range}],
+                                  "option-data": [{"name": "routers", "data": gateway}]}]}
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.post(f"{self.kea_url.rstrip('/')}/", json=payload)
-                body = resp.json()
-                result_obj = body[0] if isinstance(body, list) and body else body
-                if result_obj.get("result") == 0:
-                    logger.info(f"KEA synced scope {prefix}")
-                else:
-                    logger.warning(f"KEA rejected scope {prefix}: {result_obj.get('text')}")
+            result_obj = await self._kea_cmd("subnet4-add", arguments)
+            if result_obj.get("result") == 0:
+                logger.info(f"KEA synced scope {prefix}")
+                return True
+            text = str(result_obj.get("text") or "")
+            if "already" in text.lower() or "duplicate" in text.lower():
+                # Scope exists in Kea (e.g. pushed before a spoke restart) —
+                # that's the desired end state, not a failure.
+                logger.debug(f"KEA scope {prefix} already present: {text}")
+                return True
+            logger.warning(f"KEA rejected scope {prefix}: {text}")
+            return False
         except Exception as e:
             logger.error(f"KEA HTTP error for {prefix}: {e}")
+            return False
+
+    async def _remove_scope_from_kea(self, prefix: str) -> bool:
+        """Delete a scope we previously pushed (subnet4-list → id →
+        subnet4-del). Scope removal was NOT handled before this fix — a prefix
+        deleted from NetBox stayed in Kea forever. Returns True when the scope
+        is gone (deleted or never there), False on any error (→ caller
+        full-resyncs next tick)."""
+        try:
+            listing = await self._kea_cmd("subnet4-list")
+            if listing.get("result") != 0:
+                logger.warning(f"KEA subnet4-list failed: {listing.get('text')}")
+                return False
+            subnet_id = None
+            for sub in (listing.get("arguments") or {}).get("subnets", []):
+                if str(sub.get("subnet") or "") == prefix:
+                    subnet_id = sub.get("id")
+                    break
+            if subnet_id is None:
+                return True   # already gone — the desired end state
+            result_obj = await self._kea_cmd("subnet4-del", {"id": subnet_id})
+            if result_obj.get("result") == 0:
+                logger.info(f"KEA removed scope {prefix} (id {subnet_id})")
+                return True
+            logger.warning(f"KEA subnet4-del {prefix} rejected: {result_obj.get('text')}")
+            return False
+        except Exception as e:
+            logger.error(f"KEA HTTP error removing {prefix}: {e}")
+            return False
+
+    async def _kea_cmd(self, command: str, arguments: Dict[str, Any] = None) -> Dict[str, Any]:
+        """POST one command to the Kea Control Agent; returns the (first)
+        result object. Raises on transport errors (callers map that to a
+        full-resync)."""
+        payload: Dict[str, Any] = {"command": command, "service": ["dhcp4"]}
+        if arguments is not None:
+            payload["arguments"] = arguments
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"{self.kea_url.rstrip('/')}/", json=payload)
+            body = resp.json()
+        return body[0] if isinstance(body, list) and body else body
 
     async def _run_sync(self, fn, *args, **kwargs):
         """Run a synchronous (blocking) function in a thread pool so the event loop stays free."""
@@ -393,6 +506,10 @@ class NetboxSpoke(BaseSpoke):
                 if verify_ssl is not None:
                     self._persist_env("NETBOX_VERIFY_SSL", "1" if verify_ssl else "0")
             if data.get("kea_ctrl_url"):
+                if data["kea_ctrl_url"] != self.kea_url:
+                    # Repointed Kea — the pushed-scope state belongs to the old
+                    # server; forget it so the next tick full-syncs the new one.
+                    self._kea_synced.clear()
                 self.kea_url = data["kea_ctrl_url"]
             self.config.update(data)
             # Repointing NetBox (or KEA) makes any cached picklist data stale.
