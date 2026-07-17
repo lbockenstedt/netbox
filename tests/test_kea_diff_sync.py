@@ -16,6 +16,9 @@ import sys
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+# base_spoke lives in the shared lm core checkout (same path test_install_cert
+# uses); netbox_spoke imports it at module import time.
+sys.path.insert(0, "/Users/lbockenstedt/vscode/lm/core/src")
 
 from netbox_spoke import NetboxSpoke  # noqa: E402
 

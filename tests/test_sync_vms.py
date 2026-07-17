@@ -88,15 +88,18 @@ def test_sync_vms_create_succeeds_even_when_custom_fields_unprovisioned():
 
 
 def test_sync_vms_update_core_save_lands_even_if_custom_fields_fail():
-    # Update path: core fields (name/cluster/status/tenant) save FIRST, then the
-    # custom_fields PATCH best-effort. A cf 400 must NOT undo the core update.
+    # Update path (perf FIX C: ONE combined save for core + custom fields).
+    # When the combined save 400s (cf unprovisioned on the deployed NetBox),
+    # the core update is retried WITHOUT the cf patch — a cf 400 must NOT lose
+    # the core-field update, same contract as the old two-save split.
     eng = _engine()
     existing_row = {"id": 7, "custom_fields": {"proxmox_unique_id": "pxmx:100"}}
     eng._api_get_all = MagicMock(return_value=[existing_row])
     existing_vm = _Obj(id=7, custom_fields={"proxmox_unique_id": "pxmx:100"})
-    # 1st save = core fields (ok); 2nd save = custom_fields PATCH (raises).
+    # 1st save = combined core+cf (raises: cf unprovisioned);
+    # 2nd save = core-only retry (ok).
     existing_vm.save.side_effect = [
-        None, Exception("does not exist for this object type")]
+        Exception("does not exist for this object type"), None]
     eng.nb.virtualization.virtual_machines.get.return_value = existing_vm
 
     res = eng.sync_vms(
@@ -104,10 +107,31 @@ def test_sync_vms_update_core_save_lands_even_if_custom_fields_fail():
 
     assert res["status"] == "SUCCESS", res
     assert res["pushed"] == 1
-    assert res["errors"] == 0
-    # Core rename landed before the cf PATCH failed.
+    assert res["errors"] == 0                 # cf failure is best-effort, not an error
+    # Core rename landed via the core-only retry.
     assert existing_vm.name == "vm-renamed"
-    assert existing_vm.save.call_count == 2   # core save + (failed) cf PATCH
+    assert existing_vm.save.call_count == 2   # combined (failed) + core-only retry
+    # The unprovisioned cf patch was reverted so the retry couldn't re-send it.
+    assert "proxmox_node" not in existing_vm.custom_fields
+
+
+def test_sync_vms_update_single_combined_save_on_healthy_netbox():
+    # perf FIX C: on a healthy NetBox the update path is ONE save carrying core
+    # fields + custom fields (was two PATCHes per VM).
+    eng = _engine()
+    existing_row = {"id": 7, "custom_fields": {"proxmox_unique_id": "pxmx:100"}}
+    eng._api_get_all = MagicMock(return_value=[existing_row])
+    existing_vm = _Obj(id=7, custom_fields={"proxmox_unique_id": "pxmx:100"})
+    eng.nb.virtualization.virtual_machines.get.return_value = existing_vm
+
+    res = eng.sync_vms(
+        vms=[{**_VM, "name": "vm-renamed"}], tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1 and res["errors"] == 0
+    assert existing_vm.name == "vm-renamed"
+    assert existing_vm.custom_fields.get("proxmox_node") == "pve1"
+    assert existing_vm.save.call_count == 1   # ONE combined PATCH
 
 
 # ── Adopt-by-name self-heal: the "name must be unique per cluster" 400 ────────
@@ -642,3 +666,27 @@ def test_sync_vms_slug_match_wins_over_name_collision():
     assert res["status"] == "SUCCESS", res
     # slug.lower() "lrb" was inserted before name.lower() "lrb" → canonical "lrb"
     eng.nb.tenancy.tenants.get.assert_called_with(slug="lrb")
+
+# ── perf FIX C: hydrate matched VMs from the listing (no per-VM re-GET) ───────
+
+def test_sync_vms_update_hydrates_from_listed_row_no_reget():
+    # The listing already returned the full serialized row — the update path
+    # hydrates a pynetbox Record from it instead of re-GETting each VM by id.
+    # (Rows without a 'url' key — like the minimal ones elsewhere in this file —
+    # fall back to .get(), which is why those tests still see the mock.)
+    eng = _engine()
+    # pynetbox Record hydration reads api.base_url (a string on a real api);
+    # give the MagicMock one so hydration succeeds like it does in production.
+    eng.nb.base_url = "http://nb/api"
+    existing_row = {"id": 7,
+                    "url": "http://nb/api/virtualization/virtual-machines/7/",
+                    "name": "vm100",
+                    "custom_fields": {"proxmox_unique_id": "pxmx:100"}}
+    eng._api_get_all = MagicMock(return_value=[existing_row])
+
+    res = eng.sync_vms(vms=[_VM], tenant_slug="lrb", replace=False)
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 1
+    eng.nb.virtualization.virtual_machines.get.assert_not_called()
+    eng.nb.virtualization.virtual_machines.create.assert_not_called()

@@ -124,3 +124,78 @@ def test_stamp_last_seen_never_raises():
     obj = _Obj({})
     obj.save.side_effect = Exception("field unprovisioned")
     eng._stamp_last_seen(obj)   # swallowed at DEBUG — must not raise
+
+
+# ── FIX C: local longest-prefix mask resolution ───────────────────────────────
+
+import ipaddress  # noqa: E402
+
+
+def _nets(*cidrs):
+    return [ipaddress.ip_network(c) for c in cidrs]
+
+
+def test_mask_from_prefixes_longest_match_wins():
+    nets = _nets("10.0.0.0/8", "10.1.0.0/16", "10.1.2.0/24")
+    assert NetboxEngine._mask_from_prefixes("10.1.2.5", nets) == "24"
+    assert NetboxEngine._mask_from_prefixes("10.1.9.5", nets) == "16"
+    assert NetboxEngine._mask_from_prefixes("10.9.9.9", nets) == "8"
+
+
+def test_mask_from_prefixes_uncovered_or_invalid_returns_none():
+    nets = _nets("10.0.0.0/8")
+    assert NetboxEngine._mask_from_prefixes("192.168.1.1", nets) is None
+    assert NetboxEngine._mask_from_prefixes("not-an-ip", nets) is None
+    assert NetboxEngine._mask_from_prefixes("10.0.0.1", []) is None
+    assert NetboxEngine._mask_from_prefixes("10.0.0.1", None) is None
+
+
+def test_mask_from_prefixes_family_mismatch_never_matches():
+    nets = _nets("fd00::/8")
+    assert NetboxEngine._mask_from_prefixes("10.0.0.1", nets) is None
+    assert NetboxEngine._mask_from_prefixes("fd00::1", nets) == "8"
+
+
+def test_mask_from_prefixes_strips_inline_mask():
+    nets = _nets("10.1.2.0/24")
+    assert NetboxEngine._mask_from_prefixes("10.1.2.5/32", nets) == "24"
+
+
+def test_mask_for_ip_uses_prefetch_no_api_call():
+    eng = _engine()
+    eng._api_get = MagicMock()
+    eng._prefix_prefetch = _nets("10.1.2.0/24")
+    assert eng._mask_for_ip("10.1.2.5") == "24"
+    eng._api_get.assert_not_called()          # resolved locally
+
+
+def test_mask_for_ip_uncovered_falls_back_to_api():
+    eng = _engine()
+    eng._api_get = MagicMock(return_value={"results": [{"prefix": "192.168.0.0/16"}]})
+    eng._prefix_prefetch = _nets("10.1.2.0/24")
+    assert eng._mask_for_ip("192.168.1.1") == "16"   # per-IP API fallback kept
+    eng._api_get.assert_called_once()
+
+
+def test_mask_for_ip_without_prefetch_unchanged():
+    eng = _engine()
+    eng._api_get = MagicMock(return_value={"results": []})
+    assert eng._mask_for_ip("10.1.2.5") == "32"      # no containing prefix → /32
+    eng._api_get.assert_called_once()
+
+
+def test_begin_end_prefix_prefetch_lifecycle():
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[
+        {"prefix": "10.0.0.0/8"}, {"prefix": "bogus"}, {}])
+    eng._begin_prefix_prefetch()
+    assert [str(n) for n in eng._prefix_prefetch] == ["10.0.0.0/8"]
+    eng._end_prefix_prefetch()
+    assert eng._prefix_prefetch is None
+
+
+def test_begin_prefix_prefetch_failure_leaves_fallback():
+    eng = _engine()
+    eng._api_get_all = MagicMock(side_effect=Exception("boom"))
+    eng._begin_prefix_prefetch()
+    assert eng._prefix_prefetch is None       # → per-IP API path everywhere

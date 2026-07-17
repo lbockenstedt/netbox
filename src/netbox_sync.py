@@ -46,12 +46,68 @@ class SyncMixin:
         has_mac = bool(NetboxEngine._norm_mac(cf.get("mac_address", "")))
         return has_ip or has_mac
 
+    # ── perf FIX C: per-sync-run prefix prefetch for _mask_for_ip ────────────
+    # _mask_for_ip used to GET /api/ipam/prefixes/?contains=<ip> once per IP
+    # per record — the dominant N+1 in the VM sync. A sync run prefetches ALL
+    # prefixes once and resolves masks locally (longest-prefix match); the
+    # per-IP API lookup remains as the fallback for IPs no local prefix covers
+    # (e.g. a prefix added mid-run) and for callers outside a sync run.
+
+    def _begin_prefix_prefetch(self) -> None:
+        """Fetch every NetBox prefix once for the current sync run so
+        ``_mask_for_ip`` resolves locally. Best-effort: on failure the cache
+        stays None and every lookup falls back to the per-IP API path."""
+        try:
+            nets = []
+            for p in self._api_get_all("/api/ipam/prefixes/", {"limit": 500}):
+                pfx = (p or {}).get("prefix")
+                if not pfx:
+                    continue
+                try:
+                    nets.append(ipaddress.ip_network(pfx, strict=False))
+                except ValueError:
+                    continue
+            self._prefix_prefetch = nets
+        except Exception as e:
+            logger.debug("prefix prefetch failed (per-IP fallback stays): %s", e)
+            self._prefix_prefetch = None
+
+    def _end_prefix_prefetch(self) -> None:
+        """Drop the per-run prefix cache (call in the sync's ``finally``)."""
+        self._prefix_prefetch = None
+
+    @staticmethod
+    def _mask_from_prefixes(ip_str: str, nets) -> Optional[str]:
+        """Longest-prefix match of ``ip_str`` against a list of
+        ``ipaddress`` networks. Returns the prefixlen as a string, or None
+        when no prefix of the same address family covers the IP (or the IP is
+        unparsable) — the caller then falls back to the per-IP API lookup."""
+        try:
+            addr = ipaddress.ip_address(str(ip_str).split("/")[0].strip())
+        except ValueError:
+            return None
+        best = None
+        for net in (nets or []):
+            if net.version == addr.version and addr in net:
+                if best is None or net.prefixlen > best:
+                    best = net.prefixlen
+        return str(best) if best is not None else None
+
     def _mask_for_ip(self, ip_str: str) -> str:
         """Derive the mask from the most specific containing prefix; /32 if none.
 
         Mirrors the inline lookup in ``claim_device`` (engine.py ~296-304),
-        extracted so the device sync reuses it.
+        extracted so the device sync reuses it. When a sync run has prefetched
+        the prefix set (``_begin_prefix_prefetch``) the match is local — no
+        API call; only an uncovered IP hits the per-IP fallback below.
         """
+        nets = getattr(self, "_prefix_prefetch", None)
+        if nets is not None:
+            local = self._mask_from_prefixes(ip_str, nets)
+            if local is not None:
+                return local
+            # uncovered by the prefetched set → per-IP API fallback (catches a
+            # prefix added mid-run; otherwise resolves to /32 as before).
         try:
             pdata = self._api_get("/api/ipam/prefixes/", {"contains": ip_str, "limit": 500})
             prefs = [ipaddress.ip_network(p["prefix"], strict=False)

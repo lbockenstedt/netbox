@@ -281,6 +281,40 @@ class VmSyncMixin:
             logger.debug("ensure_vm_cluster %s failed: %s", name, e)
             return None
 
+    # ── perf FIX C: batching helpers (kill the per-VM N+1s) ────────────────────
+
+    def _hydrate_record(self, row: dict, endpoint):
+        """Rebuild a pynetbox ``Record`` from a raw list-row dict so a matched
+        object can be updated/deleted WITHOUT re-fetching it by id — the full
+        row already came from the one paginated ``_api_get_all`` listing.
+        Falls back to a per-id GET when the row can't hydrate (no ``url`` key —
+        e.g. a minimal row in tests; real API rows always carry it)."""
+        try:
+            if isinstance(row, dict) and row.get("url"):
+                from pynetbox.core.response import Record
+                return Record(row, self.nb, endpoint)
+        except Exception as e:
+            logger.debug("hydrate from row failed, falling back to GET: %s", e)
+        return endpoint.get(row["id"])
+
+    def _prefetch_vm_interfaces(self):
+        """One paginated fetch of ALL vminterfaces, bucketed by VM id, so
+        ``_assign_vm_primary_ip4`` doesn't issue a filter GET per VM. Returns
+        the bucket dict, or None on failure (→ per-VM filter fallback)."""
+        try:
+            buckets: Dict[int, list] = {}
+            for row in self._api_get_all("/api/virtualization/interfaces/",
+                                         {"limit": 500}):
+                vmref = (row or {}).get("virtual_machine")
+                vmid = vmref.get("id") if isinstance(vmref, dict) else vmref
+                if vmid:
+                    buckets.setdefault(int(vmid), []).append(row)
+            return buckets
+        except Exception as e:
+            logger.debug("sync_vms: vminterface prefetch failed "
+                         "(per-VM filter fallback): %s", e)
+            return None
+
     def _assign_vm_primary_ip4(self, vm_obj, vm: dict, tenant=None):
         """Build the VM's interfaces in NetBox from the per-interface records
         the pxmx agent gathers, set ``primary_ip4`` from the first IP, and
@@ -328,8 +362,18 @@ class VmSyncMixin:
             # (the content-type string used in assigned_object_type below), but
             # the endpoint path is ``interfaces`` — a name collision masked by
             # the mocked tests, which is why this 404'd in production only.
-            existing = list(self.nb.virtualization.interfaces.filter(
-                virtual_machine_id=vm_obj.id))
+            # perf FIX C: inside a sync_vms run all vminterfaces were bulk-
+            # fetched once (_prefetch_vm_interfaces) — hydrate this VM's bucket
+            # instead of a filter GET per VM. Outside a run (cache None) the
+            # per-VM filter is unchanged.
+            pre = getattr(self, "_vmiface_prefetch", None)
+            if pre is not None:
+                existing = [self._hydrate_record(
+                                r, self.nb.virtualization.interfaces)
+                            for r in pre.get(int(vm_obj.id), [])]
+            else:
+                existing = list(self.nb.virtualization.interfaces.filter(
+                    virtual_machine_id=vm_obj.id))
         except Exception as e:
             logger.debug("assign_vm_primary_ip4: list vminterfaces %s failed: %s",
                          vm_obj.id, e)
@@ -482,6 +526,10 @@ class VmSyncMixin:
 
         # slug -> tenant object cache (None for unassigned). '' → None.
         tenant_cache: Dict[str, Any] = {}
+        # perf FIX C: cluster name -> id cache (mirrors the tenant cache) —
+        # _ensure_vm_cluster was a clusters.get() per VM for the same few names.
+        # Failed resolutions (None) are cached too, matching _resolve_tenant.
+        cluster_cache: Dict[str, Optional[int]] = {}
 
         # Case-insensitive tenant lookup table: map lower(slug) AND lower(name)
         # → the tenant's canonical NetBox slug, built once per batch. NetBox
@@ -524,6 +572,13 @@ class VmSyncMixin:
             # Self-heal proxmox_* custom fields on virtualization.virtualmachine
             # so the linkage PATCHes below land. Cached per-process.
             self._ensure_custom_fields()
+            # perf FIX C: prefetch per-run reference data ONCE — every prefix
+            # (mask resolution goes local in _mask_for_ip; was a GET per IP per
+            # VM) and every vminterface (per-VM bucket lookup in
+            # _assign_vm_primary_ip4; was a filter GET per VM). Cleared in the
+            # ``finally`` below.
+            self._begin_prefix_prefetch()
+            self._vmiface_prefetch = self._prefetch_vm_interfaces()
             incoming: Dict[str, Dict[str, Any]] = {}
             for vm in (vms or []):
                 uid = str((vm or {}).get("unique_id") or "").strip()
@@ -583,7 +638,10 @@ class VmSyncMixin:
                     if isinstance(rten, dict):
                         rslug = str(rten.get("slug") or "")
                     try:
-                        obj = self.nb.virtualization.virtual_machines.get(row["id"])
+                        # perf FIX C: hydrate from the listed row — no per-VM
+                        # re-GET before the delete.
+                        obj = self._hydrate_record(
+                            row, self.nb.virtualization.virtual_machines)
                         if obj:
                             obj.delete()
                             deleted += 1
@@ -601,8 +659,12 @@ class VmSyncMixin:
                 b = _bucket(vslug)
                 b["vms_total"] += 1
                 try:
-                    cluster_id = self._ensure_vm_cluster(
-                        str(vm.get("cluster") or "").strip(), tenant)
+                    cname = str(vm.get("cluster") or "").strip()
+                    if cname in cluster_cache:
+                        cluster_id = cluster_cache[cname]
+                    else:
+                        cluster_id = self._ensure_vm_cluster(cname, tenant)
+                        cluster_cache[cname] = cluster_id
                     name = str(vm.get("name") or "").strip() or f"vm-{vm.get('vmid') or uid}"
                     status = self._vm_status_map(vm.get("status"))
                     vcpus = int(vm.get("vcpus") or 0)
@@ -634,7 +696,11 @@ class VmSyncMixin:
                     if match_row is None and cluster_id:
                         match_row = existing_by_nc.get((name, cluster_id))
                     if match_row is not None:
-                        obj = self.nb.virtualization.virtual_machines.get(match_row["id"])
+                        # perf FIX C: hydrate the pynetbox Record from the
+                        # listed row (the listing already returned the full
+                        # serialized record) — no per-VM re-GET.
+                        obj = self._hydrate_record(
+                            match_row, self.nb.virtualization.virtual_machines)
                         if not obj:
                             errors += 1
                             b["errors"] += 1
@@ -668,28 +734,30 @@ class VmSyncMixin:
                             # Set/clear so a VM that changed tags moves tenant
                             # (or drops to unassigned) without a delete+recreate.
                             obj.tenant = tenant.id if tenant else None
-                            obj.save()  # core fields — always syncs even if cf unprovisioned
-                            # proxmox_* linkage is best-effort: the deployed NetBox
-                            # may not have the custom fields attached to
-                            # virtualization.virtualmachine yet, and a 400 here must
-                            # NOT undo the core update above. The create path sets
-                            # them once the fields exist (next sync after ensure).
+                            # perf FIX C: ONE save for core fields + proxmox_*
+                            # custom fields (was two PATCHes per VM). perf FIX A:
+                            # last_seen is quantized — keep the stored stamp
+                            # while it's fresh (<1h) so an otherwise-unchanged
+                            # VM yields a no-diff save (zero PATCHes).
+                            prev_cf = dict(obj.custom_fields or {})
+                            cf_patch = dict(cf)
+                            if not self._last_seen_stale(prev_cf.get("last_seen")):
+                                cf_patch.pop("last_seen", None)
+                            obj.custom_fields = {**prev_cf, **cf_patch}
                             try:
-                                merged = dict(obj.custom_fields or {})
-                                cf_patch = dict(cf)
-                                # perf FIX A: last_seen is quantized — keep the
-                                # stored stamp while it's fresh (<1h) so an
-                                # otherwise-unchanged VM yields a no-diff save
-                                # (zero PATCHes on a no-op sync).
-                                if not self._last_seen_stale(merged.get("last_seen")):
-                                    cf_patch.pop("last_seen", None)
-                                merged.update(cf_patch)
-                                obj.custom_fields = merged
                                 obj.save()
                             except Exception as e:
-                                logger.warning("sync_vms: custom_fields update %s skipped "
-                                               "(field unprovisioned?): %s", uid, e)
-                            # last_seen is folded into ``cf`` above → rides the cf PATCH.
+                                # The deployed NetBox may not have the proxmox_*/
+                                # last_seen custom fields attached to
+                                # virtualization.virtualmachine — a cf 400 must
+                                # NOT lose the core-field update. Retry WITHOUT
+                                # the cf patch (best-effort linkage, same
+                                # contract as the old two-save split).
+                                logger.warning("sync_vms: combined save %s failed "
+                                               "(custom fields unprovisioned?): %s "
+                                               "— retrying core fields only", uid, e)
+                                obj.custom_fields = prev_cf
+                                obj.save()
                     else:
                         # Create WITHOUT inline custom_fields: a create carrying
                         # custom_fields 400s ("Custom field 'proxmox_node' does
@@ -758,6 +826,12 @@ class VmSyncMixin:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "vms_total": len(vms or []), "per_tenant": per_tenant}
+        finally:
+            # perf FIX C: the prefetched prefix/vminterface sets are valid for
+            # THIS run only — drop them so later single-record calls (claim,
+            # nw poll) don't resolve against stale data.
+            self._end_prefix_prefetch()
+            self._vmiface_prefetch = None
 
     def get_tenant_vmid_range(self, tenant_slug: str = "") -> Dict[str, Any]:
         """Read a NetBox tenant's Proxmox VMID allocation range + in-use VMIDs.
