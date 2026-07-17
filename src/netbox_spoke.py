@@ -214,6 +214,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
+        "NETBOX_MIGRATE_TENANT",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -590,6 +591,15 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_TENANTS":
             return await self._run_picklist("GET_TENANTS", self.engine.get_tenants)
+
+        if normalized == "NETBOX_MIGRATE_TENANT":
+            return await self._run_sync(
+                self.engine.migrate_tenant,
+                source=data.get("source"),
+                target=data.get("target"),
+                delete_source=_as_bool(data.get("delete_source"), default=True),
+                create_target=_as_bool(data.get("create_target"), default=False),
+            )
 
         if normalized == "NETBOX_SYNC_DHCP":
             await self.start_kea_sync()
