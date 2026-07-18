@@ -113,9 +113,16 @@ class NetboxSpoke(BaseSpoke):
         # UPDATE_CONFIG (token/url change).
         self._picklist_cache: Dict[str, Any] = {}
         self._picklist_ttl = 60.0
-        # Self-heal the custom fields the syncs depend on (idempotent, best-effort;
-        # a restricted token never breaks the spoke — failures are DEBUG-logged).
-        self.engine._ensure_custom_fields()
+        # The custom-field self-heal (_ensure_custom_fields) is intentionally NOT
+        # run at construction. A role sub-spoke that has not yet received its
+        # UPDATE_CONFIG builds the engine against the localhost:8000 default
+        # (NETBOX_URL unset) — probing there "to self-heal" is a self-connection
+        # the box can never satisfy (Connection refused), so it only ever logs
+        # noise and, worse, implies the spoke is its own NetBox source. The heal
+        # runs AFTER the hub repoints the engine to the real NetBox URL — in the
+        # UPDATE_CONFIG handler (reconnect → _ensure_custom_fields), which fires
+        # on every (re)connect push. Idempotent + best-effort either way: a
+        # restricted token never breaks the spoke (failures DEBUG-logged).
 
     def _persist_env(self, key: str, value: str):
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
