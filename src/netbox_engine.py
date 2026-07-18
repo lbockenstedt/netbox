@@ -1,13 +1,41 @@
+import os as _os
 import pynetbox
 import logging
 import threading
 from typing import Any, Dict, Optional
+
+import requests
 
 # Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
 # when multiple IPAM queries arrive simultaneously.
 _netbox_http_sem = threading.Semaphore(1)
 
 logger = logging.getLogger("NetboxEngine")
+
+# Default per-request timeout (seconds) for EVERY upstream NetBox call.
+# requests' own default is NO timeout → a hung NetBox worker / stalled
+# reverse-proxy / black-holed route blocks the calling thread FOREVER. These
+# calls run in to_thread workers, so a handful of stuck requests wedge the
+# spoke: the hub WS stays "online" but every command (NETBOX_GET_*,
+# NETBOX_STALENESS_SWEEP, …) times out. A finite read timeout bounds the hang
+# to this many seconds and reclaims the thread. Override via the env var.
+_NETBOX_API_TIMEOUT = float(_os.environ.get("LM_NETBOX_API_TIMEOUT", "30") or 30)
+
+
+class _DefaultTimeoutHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Mount on ``nb.http_session`` so every request — pynetbox ORM calls
+    (``.all()``/``.filter()``/``.save()``) AND our direct ``http_session.get()``
+    — gets a default connect+read timeout. A caller that already passes a
+    (non-None) timeout keeps it."""
+
+    def __init__(self, timeout: float, *a, **kw):
+        self._timeout = timeout
+        super().__init__(*a, **kw)
+
+    def send(self, request, **kw):
+        if kw.get("timeout") is None:
+            kw["timeout"] = self._timeout
+        return super().send(request, **kw)
 
 def get_version():
     try:
@@ -56,6 +84,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
         self._apply_ssl()
+        self._apply_timeout()
         # perf-scan D1b: shared slug→object cache for reference data (sites,
         # device-roles). Keyed "kind:slug"; each entry {"ts", "value"}. Shared
         # across every mixin because they all share `self`.
@@ -70,6 +99,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         self.nb = pynetbox.api(url, token=self.token)
         self._apply_auth()
         self._apply_ssl()
+        self._apply_timeout()
         # A new API target invalidates any slug→object mappings from the old one.
         self._ref_cache = {}
 
@@ -137,6 +167,15 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
                 "self-signed NetBox; set netbox_verify_ssl=1 once a CA-signed "
                 "cert is deployed.", self.url)
 
+    def _apply_timeout(self) -> None:
+        """Mount a default-timeout adapter so a hung NetBox can't block a
+        worker thread forever. Covers pynetbox ORM calls + our direct
+        ``http_session.get()`` (both route through ``Session.send`` → the
+        adapter). See ``_DefaultTimeoutHTTPAdapter``."""
+        adapter = _DefaultTimeoutHTTPAdapter(_NETBOX_API_TIMEOUT)
+        self.nb.http_session.mount("https://", adapter)
+        self.nb.http_session.mount("http://", adapter)
+
     def _api_get(self, path: str, params: dict = None) -> dict:
         """Single-page GET — uses the existing pynetbox session (auth already set).
         Never follows pagination links, so this is always exactly ONE HTTP request.
@@ -144,7 +183,8 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         exhausting gunicorn worker memory."""
         url = self.url.rstrip("/") + path
         with _netbox_http_sem:
-            resp = self.nb.http_session.get(url, params=params or {})
+            resp = self.nb.http_session.get(url, params=params or {},
+                                            timeout=_NETBOX_API_TIMEOUT)
         if not resp.ok:
             raise Exception(f"{resp.status_code} {resp.reason} from {path}")
         return resp.json()
@@ -167,9 +207,10 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         for _ in range(max_pages):
             with _netbox_http_sem:
                 if next_url:
-                    resp = self.nb.http_session.get(next_url)
+                    resp = self.nb.http_session.get(next_url, timeout=_NETBOX_API_TIMEOUT)
                 else:
-                    resp = self.nb.http_session.get(base_url, params=params)
+                    resp = self.nb.http_session.get(base_url, params=params,
+                                                    timeout=_NETBOX_API_TIMEOUT)
             if not resp.ok:
                 raise Exception(f"{resp.status_code} {resp.reason} from {path}")
             data = resp.json()
