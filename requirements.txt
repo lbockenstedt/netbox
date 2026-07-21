@@ -5,3 +5,4 @@ uvicorn
 httpx
 gitpython
 python-dotenv
+openpyxl

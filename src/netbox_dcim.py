@@ -639,3 +639,372 @@ class DcimMixin:
         except Exception as e:  # noqa: BLE001
             logger.exception("seed_catalog failed")
             return {"status": "ERROR", "message": str(e)}
+
+    # ─── Excel rack-layout import ─────────────────────────────────────────────
+
+    _NOISE_TOKENS = {"cl", "cl6", "sr", "sr5", "vsf", "stk", "oobm", "f2b", "b2f",
+                     "us", "poe", "poE", "g", "t", "c", "y", "q", "mp"}
+
+    def _dt_index(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Build (and cache) a stem → [device_type catalog entries] index from
+        the bundled seed catalog. Stem = the series token before the port count
+        (e.g. ``3810M-24G`` → ``3810m``; ``8325-32C`` → ``8325``). Used by
+        ``_resolve_device_type_slug`` to map messy Excel model strings
+        (``"6300M 24SR5 CL6"``, ``"CX8325-32 (F2B)"``) onto catalog slugs."""
+        idx = getattr(self, "_dt_index_cache", None)
+        if idx is not None:
+            return idx
+        idx: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            for t in self._load_seed_catalog().get("device_types", []) or []:
+                model = (t.get("model") or "").strip()
+                stem, port = self._model_stem_port(model)
+                if stem:
+                    idx.setdefault(stem, []).append(
+                        {"slug": t["slug"], "model": model, "port": port})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("device-type catalog index build failed: %s", e)
+        self._dt_index_cache = idx
+        return idx
+
+    @staticmethod
+    def _model_stem_port(model: str) -> tuple:
+        """Split a model string into (stem_lower, port:int|None).
+
+        ``3810M-24G`` → (``3810m``, 24); ``8325-32C`` → (``8325``, 32);
+        ``QFX5120-48Y`` → (``qfx5120``, 48); ``3810M`` → (``3810m``, None)."""
+        toks = re.split(r"[\s\-/]+", (model or "").strip().lower())
+        toks = [t for t in toks if t]
+        if not toks:
+            return "", None
+        stem = toks[0]
+        port = None
+        if len(toks) > 1:
+            m = re.match(r"(\d{1,3})", toks[1])
+            if m:
+                try:
+                    port = int(m.group(1))
+                except ValueError:
+                    port = None
+        return stem, port
+
+    def _resolve_device_type_slug(self, model: str) -> Dict[str, Any]:
+        """Map a free-form Excel ``Type of device`` string onto a NetBox device
+        type. Resolution ladder (first hit wins):
+
+        1. exact catalog model match (case-insensitive, parentheticals stripped);
+        2. catalog stem match — disambiguated by a port-count hint in the model
+           (``24``/``48``/``32``…); multiple stems with no hint → first + flagged
+           ``ambiguous``;
+        3. live ``device_types.get(model=…)``;
+        4. live ``device_types.get(slug=_slugify(model))``;
+        5. unresolved → ``{resolved: False, …}`` (caller records a per-device
+           error; **never** auto-creates a junk type).
+
+        Returns ``{resolved:bool, slug|None, id|None, ambiguous:bool, match:str}``."""
+        raw = (model or "").strip()
+        norm = re.sub(r"\([^)]*\)", "", raw).strip()          # drop "(B2F)"
+        norm = re.sub(r"\s+", " ", norm).strip()
+        norm_nopunc = re.sub(r"[^a-z0-9]+", " ", norm.lower()).strip()
+        catalog = self._dt_index()
+        # 1. exact model match
+        for entries in catalog.values():
+            for e in entries:
+                if e["model"].lower() == norm.lower() or e["model"].lower() == norm_nopunc.replace(" ", "-"):
+                    try:
+                        dt = self.nb.dcim.device_types.get(slug=e["slug"])
+                        if dt:
+                            return {"resolved": True, "slug": e["slug"], "id": dt.id,
+                                    "ambiguous": False, "match": "catalog-exact"}
+                    except Exception:  # noqa: BLE001
+                        pass
+        # 2. stem match + port-hint disambiguation
+        stem, port_hint = self._model_stem_port(norm_nopunc)
+        candidate_stems = {stem}
+        for pre in ("cx", "a", "j"):  # "CX8325-32" → also try "8325"
+            if stem.startswith(pre) and len(stem) > len(pre) + 2:
+                candidate_stems.add(stem[len(pre):])
+        matches: List[Dict[str, Any]] = []
+        for s in candidate_stems:
+            matches.extend(catalog.get(s, []))
+        # de-dup by slug preserving order
+        seen = set()
+        uniq = []
+        for m in matches:
+            if m["slug"] not in seen:
+                seen.add(m["slug"]); uniq.append(m)
+        if len(uniq) == 1:
+            try:
+                dt = self.nb.dcim.device_types.get(slug=uniq[0]["slug"])
+                if dt:
+                    return {"resolved": True, "slug": uniq[0]["slug"], "id": dt.id,
+                            "ambiguous": False, "match": "catalog-stem"}
+            except Exception:  # noqa: BLE001
+                pass
+        elif len(uniq) > 1:
+            pick = None
+            if port_hint:
+                pick = next((m for m in uniq if m.get("port") == port_hint), None)
+            if pick is None:
+                pick = uniq[0]  # catalog order; flag ambiguous
+            try:
+                dt = self.nb.dcim.device_types.get(slug=pick["slug"])
+                if dt:
+                    return {"resolved": True, "slug": pick["slug"], "id": dt.id,
+                            "ambiguous": port_hint is None and len(uniq) > 1,
+                            "match": "catalog-stem"}
+            except Exception:  # noqa: BLE001
+                pass
+        # 3. live by model
+        try:
+            dt = self.nb.dcim.device_types.get(model=norm)
+            if dt:
+                return {"resolved": True, "slug": dt.slug, "id": dt.id,
+                        "ambiguous": False, "match": "live-model"}
+        except Exception:  # noqa: BLE001
+            pass
+        # 4. live by slug
+        try:
+            slug = self._slugify(norm)
+            dt = self.nb.dcim.device_types.get(slug=slug)
+            if dt:
+                return {"resolved": True, "slug": dt.slug, "id": dt.id,
+                        "ambiguous": False, "match": "live-slug"}
+        except Exception:  # noqa: BLE001
+            pass
+        return {"resolved": False, "slug": None, "id": None,
+                "ambiguous": False, "match": "unresolved", "model": raw}
+
+    def import_rack_layout(self, selected: List[Dict[str, Any]],
+                           dry_run: bool = False) -> Dict[str, Any]:
+        """Idempotently create/update racks + placed devices (+ mgmt iface/IP)
+        from parsed Excel rack sheets. ``selected`` is a list of entries, each::
+
+            {rack_name, site_slug, u_height, tenant_slug,
+             default_role_slug, default_status,
+             devices: [{name, device_type, serial, asset_tag, position, face,
+                        mgmt_ip, mac, role, status, description}]}
+
+        Per-rack and per-device errors are collected, never aborting the whole
+        import. ``dry_run`` resolves everything (sites/tenants/types/racks) but
+        skips every create/save — returning would-be counts. Tenant is stamped
+        on both rack and devices (mirrors add_rack/claim_device); an unresolvable
+        tenant skips that rack."""
+        racks_created = racks_updated = 0
+        devices_created = devices_updated = 0
+        interfaces_created = ips_assigned = 0
+        errors: List[Dict[str, Any]] = []
+        skipped_devices = 0
+
+        for entry in selected or []:
+            rack_name = entry.get("rack_name") or entry.get("sheet") or ""
+            site_slug = entry.get("site_slug")
+            tenant_slug = entry.get("tenant_slug")
+            u_height = int(entry.get("u_height") or 0) or 42
+            try:
+                site = self.nb.dcim.sites.get(slug=site_slug) if site_slug else None
+                if not site:
+                    errors.append({"rack": rack_name, "message":
+                                   f"Site '{site_slug}' not found — rack skipped"})
+                    continue
+                tenant = None
+                if tenant_slug:
+                    tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                    if not tenant:
+                        errors.append({"rack": rack_name, "message":
+                                       f"NetBox tenant '{tenant_slug}' not found — rack skipped"})
+                        continue
+                # default role (optional — devices may omit role)
+                default_role = None
+                dr_slug = entry.get("default_role_slug")
+                if dr_slug:
+                    try:
+                        default_role = self.nb.dcim.device_roles.get(slug=dr_slug)
+                    except Exception:  # noqa: BLE001
+                        default_role = None
+                default_status = (entry.get("default_status") or "active").strip().lower() or "active"
+
+                # ── rack get-or-create (idempotent) ───────────────────────────
+                rack = None
+                try:
+                    rack = self.nb.dcim.racks.get(name=rack_name, site_id=site.id)
+                except Exception:  # noqa: BLE001
+                    rack = None
+                if rack:
+                    if not dry_run:
+                        r = self.update_rack(rack.id, u_height=u_height,
+                                             tenant_slug=tenant_slug)
+                        if r.get("status") != "SUCCESS":
+                            errors.append({"rack": rack_name, "message":
+                                           f"rack update: {r.get('message')}"})
+                    racks_updated += 1
+                else:
+                    if not dry_run:
+                        r = self.add_rack(rack_name, site_slug, u_height=u_height,
+                                          tenant_slug=tenant_slug)
+                        if r.get("status") == "SUCCESS":
+                            rack = self.nb.dcim.racks.get(name=rack_name, site_id=site.id)
+                        else:
+                            errors.append({"rack": rack_name, "message":
+                                           f"rack create: {r.get('message')}"})
+                            continue
+                    racks_created += 1
+
+                # ── per device ─────────────────────────────────────────────────
+                for dev in entry.get("devices", []) or []:
+                    name = (dev.get("name") or "").strip()
+                    serial = (dev.get("serial") or "").strip()
+                    dname = name or f"<unnamed:{serial or '?'}>"
+                    try:
+                        # device type (required to create)
+                        dt_info = self._resolve_device_type_slug(dev.get("device_type") or "")
+                        if not dt_info.get("resolved"):
+                            msg = f"device type '{dev.get('device_type')}' unresolved"
+                            if dt_info.get("ambiguous"):
+                                msg += " (ambiguous — map a port-count column)"
+                            errors.append({"sheet": entry.get("sheet"), "rack": rack_name,
+                                           "name": dname, "message": msg})
+                            skipped_devices += 1
+                            continue
+                        dt_id = dt_info["id"]
+
+                        # role: per-row override (by slug/name) → default
+                        role_id = None
+                        role_val = (dev.get("role") or "").strip()
+                        if role_val:
+                            try:
+                                r = (self.nb.dcim.device_roles.get(slug=role_val.lower())
+                                     or self.nb.dcim.device_roles.get(name=role_val))
+                                if r:
+                                    role_id = r.id
+                            except Exception:  # noqa: BLE001
+                                role_id = None
+                        if role_id is None and default_role is not None:
+                            role_id = default_role.id
+
+                        status = (dev.get("status") or default_status).strip().lower()
+                        # RU → position (Excel RU 1:1 = NetBox position for 1U).
+                        # RU 0 (0U/PDU) → position unset.
+                        try:
+                            pos = int(dev.get("position"))
+                        except (TypeError, ValueError):
+                            pos = None
+                        if pos == 0:
+                            pos = None
+                        face_raw = (dev.get("face") or "").strip().lower()
+                        face = "rear" if face_raw.startswith("r") else "front"
+                        asset_tag = (dev.get("asset_tag") or "").strip() or None
+                        desc = (dev.get("description") or "").strip()
+
+                        # idempotent match: by serial (global) else by name in rack
+                        existing = None
+                        if serial and not dry_run:
+                            try:
+                                existing = self.nb.dcim.devices.get(serial=serial)
+                            except Exception:  # noqa: BLE001
+                                existing = None
+                        if not existing and name and rack is not None and not dry_run:
+                            try:
+                                existing = self.nb.dcim.devices.get(
+                                    rack=rack.id, name=name)
+                            except Exception:  # noqa: BLE001
+                                existing = None
+
+                        if dry_run:
+                            devices_created += 1
+                            continue
+
+                        payload: Dict[str, Any] = {
+                            "device_type": dt_id, "site": site.id, "status": status,
+                            "face": face,
+                        }
+                        if rack is not None:
+                            payload["rack"] = rack.id
+                        if pos is not None:
+                            payload["position"] = pos
+                        if role_id is not None:
+                            payload["role"] = role_id
+                        if tenant is not None:
+                            payload["tenant"] = tenant.id
+                        if serial:
+                            payload["serial"] = serial
+                        if asset_tag:
+                            payload["asset_tag"] = asset_tag
+                        if name:
+                            payload["name"] = name
+                        if desc:
+                            payload["description"] = desc
+
+                        if existing:
+                            changed = False
+                            for k, v in payload.items():
+                                if k in ("device_type", "site"):
+                                    continue
+                                if getattr(existing, k, None) != v:
+                                    setattr(existing, k, v); changed = True
+                            # device_type update separately (idempotent set)
+                            if getattr(existing, "device_type", None) != dt_id:
+                                existing.device_type = dt_id; changed = True
+                            if changed:
+                                existing.save()
+                            devices_updated += 1
+                            device = existing
+                        else:
+                            device = self.nb.dcim.devices.create(**payload)
+                            devices_created += 1
+
+                        # ── mgmt interface + IP (mirror claim_device) ──────────
+                        mgmt_ip = (dev.get("mgmt_ip") or "").strip()
+                        if mgmt_ip:
+                            ip_str = mgmt_ip.split("/")[0].strip()
+                            full = mgmt_ip if "/" in mgmt_ip else f"{ip_str}/{self._mask_for_ip(ip_str)}"
+                            iface = None
+                            try:
+                                ifaces = list(self.nb.dcim.interfaces.filter(
+                                    device_id=device.id, name="mgmt"))
+                                iface = ifaces[0] if ifaces else None
+                            except Exception:  # noqa: BLE001
+                                iface = None
+                            if not iface:
+                                iface = self.nb.dcim.interfaces.create(
+                                    device=device.id, name="mgmt", type="other")
+                                interfaces_created += 1
+                            ip_kwargs: Dict[str, Any] = {
+                                "address": full,
+                                "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": iface.id,
+                            }
+                            if tenant is not None:
+                                ip_kwargs["tenant"] = tenant.id
+                            if name:
+                                ip_kwargs["dns_name"] = name
+                            ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
+                            ips_assigned += 1
+                            mac = (dev.get("mac") or "").strip()
+                            if mac:
+                                try:
+                                    ip_obj.custom_fields = {"mac_address": mac}
+                                    ip_obj.save()
+                                except Exception as e:  # noqa: BLE001
+                                    logger.debug("import_rack_layout: mac_address cf on %s skipped: %s", full, e)
+                            try:
+                                device.primary_ip4 = ip_obj.id
+                                device.save()
+                            except Exception as e:  # noqa: BLE001
+                                logger.debug("import_rack_layout: primary_ip4 set on %s skipped: %s", name, e)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error("import_rack_layout: device %s failed: %s", dname, e)
+                        errors.append({"sheet": entry.get("sheet"), "rack": rack_name,
+                                       "name": dname, "message": str(e)})
+                        skipped_devices += 1
+            except Exception as e:  # noqa: BLE001
+                logger.error("import_rack_layout: rack %s failed: %s", rack_name, e)
+                errors.append({"rack": rack_name, "message": str(e)})
+
+        return {"status": "SUCCESS", "dry_run": dry_run,
+                "racks_created": racks_created, "racks_updated": racks_updated,
+                "devices_created": devices_created, "devices_updated": devices_updated,
+                "interfaces_created": interfaces_created,
+                "ips_assigned": ips_assigned,
+                "skipped_devices": skipped_devices,
+                "errors": errors}

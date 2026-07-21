@@ -15,6 +15,8 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 from netbox_engine import NetboxEngine
+from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
+                         parse_one_rack_sheet, parse_summary_block_by_name)
 
 logger = logging.getLogger("NetboxSpoke")
 
@@ -318,6 +320,22 @@ class NetboxSpoke(BaseSpoke):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
+    def _fetch_upload_bytes(self, download_url: str, token: str) -> bytes:
+        """HTTP-GET a hub-relayed upload file (token-gated GET endpoint) and
+        return its bytes. Used by the Excel rack-import detect/commit arms —
+        the hub saves the .xlsx to a scratch dir and hands the spoke a one-time
+        download_url + token (mirrors the template-refresh relay). Runs inside
+        _run_sync, so a sync httpx client is fine. TLS verify is OFF to match
+        the spoke→hub wss permissive model (self-signed hub cert during boot)."""
+        if not download_url:
+            raise RuntimeError("no download_url provided for relayed upload")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        verify = str(os.getenv("LM_HUB_TLS_VERIFY", "0")) not in ("1", "true", "True")
+        with httpx.Client(timeout=180.0, verify=verify, follow_redirects=True) as c:
+            r = c.get(download_url, headers=headers)
+            r.raise_for_status()
+            return r.content
+
     def _picklist_invalidate(self):
         """Drop all cached picklist data — call after any mutation that could
         change the dropdown contents (add/update/delete/claim/allocate/release/
@@ -350,6 +368,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
+        "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -863,6 +882,59 @@ class NetboxSpoke(BaseSpoke):
             # Long-running (45+ device types × templates) → no per-call timeout
             # clamp; _run_sync offloads the blocking pynetbox calls to a thread.
             return await self._run_sync(self.engine.seed_catalog)
+
+        if normalized == "NETBOX_IMPORT_RACK_DETECT":
+            # WebUI "Import .xlsx" step 1: the hub saved the uploaded workbook
+            # to a scratch dir and sent a token-gated download_url. Fetch it,
+            # parse with openpyxl, and auto-detect rack sheets + guess column
+            # maps (both one-rack-per-sheet and multi-rack summary shapes).
+            # Pure parse — no NetBox writes — so this arm is NOT a picklist
+            # mutation (the COMMIT arm below is). _run_sync offloads openpyxl.
+            def _detect():
+                raw = self._fetch_upload_bytes(
+                    data.get("download_url", ""), data.get("token", ""))
+                wb = load_workbook_from_bytes(raw)
+                return {"status": "SUCCESS", "racks": detect_rack_sheets(wb)}
+            return await self._run_sync(_detect)
+
+        if normalized == "NETBOX_IMPORT_RACK_COMMIT":
+            # Step 2: re-fetch the workbook, re-parse the SELECTED sheets with
+            # the user's column maps (full device rows — the detect step only
+            # returned previews), then create/update racks + devices + mgmt
+            # iface/IP via engine.import_rack_layout. Idempotent; per-device
+            # errors are isolated. ``sheets`` = [{sheet, rack_name, site_slug,
+            # u_height, tenant_slug, shape, column_map, default_role_slug,
+            # default_status}]; ``dry_run`` resolves but skips every create.
+            sheets = data.get("sheets") or []
+            dry_run = bool(data.get("dry_run"))
+
+            def _commit():
+                raw = self._fetch_upload_bytes(
+                    data.get("download_url", ""), data.get("token", ""))
+                wb = load_workbook_from_bytes(raw)
+                ws_by_title = {ws.title: ws for ws in wb.worksheets}
+                selected = []
+                for s in sheets:
+                    shape = s.get("shape", "one-rack")
+                    if shape == "summary":
+                        parsed = parse_summary_block_by_name(wb, s.get("rack_name", ""))
+                    else:
+                        ws = ws_by_title.get(s.get("sheet", ""))
+                        parsed = parse_one_rack_sheet(ws, s.get("column_map") or {}) if ws else None
+                    if not parsed:
+                        continue
+                    selected.append({
+                        "sheet": s.get("sheet"),
+                        "rack_name": s.get("rack_name") or parsed.get("rack_name"),
+                        "site_slug": s.get("site_slug"),
+                        "u_height": s.get("u_height") or parsed.get("u_height") or 42,
+                        "tenant_slug": s.get("tenant_slug"),
+                        "default_role_slug": s.get("default_role_slug"),
+                        "default_status": s.get("default_status"),
+                        "devices": parsed.get("devices") or [],
+                    })
+                return self.engine.import_rack_layout(selected, dry_run=dry_run)
+            return await self._run_sync(_commit)
 
         if normalized == "INSTALL_CERT":
             # Cert custodian (tiered Hub→Spoke→Agent): the SPOKE holds ALL the

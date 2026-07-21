@@ -27,6 +27,42 @@ then **add-missing** interface/console/power templates (expand each model's
 To extend: edit `src/seed_catalog.json`, redeploy the spoke (WebUI Update), and
 click Seed catalog again.
 
+## Import rack layout from Excel (`src/netbox_xlsx.py` + `DcimMixin.import_rack_layout`)
+
+A dynamic, admin-only importer for recreating a lab's racks + devices from an
+`.xlsx` workbook (the format the lab keeps its rack elevations in). Handles
+**column drift** between sheets and **two sheet shapes** — one-rack-per-sheet
+(header row `RU`/`F/R`/`Type of device`/`Hostname`/`Serial`/`MGMT IP`…) and
+whole-lab multi-rack summary sheets (`RACK <name>` blocks with `Front`/`Rear`
+text cells). Flow (two-step URL relay, mirroring template-refresh):
+
+1. **Upload + detect** — `POST /api/netbox/racks/import-xlsx` (multipart) → the
+   hub saves the file to `/var/lib/lm/imports/<uuid>.xlsx`, mints a one-time
+   token, relays `NETBOX_IMPORT_RACK_DETECT {download_url, token}` → the spoke
+   HTTP-GETs it, parses with **openpyxl** (`detect_rack_sheets`), auto-detects
+   rack sheets, and **guesses a column→field map**. Returns the preview +
+   device form-options.
+2. **Map + commit** — the WebUI shows a per-rack column-mapping table (edit +
+   pick racks + optional Dry run) → `POST /api/netbox/racks/import-commit` →
+   the spoke re-GETs the file, re-parses the selected sheets with the user's
+   maps (`parse_one_rack_sheet` / `parse_summary_block_by_name`), and runs
+   `import_rack_layout(selected, dry_run)`.
+
+`import_rack_layout` is idempotent (match by **serial** else **name-in-rack**;
+re-import updates, never duplicates) with **per-device error isolation** (one
+bad row never aborts the whole import). Devices are placed at `position` = RU
+(1:1 for 1U; RU 0 → 0U) with `face` F→front / R→rear, stamped with the current
+tenant, `serial`, `asset_tag`; an `mgmt` interface + IP (mask from the most-
+specific containing prefix, `/32` fallback) is attached when `mgmt_ip` is
+mapped (mirrors `claim_device`). Device types are resolved by
+`_resolve_device_type_slug` against the **seed catalog** (stem + port-hint:
+`"6300M 24SR5 CL6"` → `6300m-24g`, `"CX8325-32 (F2B)"` → `8325-32c`) → live
+NetBox → unresolved = a **per-device error (skipped, never a junk type)**.
+**Seed/extend the catalog first** for the models you import. `dry_run=True`
+resolves everything but writes nothing. Admin-only (button hidden for
+non-admins + both routes 403). Dep: `openpyxl` (`requirements.txt`); a missing
+dep degrades to a clear ERROR, not a spoke crash.
+
 ## Proxmox VMID ranges & custom validators (`install.sh`)
 
 `install.sh` idempotently provisions two integer custom fields on

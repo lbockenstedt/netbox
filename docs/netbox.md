@@ -50,6 +50,8 @@ Sync family:
 - `NETBOX_TENANT_VMID_RANGE` — tenant `vmid_start`/`vmid_end` cf + in-use `proxmox_vmid` for hub VMID auto-allocation.
 - `NETBOX_PROVISION_CUSTOM_FIELDS` — `force=True` re-run of `_ensure_custom_fields` (WebUI "Apply schema changes" button).
 - `NETBOX_SEED_CATALOG` — `seed_catalog()`: load the bundled Aruba/HPE/Juniper device-type catalog (`src/seed_catalog.json`) — get-or-create manufacturers + device types (upsert scalars), add-missing interface/console/power templates. Idempotent; admin-only (WebUI Setup → Module Management → "Seed catalog"). In `_PICKLIST_MUTATIONS` (drops the picklist cache).
+- `NETBOX_IMPORT_RACK_DETECT` — `detect_rack_sheets(wb)` (pure parse, no NetBox writes): the hub relays a `download_url`+`token` for an uploaded `.xlsx`; the spoke HTTP-GETs it (`_fetch_upload_bytes`), parses with openpyxl, and returns detected rack sheets + guessed column→field maps. NOT a picklist mutation. Admin-only (WebUI IPAM → Racks → "Import .xlsx").
+- `NETBOX_IMPORT_RACK_COMMIT` — `import_rack_layout(selected, dry_run)`: re-GET the file, re-parse the selected sheets with the user's column maps (full device rows), then idempotently create/update racks + devices (position/face/tenant/serial/asset_tag) + mgmt interface + IP. Per-device error isolation. In `_PICKLIST_MUTATIONS` (mutates racks/devices). `dry_run=True` resolves but skips every create/save.
 
 Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 
@@ -57,7 +59,8 @@ Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 
 `src/netbox_engine.py` (thin composition class — `NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, TenancyMixin)`; owns the pynetbox client, `_apply_auth`, the module-level HTTP semaphore, and the single-page/paginated GET helpers `_api_get`/`_api_get_all`). The sync/DCIM/IPAM logic lives in the mixin modules it composes:
 
-- `src/netbox_dcim.py` (`DcimMixin`) — sites, racks, devices, `update_device_ip`, form-options picklists, `seed_catalog()` (loads `src/seed_catalog.json`).
+- `src/netbox_dcim.py` (`DcimMixin`) — sites, racks, devices, `update_device_ip`, form-options picklists, `seed_catalog()` (loads `src/seed_catalog.json`), and the Excel rack-layout importer: `_resolve_device_type_slug(model)` (catalog stem + port-hint resolver) + `import_rack_layout(selected, dry_run)`.
+- `src/netbox_xlsx.py` — pure-parse Excel rack-layout detection (`detect_rack_sheets` for both sheet shapes — one-rack-per-sheet + multi-rack summary — + a label→field synonym table + RU/U-height helpers) and commit-time re-parse (`parse_one_rack_sheet`, `parse_summary_block_by_name`). openpyxl imported lazily. No NetBox calls live here.
 - `src/netbox_ipam.py` (`IpamMixin`) — prefixes, IPs, `find_available_prefixes`, `claim_prefix`, allocate/release.
 - `src/netbox_vmsync.py` (`VmSyncMixin`) — `sync_vms`, `_ensure_custom_fields`, `_assign_vm_primary_ip4`, `get_tenant_vmid_range`, `create_vm_entry`.
 - `src/netbox_sync.py` (`SyncMixin`) — `sync_devices`, `sync_nw_device`, `sync_access_tracker`.
@@ -102,6 +105,7 @@ Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 - **Allocate a prefix or IP.** IPAM → Prefixes/IPs → allocate; you can search for available space within a parent block or claim a specific prefix/IP directly.
 - **Force a staleness sweep or check why something is offline.** The staleness sweep normally runs on the hub's own schedule; if you need to check sooner, look at a device/VM's `last_seen` value — anything older than the configured stale-days threshold will show (or shortly become) offline.
 - **Seed the device-type catalog (admin).** Setup → Module Management → **Seed catalog** loads the bundled Aruba/HPE/Juniper manufacturers + device types + interface/console/power templates. Idempotent (re-runs upsert scalars + add-missing templates, never delete/re-type). To add/amend a model, edit `src/seed_catalog.json`, redeploy the spoke, and click again. Renames/port-type changes on an existing name = delete that device type in NetBox + re-seed (re-create).
+- **Import a rack layout from Excel (admin).** IPAM → Racks → **Import .xlsx** uploads a workbook; the spoke auto-detects rack sheets (both one-rack-per-sheet and multi-rack summary shapes) and guesses a column→field map. Edit the mapping + pick racks + optional **Dry run**, then commit — racks + devices (placed at RU, front/rear face, tenant-stamped, with serial/asset_tag) + mgmt interface + IP are created/updated idempotently (match by serial else name-in-rack; re-import updates, never duplicates). Device types are resolved from the seed catalog (stem + port-hint; e.g. `6300M 24SR5 CL6` → `6300m-24g`) — **unresolved models are a per-device error, not an auto-created junk type**, so seed/extend the catalog first. Per-device errors never abort the whole import. Two-step URL relay (the file is fetched by the spoke via a token-gated download_url, not inlined over the WS). Dep: `openpyxl` (`requirements.txt`).
 
 ## Troubleshooting / common questions
 
