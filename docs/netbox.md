@@ -38,6 +38,8 @@ You rarely have to enter data into NetBox by hand: this module is the landing zo
 
 DCIM/IPAM: `NETBOX_HEALTH`, `NETBOX_GET_SITES`, `NETBOX_GET/ADD/UPDATE/DELETE_RACK`, `NETBOX_GET/ADD/CLAIM/DELETE/UPDATE_DEVICE`, `NETBOX_GET_DEVICE_FORM_OPTIONS`, `NETBOX_GET_PREFIXES`, `NETBOX_ALLOCATE_PREFIX`, `NETBOX_FIND_AVAILABLE_PREFIXES`, `NETBOX_CLAIM/UPDATE/DELETE_PREFIX`, `NETBOX_GET_IPS`, `NETBOX_ALLOCATE/RELEASE/UPDATE_IP(_ADDR)`, `NETBOX_DOC_VM`, `NETBOX_GET_TENANTS`, `NETBOX_SEARCH`.
 
+> **Rack tenant attribution** — `NETBOX_ADD_RACK` / `NETBOX_UPDATE_RACK` accept a `tenant` (NetBox tenant **slug**); the WebUI Add/Edit Rack modal stamps the current tenant (`currentTenant`, omitted when viewing the global `default` tenant). `add_rack`/`update_rack` resolve the slug to a tenant id (mirroring `allocate_prefix`/`claim_device`); an unresolvable slug is REFUSED (no silent unattributed create). On update, a missing tenant (None) preserves the rack's existing tenant; an empty string clears it to global. This is why a rack created from a tenant view lands in that tenant and shows up under it.
+
 Sync family:
 - `NETBOX_SYNC_DHCP` — background KEA sync loop (`_kea_sync_loop`, 300s): `get_dhcp_prefixes` → POST `subnet4-add` per scope with derived pool range + routers option.
 - `NETBOX_SYNC_VMS` — `sync_vms(vms, tenant_slug, replace, source_of_truth)`: Proxmox→NetBox VM sync; matches by `proxmox_unique_id` cf; tag-driven tenant attribution; `replace=True` deletes proxmox-sourced VMs absent from the pull; `source_of_truth` `external` (Proxmox overwrites) or `netbox` (only-add-missing).

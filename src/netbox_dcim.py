@@ -265,15 +265,34 @@ class DcimMixin:
     # ─── DCIM – Racks (CRUD) ───────────────────────────────────────────────────
 
     def add_rack(self, name: str, site_slug: str, u_height: int = 42,
-                 facility_id: Optional[str] = None) -> Dict[str, Any]:
-        """Create a rack at a site."""
+                 facility_id: Optional[str] = None,
+                 tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Create a rack at a site, optionally attributed to a NetBox tenant.
+
+        ``tenant_slug`` is resolved to a tenant id (mirrors ``allocate_prefix`` /
+        ``claim_device``): if a slug is supplied but no NetBox tenant matches it,
+        we refuse rather than silently create an unattributed rack — the WebUI
+        stamps the current tenant on create, so an unresolvable slug means the
+        tenant's NetBox slug mapping is wrong (not that the user wanted global)."""
         try:
             site = self.nb.dcim.sites.get(slug=site_slug)
             if not site:
                 return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
+            tenant_id = None
+            if tenant_slug:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                if not tenant:
+                    logger.warning(
+                        f"add_rack: NetBox tenant '{tenant_slug}' not found; "
+                        f"refusing unattributed rack at site '{site_slug}'")
+                    return {"status": "ERROR",
+                            "message": f"NetBox tenant '{tenant_slug}' not found — rack not created. Check the tenant's NetBox slug mapping."}
+                tenant_id = tenant.id
             payload: Dict[str, Any] = {"name": name, "site": site.id, "u_height": u_height}
             if facility_id:
                 payload["facility_id"] = facility_id
+            if tenant_id is not None:
+                payload["tenant"] = tenant_id
             rack = self.nb.dcim.racks.create(**payload)
             return {"status": "SUCCESS", "rack_id": rack.id, "name": name}
         except Exception as e:
@@ -282,8 +301,11 @@ class DcimMixin:
 
     def update_rack(self, rack_id: int, name: Optional[str] = None,
                     u_height: Optional[int] = None,
-                    facility_id: Optional[str] = None) -> Dict[str, Any]:
-        """Edit a rack's name/u_height/facility_id."""
+                    facility_id: Optional[str] = None,
+                    tenant_slug: Optional[str] = None) -> Dict[str, Any]:
+        """Edit a rack's name/u_height/facility_id (and re-attribute tenant when
+        ``tenant_slug`` is supplied). A ``None`` tenant_slug leaves the existing
+        tenant untouched — so an edit that doesn't send a tenant preserves it."""
         try:
             rack = self.nb.dcim.racks.get(rack_id)
             if not rack:
@@ -294,6 +316,12 @@ class DcimMixin:
                 rack.u_height = u_height
             if facility_id is not None:
                 rack.facility_id = facility_id
+            if tenant_slug is not None:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug) if tenant_slug else None
+                if tenant_slug and not tenant:
+                    return {"status": "ERROR",
+                            "message": f"NetBox tenant '{tenant_slug}' not found — rack not updated."}
+                rack.tenant = tenant.id if tenant else None
             rack.save()
             return {"status": "SUCCESS", "id": rack.id, "name": rack.name}
         except Exception as e:

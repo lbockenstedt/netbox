@@ -571,6 +571,7 @@ class NetboxSpoke(BaseSpoke):
                 site_slug=data.get("site", ""),
                 u_height=int(data.get("u_height", 42)),
                 facility_id=data.get("facility_id"),
+                tenant_slug=data.get("tenant"),
             )
 
         if normalized == "NETBOX_UPDATE_RACK":
@@ -580,6 +581,7 @@ class NetboxSpoke(BaseSpoke):
                 name=data.get("name"),
                 u_height=int(data["u_height"]) if data.get("u_height") not in (None, "") else None,
                 facility_id=data.get("facility_id"),
+                tenant_slug=data.get("tenant"),
             )
 
         if normalized == "NETBOX_DELETE_RACK":
