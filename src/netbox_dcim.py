@@ -86,6 +86,118 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
+    @staticmethod
+    def _name_of(obj) -> str:
+        """Read a .name from a NetBox nested object that may be a pynetbox
+        Record (attribute access) or a plain dict (REST JSON)."""
+        if obj is None:
+            return ""
+        if isinstance(obj, dict):
+            return obj.get("name") or ""
+        return getattr(obj, "name", "") or ""
+
+    def _elev_devsum(self, d) -> Optional[Dict[str, Any]]:
+        """Flatten a nested NetBox device (from the elevation unit list or the
+        rack's device list) into the summary the WebUI elevation view renders:
+        name/model/u_height/role(+color)/status/primary_ip/tenant/face."""
+        if not d:
+            return None
+        dt = d.get("device_type") or {}
+        role = d.get("role") or {}
+        status = d.get("status") or {}
+        tenant = d.get("tenant") or {}
+        primary_ip = d.get("primary_ip") or d.get("primary_ip4") or {}
+        try:
+            u_h = int(dt.get("u_height") or 1)
+        except (TypeError, ValueError):
+            u_h = 1
+        return {
+            "id": d.get("id"),
+            "name": d.get("name") or "",
+            "display": d.get("display") or d.get("name") or "",
+            "model": dt.get("display") or dt.get("model") or "",
+            "u_height": u_h,
+            "role": role.get("name") or "",
+            "role_color": (role.get("color") or "9e9e9e") if isinstance(role, dict) else "9e9e9e",
+            "status": status.get("value") if isinstance(status, dict) else str(status or ""),
+            "status_label": status.get("label") if isinstance(status, dict) else "",
+            "primary_ip": primary_ip.get("address") if isinstance(primary_ip, dict) else "",
+            "tenant": tenant.get("name") if isinstance(tenant, dict) else "",
+            "face": d.get("face"),
+        }
+
+    def get_rack_elevation(self, rack_id: int) -> Dict[str, Any]:
+        """Return a render-ready rack elevation (front + rear faces) for the
+        WebUI "View" button — mirrors NetBox's rack-elevation view.
+
+        Uses NetBox's ``/api/dcim/racks/{id}/elevation/?face=front|rear``
+        endpoint, which yields one entry per RU top→bottom (U=N at the top),
+        each carrying the device occupying that unit (or null). A multi-U
+        device appears in consecutive units; the WebUI merges consecutive
+        same-device units into one rowspan cell. 0U / side devices (PDUs etc.,
+        position null/0 — never in the unit list) are returned separately in
+        ``zero_u``. Device summaries carry the role ``color`` so slots are
+        tinted like NetBox."""
+        try:
+            rack = self.nb.dcim.racks.get(int(rack_id))
+            if not rack:
+                return {"status": "ERROR", "message": f"Rack {rack_id} not found"}
+            try:
+                u_height = int(getattr(rack, "u_height", 0) or 0)
+            except (TypeError, ValueError):
+                u_height = 0
+            rack_meta = {
+                "id": getattr(rack, "id", int(rack_id)),
+                "name": getattr(rack, "name", "") or "",
+                "u_height": u_height,
+                "site": self._name_of(getattr(rack, "site", None)),
+                "tenant": self._name_of(getattr(rack, "tenant", None)),
+            }
+
+            def _units(face: str) -> List[Dict[str, Any]]:
+                data = self._api_get(f"/api/dcim/racks/{rack_id}/elevation/",
+                                     {"face": face})
+                # The elevation action returns a plain list; defensively accept
+                # a paginated {results: [...]} shape too.
+                if isinstance(data, dict):
+                    data = data.get("results", [])
+                out = []
+                for u in data:
+                    if not isinstance(u, dict):
+                        continue
+                    unit = u.get("id")
+                    if unit is None:
+                        try:
+                            unit = int(str(u.get("name", "")).lstrip("Uu"))
+                        except ValueError:
+                            unit = None
+                    dev = self._elev_devsum(u.get("device"))
+                    if dev is not None:
+                        dev["face"] = u.get("face") or face
+                    out.append({"unit": unit, "device": dev})
+                # Guarantee top→bottom (highest unit first) regardless of API order.
+                out.sort(key=lambda r: (r["unit"] is None, -(r["unit"] or 0)))
+                return out
+
+            front = _units("front")
+            rear = _units("rear")
+            positioned_ids = {u["device"]["id"] for u in (front + rear)
+                              if u.get("device")}
+            # 0U / side devices: position null or 0, not in the elevation units.
+            all_devs = self._api_get_all("/api/dcim/devices/", {"rack_id": rack_id})
+            zero_u = []
+            for d in all_devs:
+                pos = d.get("position")
+                if (pos is None or pos == 0) and d.get("id") not in positioned_ids:
+                    ds = self._elev_devsum(d)
+                    if ds:
+                        zero_u.append(ds)
+            return {"status": "SUCCESS", "rack": rack_meta,
+                    "faces": {"front": front, "rear": rear}, "zero_u": zero_u}
+        except Exception as e:
+            logger.error("get_rack_elevation failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
     def add_device_to_rack(
         self,
         name: str,

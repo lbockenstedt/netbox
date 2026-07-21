@@ -63,6 +63,21 @@ resolves everything but writes nothing. Admin-only (button hidden for
 non-admins + both routes 403). Dep: `openpyxl` (`requirements.txt`); a missing
 dep degrades to a clear ERROR, not a spoke crash.
 
+## Rack elevation view (`DcimMixin.get_rack_elevation`)
+
+A NetBox-style front/back rack elevation, surfaced in the WebUI via the eye
+button on each rack row (IPAM → Racks). `get_rack_elevation(rack_id)` calls
+NetBox's `/api/dcim/racks/{id}/elevation/?face=front|rear` — one entry per RU,
+top→bottom (U=N at the top), multi-U devices occupying consecutive units — plus
+the rack's device list for 0U / side devices (position null/0, never in the
+unit list). It returns `{rack:{name,u_height,site,tenant},
+faces:{front,rear:[{unit,device}]}, zero_u:[…]}` with per-device summaries
+(`name`, `model`, `u_height`, `role`, role `color` for slot tinting, `status`,
+`primary_ip`, `tenant`, `face`). The WebUI merges consecutive same-device units
+into one rowspan cell. Dispatched by `NETBOX_GET_RACK_ELEVATION` (read-only,
+not a picklist mutation); non-admins are ownership-gated against their tenant's
+racks cache at the hub route, admins bypass.
+
 ## Proxmox VMID ranges & custom validators (`install.sh`)
 
 `install.sh` idempotently provisions two integer custom fields on

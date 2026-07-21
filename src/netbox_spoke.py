@@ -626,6 +626,14 @@ class NetboxSpoke(BaseSpoke):
         if normalized == "NETBOX_GET_DEVICE_FORM_OPTIONS":
             return await self._run_picklist("GET_DEVICE_FORM_OPTIONS", self.engine.get_device_form_options)
 
+        if normalized == "NETBOX_GET_RACK_ELEVATION":
+            # WebUI "View" rack-elevation button (IPAM → Racks). Read-only
+            # render model (front+rear unit lists + 0U tray) — NOT a picklist
+            # mutation. _run_sync offloads the 3 NetBox GETs (rack + 2 faces
+            # + device list) to a thread.
+            return await self._run_sync(self.engine.get_rack_elevation,
+                                        int(data.get("rack_id", 0)))
+
         if normalized == "NETBOX_CLAIM_DEVICE":
             return await self._run_sync(
                 self.engine.claim_device,
