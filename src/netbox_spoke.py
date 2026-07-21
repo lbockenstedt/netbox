@@ -861,7 +861,9 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_SEARCH":
             return await self._run_sync(self.engine.search,
-                                        query=data.get("q", ""), tenant=data.get("tenant"))
+                                        query=data.get("q", ""),
+                                        tenant=data.get("tenant"),
+                                        is_admin=bool(data.get("is_admin")))
 
         if normalized == "NETBOX_TENANT_VMID_RANGE":
             # LM hub VMID auto-allocation knob: read a tenant's

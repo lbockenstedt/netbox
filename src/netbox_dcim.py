@@ -507,71 +507,216 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
-    def search(self, query: str, tenant: Optional[str] = None) -> Dict[str, Any]:
+    def search(self, query: str, tenant: Optional[str] = None,
+               is_admin: bool = False) -> Dict[str, Any]:
         """
-        Universal search across devices, IPs, and prefixes.
-        Returns a normalised list of hits tagged with source="netbox".
+        Universal search across devices, interfaces/MACs, IPs, prefixes, racks,
+        VLANs, sites, and virtual machines. Returns a normalised list of hits
+        tagged with source="netbox" and carrying the common keys the UI groups
+        on (source/type/name/ip/mac/cluster).
+
+        Tenant scoping: a scoped caller (non-admin, or an admin viewing a
+        tenant) is restricted to its NetBox tenant PLUS the ``shared`` tenant
+        (visible to all — see memory `shared-tenant-flag-visibility`). An
+        unscoped admin sees every tenant. A non-admin with no tenant slug gets
+        nothing back (never leak another tenant's data). Each entity type is
+        fetched in its own try/except so one failing endpoint doesn't drop the
+        rest, and results are de-duped by (type, id) so the shared-OR-tenant
+        passes can't double-list.
         """
-        q = query.strip()
+        q = (query or "").strip()
         results: List[Dict] = []
+        if not q:
+            return {"status": "SUCCESS", "results": [], "count": 0}
+
+        # Tenant scoping resolution:
+        #   [slug, "shared"] → scoped caller: own tenant + shared
+        #   []               → unscoped admin: every tenant
+        #   None             → non-admin with no slug: nothing (no leak)
+        if tenant:
+            tenant_slugs: Optional[List[str]] = [tenant, "shared"]
+        elif is_admin:
+            tenant_slugs = []
+        else:
+            return {"status": "SUCCESS", "results": [], "count": 0}
+
+        def _passes():
+            # Yield one param dict per tenant slug to OR-in (shared is visible
+            # to all). Empty list → a single unscoped pass (admin only).
+            if not tenant_slugs:
+                yield {}
+            else:
+                for s in tenant_slugs:
+                    yield {"tenant": s}
+
+        seen: set = set()
+
+        def _add(r: Dict):
+            key = (r.get("type"), r.get("id"))
+            if key in seen:
+                return
+            seen.add(key)
+            results.append(r)
+
+        _MAC_RE = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
+        is_mac = bool(_MAC_RE.match(q))
+
+        # ── Devices (name / serial / asset / primary IP) ───────────────────────
         try:
-            # Device search
-            dev_params: Dict = {"q": q, "limit": 20}
-            if tenant:
-                dev_params["tenant"] = tenant
-            for d in self._api_get("/api/dcim/devices/", dev_params).get("results", []):
-                status = d.get("status") or {}
-                results.append({
-                    "source":      "netbox",
-                    "type":        "device",
-                    "id":          d["id"],
-                    "name":        d.get("name") or "",
-                    "status":      status.get("value", "") if isinstance(status, dict) else str(status),
-                    "primary_ip":  d["primary_ip"]["address"] if d.get("primary_ip") else "",
-                    "site":        d["site"]["name"] if d.get("site") else "",
-                    "rack":        d["rack"]["name"] if d.get("rack") else "",
-                    "role":        d["role"]["name"] if d.get("role") else "",
-                    "device_type": d["device_type"]["display"] if d.get("device_type") else "",
-                    "url":         f"/dcim/devices/{d['id']}/",
-                })
+            for tp in _passes():
+                for d in self._api_get("/api/dcim/devices/",
+                                       {"q": q, "limit": 30, **tp}).get("results", []):
+                    status = d.get("status") or {}
+                    _add({
+                        "source":      "netbox",
+                        "type":        "device",
+                        "id":          d["id"],
+                        "name":        d.get("name") or "",
+                        "ip":          d["primary_ip"]["address"] if d.get("primary_ip") else "",
+                        "mac":         "",
+                        "status":      status.get("value", "") if isinstance(status, dict) else str(status),
+                        "site":        d["site"]["name"] if d.get("site") else "",
+                        "rack":        d["rack"]["name"] if d.get("rack") else "",
+                        "role":        d["role"]["name"] if d.get("role") else "",
+                        "device_type": d["device_type"]["display"] if d.get("device_type") else "",
+                        "url":         f"/dcim/devices/{d['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search devices failed: {e}")
 
-            # IP address search
-            ip_params: Dict = {"q": q, "limit": 20}
-            if tenant:
-                ip_params["tenant"] = tenant
-            for ip in self._api_get("/api/ipam/ip-addresses/", ip_params).get("results", []):
-                status = ip.get("status") or {}
-                ao = ip.get("assigned_object")
-                results.append({
-                    "source":      "netbox",
-                    "type":        "ip",
-                    "id":          ip["id"],
-                    "name":        ip.get("address") or "",
-                    "dns_name":    ip.get("dns_name") or "",
-                    "status":      status.get("value", "") if isinstance(status, dict) else str(status),
-                    "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
-                    "url":         f"/ipam/ip-addresses/{ip['id']}/",
-                })
+        # ── Interfaces by MAC → owning device (MAC search) ─────────────────────
+        if is_mac:
+            try:
+                for iface in self._api_get(
+                        "/api/dcim/interfaces/",
+                        {"mac_address": q, "limit": 50}).get("results", []):
+                    dev = iface.get("device") or {}
+                    _add({
+                        "source": "netbox",
+                        "type":   "device",
+                        "id":     dev.get("id"),
+                        "name":   dev.get("display") or dev.get("name") or "",
+                        "ip":     "",
+                        "mac":    q,
+                        "site":   "",
+                        "rack":   "",
+                        "url":    f"/dcim/devices/{dev.get('id')}/" if dev.get("id") else "",
+                        "match":  f"interface {iface.get('name', '')}",
+                    })
+            except Exception as e:
+                logger.error(f"NetBox search interfaces-by-mac failed: {e}")
 
-            # Prefix search
-            pre_params: Dict = {"q": q, "limit": 10}
-            if tenant:
-                pre_params["tenant"] = tenant
-            for pre in self._api_get("/api/ipam/prefixes/", pre_params).get("results", []):
-                status = pre.get("status") or {}
-                results.append({
-                    "source":  "netbox",
-                    "type":    "prefix",
-                    "id":      pre["id"],
-                    "name":    pre.get("prefix") or "",
-                    "status":  status.get("value", "") if isinstance(status, dict) else str(status),
-                    "site":    pre["site"]["name"] if pre.get("site") else "",
-                    "vrf":     pre["vrf"]["name"] if pre.get("vrf") else "",
-                    "url":     f"/ipam/prefixes/{pre['id']}/",
+        # ── IP addresses (address / dns_name; MAC via cf_mac_address) ──────────
+        try:
+            base: Dict = {"cf_mac_address": q, "limit": 30} if is_mac else {"q": q, "limit": 30}
+            for tp in _passes():
+                for ip in self._api_get("/api/ipam/ip-addresses/",
+                                        {**base, **tp}).get("results", []):
+                    status = ip.get("status") or {}
+                    ao = ip.get("assigned_object")
+                    cf = ip.get("custom_fields") or {}
+                    _add({
+                        "source":      "netbox",
+                        "type":        "ip",
+                        "id":          ip["id"],
+                        "name":        ip.get("address") or "",
+                        "ip":          ip.get("address") or "",
+                        "mac":         cf.get("mac_address") or "",
+                        "dns_name":    ip.get("dns_name") or "",
+                        "status":      status.get("value", "") if isinstance(status, dict) else str(status),
+                        "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
+                        "url":         f"/ipam/ip-addresses/{ip['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search ip-addresses failed: {e}")
+
+        # ── Prefixes ───────────────────────────────────────────────────────────
+        try:
+            for tp in _passes():
+                for pre in self._api_get("/api/ipam/prefixes/",
+                                         {"q": q, "limit": 15, **tp}).get("results", []):
+                    status = pre.get("status") or {}
+                    _add({
+                        "source": "netbox",
+                        "type":   "prefix",
+                        "id":     pre["id"],
+                        "name":   pre.get("prefix") or "",
+                        "ip":     pre.get("prefix") or "",
+                        "status": status.get("value", "") if isinstance(status, dict) else str(status),
+                        "site":   pre["site"]["name"] if pre.get("site") else "",
+                        "vrf":    pre["vrf"]["name"] if pre.get("vrf") else "",
+                        "url":    f"/ipam/prefixes/{pre['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search prefixes failed: {e}")
+
+        # ── Racks ──────────────────────────────────────────────────────────────
+        try:
+            for tp in _passes():
+                for rk in self._api_get("/api/dcim/racks/",
+                                        {"q": q, "limit": 20, **tp}).get("results", []):
+                    _add({
+                        "source":   "netbox",
+                        "type":     "rack",
+                        "id":       rk["id"],
+                        "name":     rk.get("name") or "",
+                        "site":     rk["site"]["name"] if rk.get("site") else "",
+                        "u_height": rk.get("u_height"),
+                        "url":      f"/dcim/racks/{rk['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search racks failed: {e}")
+
+        # ── VLANs ──────────────────────────────────────────────────────────────
+        try:
+            for tp in _passes():
+                for vl in self._api_get("/api/ipam/vlans/",
+                                        {"q": q, "limit": 20, **tp}).get("results", []):
+                    _add({
+                        "source": "netbox",
+                        "type":   "vlan",
+                        "id":     vl["id"],
+                        "name":   vl.get("name") or "",
+                        "vid":    vl.get("vid"),
+                        "site":   vl["site"]["name"] if vl.get("site") else "",
+                        "url":    f"/ipam/vlans/{vl['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search vlans failed: {e}")
+
+        # ── Sites (physical locations — not tenant-sensitive) ──────────────────
+        try:
+            for s in self._api_get("/api/dcim/sites/", {"q": q, "limit": 20}).get("results", []):
+                _add({
+                    "source": "netbox",
+                    "type":   "site",
+                    "id":     s["id"],
+                    "name":   s.get("name") or "",
+                    "slug":   s.get("slug") or "",
+                    "url":    f"/dcim/sites/{s['id']}/",
                 })
         except Exception as e:
-            logger.error(f"NetBox search failed: {e}")
-            return {"status": "ERROR", "message": str(e), "results": []}
+            logger.error(f"NetBox search sites failed: {e}")
+
+        # ── Virtual machines (cluster) ─────────────────────────────────────────
+        try:
+            for tp in _passes():
+                for vm in self._api_get("/api/virtualization/virtual-machines/",
+                                        {"q": q, "limit": 30, **tp}).get("results", []):
+                    cl = vm.get("cluster") or {}
+                    vstatus = vm.get("status") or {}
+                    _add({
+                        "source":  "netbox",
+                        "type":    "vm",
+                        "id":      vm["id"],
+                        "name":    vm.get("name") or "",
+                        "cluster": cl.get("name") or "",
+                        "status":  vstatus.get("label", "") if isinstance(vstatus, dict) else str(vstatus),
+                        "site":    vm["site"]["name"] if vm.get("site") else "",
+                        "url":     f"/virtualization/virtual-machines/{vm['id']}/",
+                    })
+        except Exception as e:
+            logger.error(f"NetBox search virtual-machines failed: {e}")
 
         return {"status": "SUCCESS", "results": results, "count": len(results)}
 
