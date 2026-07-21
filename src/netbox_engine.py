@@ -76,6 +76,10 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
     # a few minutes. Override via LM_NETBOX_REF_TTL for testing.
     import os as _os
     _ref_cache_ttl = float(_os.environ.get("LM_NETBOX_REF_TTL", "300") or 300)
+    # Negative-cache TTL: a "not found" (None) is held only a few seconds so a
+    # newly-created site/role resolves on the next sync tick instead of being
+    # pinned as missing for the full positive TTL.
+    _ref_cache_neg_ttl = float(_os.environ.get("LM_NETBOX_REF_NEG_TTL", "5") or 5)
 
     def __init__(self, url: str, token: str, verify_ssl: bool = True):
         self.url = url
@@ -108,19 +112,28 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
 
         ``kind`` namespaces the key ("site", "device_role"); ``fetch`` is a
         zero-arg callable that performs the actual ``self.nb`` lookup on a miss.
-        A ``None`` result (slug not found) is cached too, so a fleet of devices
-        pointing at a bogus slug doesn't re-hit the API once per device. TTL-only
-        expiry — there is no site/role mutation command to invalidate against.
-        Best-effort: on fetch error, returns None without caching (so a
-        transient API blip retries next call)."""
+        A successful (non-None) lookup is cached for the full ``_ref_cache_ttl``.
+        A ``None`` result (slug not found) is cached only VERY briefly
+        (``_ref_cache_neg_ttl``, a few seconds): that still absorbs a burst of a
+        fleet of devices pointing at a bogus slug within one sync, but does NOT
+        pin the miss for 5 min — so once the missing site/role is created in
+        NetBox, the very next sync tick re-resolves it instead of failing for up
+        to the full TTL. TTL-only expiry (there is no site/role mutation command
+        to invalidate against). Best-effort: on fetch error, returns None
+        without caching (so a transient API blip retries next call)."""
         import time as _time
         key = f"{kind}:{(slug or '').strip().lower()}"
         entry = getattr(self, "_ref_cache", None)
         if entry is None:  # defensive: pre-__init__ / reconnect race
             self._ref_cache = entry = {}
         hit = entry.get(key)
-        if hit is not None and (_time.time() - hit["ts"]) < self._ref_cache_ttl:
-            return hit["value"]
+        if hit is not None:
+            # Negative (None) entries expire fast so a freshly-created object is
+            # picked up next tick; positive entries live the full TTL.
+            ttl = (self._ref_cache_neg_ttl if hit["value"] is None
+                   else self._ref_cache_ttl)
+            if (_time.time() - hit["ts"]) < ttl:
+                return hit["value"]
         try:
             value = fetch()
         except Exception as e:  # noqa: BLE001 — don't poison cache on transient error

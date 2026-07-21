@@ -60,6 +60,15 @@ class VmSyncMixin:
     # provision exactly the same set. (name, type, label, content_type).
     _REQUIRED_CUSTOM_FIELDS = CUSTOM_FIELDS_SPEC
 
+    # How long a clean custom-field verify is trusted before the idempotent
+    # ensure re-runs. Bounds self-heal latency if a field is deleted in NetBox
+    # after the flag was set (was once-per-process → never re-verified until a
+    # process restart). The ensure is cheap (one list-all), so a modest window
+    # is fine. Override via LM_NETBOX_CF_ENSURE_TTL (seconds).
+    import os as _os
+    _CF_ENSURE_TTL = float(_os.environ.get("LM_NETBOX_CF_ENSURE_TTL", "900") or 900)
+    del _os
+
     def _cf_types_list(self, cf: Any, types_key: str) -> Any:
         """Read the attached content-type list off a custom-field record,
         tolerant of the NetBox 4.x ``content_types`` → ``object_types`` REST
@@ -136,9 +145,20 @@ class VmSyncMixin:
             "present": 0, "created": 0, "attached": 0,
             "already_attached": 0, "warnings": [],
         }
-        if not force and getattr(self, "_cf_ensured", False):
-            # Cached clean run — everything is already present+attached. Report
-            # it as such rather than re-hitting the API.
+        import time as _time
+        _cf_ttl = getattr(self, "_CF_ENSURE_TTL", 900.0)
+        _cf_ts = getattr(self, "_cf_ensured_ts", 0.0)
+        # A set flag with no timestamp (ts == 0) means "trust the flag" — the
+        # clean-run branch below always co-sets flag + ts, so in real runs a set
+        # flag carries a real ts and the TTL bounds the skip window; ts == 0 only
+        # arises from an externally-set flag.
+        _cf_fresh = _cf_ts == 0.0 or (_time.time() - _cf_ts) < _cf_ttl
+        if not force and getattr(self, "_cf_ensured", False) and _cf_fresh:
+            # Recent clean run (within _CF_ENSURE_TTL) — everything was present+
+            # attached. Report it as such rather than re-hitting the API. The
+            # TTL bound means the idempotent verify still re-runs periodically,
+            # so a custom field later deleted in NetBox self-heals on the next
+            # sync past the window instead of 400ing forever until restart.
             report["already_attached"] = report["total"]
             report["present"] = report["total"]
             return report
@@ -219,8 +239,10 @@ class VmSyncMixin:
         if had_failure:
             report["status"] = "PARTIAL"
             self._cf_ensured = False  # retry next sync
+            self._cf_ensured_ts = 0.0
         else:
             self._cf_ensured = True
+            self._cf_ensured_ts = _time.time()  # bound the skip window
         return report
 
     @staticmethod
@@ -563,8 +585,14 @@ class VmSyncMixin:
             try:
                 t = self.nb.tenancy.tenants.get(slug=canon)
             except Exception as e:
+                # Transient API error — do NOT cache. Caching this None would
+                # mislabel every subsequent VM with the same slug as unassigned
+                # for the rest of the run. Return None (unassigned for THIS VM)
+                # and retry the lookup on the next VM.
                 logger.debug("sync_vms: resolve tenant %s failed: %s", s, e)
-                t = None
+                return None
+            # Confirmed result (found, or a genuine "no such tenant" None) — safe
+            # to memoize for the run.
             tenant_cache[s] = t
             return t
 
@@ -664,7 +692,13 @@ class VmSyncMixin:
                         cluster_id = cluster_cache[cname]
                     else:
                         cluster_id = self._ensure_vm_cluster(cname, tenant)
-                        cluster_cache[cname] = cluster_id
+                        # _ensure_vm_cluster auto-creates on a genuine miss, so a
+                        # None here means an API error (or empty name), NOT a
+                        # confirmed "no cluster". Don't cache it — caching would
+                        # strand every later VM in this cluster as cluster-less
+                        # for the rest of the run; leave it uncached to retry.
+                        if cluster_id is not None:
+                            cluster_cache[cname] = cluster_id
                     name = str(vm.get("name") or "").strip() or f"vm-{vm.get('vmid') or uid}"
                     status = self._vm_status_map(vm.get("status"))
                     vcpus = int(vm.get("vcpus") or 0)

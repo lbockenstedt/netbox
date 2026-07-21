@@ -15,6 +15,16 @@ class StalenessMixin:
     # hand-managed inventory (a human-created device/VM the syncs never touched
     # has no last_seen, so the sweep can't age it out). Only objects the syncs
     # stamped (every detection writes last_seen) are eligible.
+
+    # Global safety floor: if the owned set is at least this large AND NOTHING
+    # in it was seen within ``stale_days``, treat the discovery feed as stalled
+    # (not the whole fleet as genuinely dead) and refuse to decommission/delete
+    # anything that run. A tiny fleet (< floor) is exempt so a couple of truly
+    # dead objects can still be cleaned. Override via LM_NETBOX_STALENESS_FLOOR.
+    import os as _os
+    _STALENESS_MIN_FLEET = int(
+        _os.environ.get("LM_NETBOX_STALENESS_FLOOR", "3") or 3)
+    del _os
     @staticmethod
     def _parse_iso_cf(ts: str) -> Optional[datetime]:
         """Parse a ``last_seen``/``decommissioned_at`` CF timestamp (ISO, Z or
@@ -82,13 +92,65 @@ class StalenessMixin:
             cutoff_stale = float(stale_days)
             cutoff_delete = float(delete_days)
 
-            # ── devices (cluster-wide, no tenant scope) ──
+            # Fetch every owned object list UP FRONT so we can evaluate a global
+            # safety floor before taking any destructive action.
             try:
                 dev_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
             except Exception as e:
                 return {"status": "ERROR", "message": f"failed to list devices: {e}",
                         "scanned": 0, "decommissioned": 0, "deleted": 0,
                         "ip_freed": 0, "errors": 0, "per_tenant": per_tenant}
+            try:
+                vm_rows = self._api_get_all("/api/virtualization/virtual-machines/",
+                                            {"limit": 500})
+            except Exception as e:
+                logger.warning("staleness_sweep: list VMs failed: %s", e)
+                vm_rows = []
+            try:
+                ip_rows = self._api_get_all("/api/ipam/ip-addresses/", {"limit": 500})
+            except Exception as e:
+                logger.warning("staleness_sweep: list IPs failed: %s", e)
+                ip_rows = []
+
+            # ── GLOBAL SAFETY FLOOR ──
+            # A stalled discovery feed makes the ENTIRE owned fleet age past
+            # stale_days at once — which would otherwise decommission then delete
+            # everything we own. Require that at least ONE owned object was seen
+            # recently (within stale_days): if nothing is fresh and the fleet is
+            # non-trivial, the feed is down, not the fleet. Count sync-owned
+            # objects (carry last_seen; VMs also require proxmox_unique_id) and
+            # how many are fresh.
+            owned_total = 0
+            fresh_count = 0
+
+            def _tally(rows, require_uid):
+                nonlocal owned_total, fresh_count
+                for r in rows:
+                    rcf = r.get("custom_fields") or {}
+                    if require_uid and not str(
+                            rcf.get("proxmox_unique_id") or "").strip():
+                        continue
+                    rls = str(rcf.get("last_seen") or "").strip()
+                    if not rls:
+                        continue
+                    owned_total += 1
+                    a = _age_days(rls)
+                    if a is not None and a < cutoff_stale:
+                        fresh_count += 1
+
+            _tally(dev_rows, False)
+            _tally(vm_rows, True)
+            _tally(ip_rows, False)
+            if owned_total >= self._STALENESS_MIN_FLEET and fresh_count == 0:
+                msg = (f"ABORTED: none of {owned_total} owned object(s) seen "
+                       f"within {stale_days}d — discovery feed appears stalled; "
+                       f"refusing to decommission/delete the entire owned fleet")
+                logger.error("staleness_sweep: %s", msg)
+                return {"status": "ABORTED", "scanned": owned_total,
+                        "decommissioned": 0, "deleted": 0, "ip_freed": 0,
+                        "errors": 0, "message": msg, "per_tenant": per_tenant}
+
+            # ── devices (cluster-wide, no tenant scope) ──
             for row in dev_rows:
                 cf = row.get("custom_fields") or {}
                 ls = str(cf.get("last_seen") or "").strip()
@@ -152,12 +214,7 @@ class StalenessMixin:
                     logger.debug("staleness_sweep: device %s failed: %s", row["id"], e)
 
             # ── VMs (cluster-wide; only those we own via proxmox_unique_id) ──
-            try:
-                vm_rows = self._api_get_all("/api/virtualization/virtual-machines/",
-                                            {"limit": 500})
-            except Exception as e:
-                logger.warning("staleness_sweep: list VMs failed: %s", e)
-                vm_rows = []
+            # (vm_rows fetched up front for the global floor above.)
             for row in vm_rows:
                 cf = row.get("custom_fields") or {}
                 if not str(cf.get("proxmox_unique_id") or "").strip():
@@ -225,11 +282,7 @@ class StalenessMixin:
             # delete above; here we only delete IPs that are already unassigned
             # (assigned_object_id null) + carry our last_seen + aged past
             # delete_days, so an orphaned IP record releases its address.
-            try:
-                ip_rows = self._api_get_all("/api/ipam/ip-addresses/", {"limit": 500})
-            except Exception as e:
-                logger.warning("staleness_sweep: list IPs failed: %s", e)
-                ip_rows = []
+            # (ip_rows fetched up front for the global floor above.)
             for row in ip_rows:
                 cf = row.get("custom_fields") or {}
                 ls = str(cf.get("last_seen") or "").strip()

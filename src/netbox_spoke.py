@@ -248,10 +248,25 @@ class NetboxSpoke(BaseSpoke):
                 return True
             text = str(result_obj.get("text") or "")
             if "already" in text.lower() or "duplicate" in text.lower():
-                # Scope exists in Kea (e.g. pushed before a spoke restart) —
-                # that's the desired end state, not a failure.
-                logger.debug(f"KEA scope {prefix} already present: {text}")
-                return True
+                # Scope already exists in Kea — but we must NOT assume its
+                # gateway (option routers) matches what NetBox now wants. After a
+                # spoke restart `_kea_synced` is empty, so we re-add every scope;
+                # a subnet still holding an OLD gateway answers "already present"
+                # and, if we returned True here, the diff would record the
+                # DESIRED gateway as synced and never correct the stale one.
+                # Force the desired state: delete the existing subnet, then
+                # re-add it with our option-data.
+                logger.debug(f"KEA scope {prefix} already present; forcing "
+                             f"gateway to {gateway}: {text}")
+                await self._remove_scope_from_kea(prefix)
+                retry = await self._kea_cmd("subnet4-add", arguments)
+                if retry.get("result") == 0:
+                    logger.info(f"KEA re-synced scope {prefix} "
+                                f"(forced gateway {gateway})")
+                    return True
+                logger.warning(f"KEA re-add after forced del failed for "
+                               f"{prefix}: {retry.get('text')}")
+                return False
             logger.warning(f"KEA rejected scope {prefix}: {text}")
             return False
         except Exception as e:
