@@ -1,6 +1,32 @@
 # netbox
 Netbox Lab Manager Module
 
+## Seed device catalog (`src/seed_catalog.json` + `DcimMixin.seed_catalog`)
+
+A bundled **Aruba / HPE / Juniper** device-type catalog (`src/seed_catalog.json`,
+~45 models) plus `NetboxEngine.seed_catalog()` load it into NetBox in one action
+via the `NETBOX_SEED_CATALOG` command — get-or-create **manufacturers** +
+**device types** (upsert `u_height`/`is_full_depth`/`comments`, `.save()`),
+then **add-missing** interface/console/power templates (expand each model's
+`ports` spec into named templates; one `mgmt` interface with `mgmt_only=True`).
+
+- **Idempotent** — re-runs never error on an existing slug; they upsert scalars
+  and add only missing templates. Existing templates (hand-added or re-typed)
+  are never deleted/clobbered. So "edit the catalog, re-run" works for
+  *adding* models/ports; a rename or port-type *change* on an existing name is
+  a delete-that-device-type + re-seed (re-create), not an automatic migration.
+- **Admin-only** — triggered from the WebUI **Setup → Module Management →
+  "Seed catalog"** card (hidden for non-admins) → `POST /api/netbox/seed-catalog`
+  (403 for non-admins). Runs on the spoke, reusing its `NETBOX_URL`/token.
+- **Per-model error isolation** — one bad model is collected into `errors[]`
+  and doesn't abort the rest. Returns `{status, manufacturers_created,
+  device_types_created, device_types_updated, templates_added, errors[]}`.
+- Listed in `_PICKLIST_MUTATIONS` so the device-type/form-options picklist cache
+  is dropped after seeding.
+
+To extend: edit `src/seed_catalog.json`, redeploy the spoke (WebUI Update), and
+click Seed catalog again.
+
 ## Proxmox VMID ranges & custom validators (`install.sh`)
 
 `install.sh` idempotently provisions two integer custom fields on

@@ -47,6 +47,7 @@ Sync family:
 - `NETBOX_STALENESS_SWEEP` — `staleness_sweep(stale_days=7, delete_days=30)`: not seen `stale_days` → offline + `decommissioned_at`; offline + aged `delete_days` → deleted (IPs freed).
 - `NETBOX_TENANT_VMID_RANGE` — tenant `vmid_start`/`vmid_end` cf + in-use `proxmox_vmid` for hub VMID auto-allocation.
 - `NETBOX_PROVISION_CUSTOM_FIELDS` — `force=True` re-run of `_ensure_custom_fields` (WebUI "Apply schema changes" button).
+- `NETBOX_SEED_CATALOG` — `seed_catalog()`: load the bundled Aruba/HPE/Juniper device-type catalog (`src/seed_catalog.json`) — get-or-create manufacturers + device types (upsert scalars), add-missing interface/console/power templates. Idempotent; admin-only (WebUI Setup → Module Management → "Seed catalog"). In `_PICKLIST_MUTATIONS` (drops the picklist cache).
 
 Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 
@@ -54,7 +55,7 @@ Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 
 `src/netbox_engine.py` (thin composition class — `NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, TenancyMixin)`; owns the pynetbox client, `_apply_auth`, the module-level HTTP semaphore, and the single-page/paginated GET helpers `_api_get`/`_api_get_all`). The sync/DCIM/IPAM logic lives in the mixin modules it composes:
 
-- `src/netbox_dcim.py` (`DcimMixin`) — sites, racks, devices, `update_device_ip`, form-options picklists.
+- `src/netbox_dcim.py` (`DcimMixin`) — sites, racks, devices, `update_device_ip`, form-options picklists, `seed_catalog()` (loads `src/seed_catalog.json`).
 - `src/netbox_ipam.py` (`IpamMixin`) — prefixes, IPs, `find_available_prefixes`, `claim_prefix`, allocate/release.
 - `src/netbox_vmsync.py` (`VmSyncMixin`) — `sync_vms`, `_ensure_custom_fields`, `_assign_vm_primary_ip4`, `get_tenant_vmid_range`, `create_vm_entry`.
 - `src/netbox_sync.py` (`SyncMixin`) — `sync_devices`, `sync_nw_device`, `sync_access_tracker`.
@@ -98,6 +99,7 @@ Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
 - **Let discovery fill in devices/VMs for you.** You generally don't add devices/VMs by hand for anything that's already visible to the firewall, a switch, Proxmox, or NAC — those show up in IPAM on their own via the sync loops described above. Manual add/claim (`NETBOX_ADD_DEVICE`/`NETBOX_CLAIM_DEVICE`, etc.) is for inventory nothing else can see yet.
 - **Allocate a prefix or IP.** IPAM → Prefixes/IPs → allocate; you can search for available space within a parent block or claim a specific prefix/IP directly.
 - **Force a staleness sweep or check why something is offline.** The staleness sweep normally runs on the hub's own schedule; if you need to check sooner, look at a device/VM's `last_seen` value — anything older than the configured stale-days threshold will show (or shortly become) offline.
+- **Seed the device-type catalog (admin).** Setup → Module Management → **Seed catalog** loads the bundled Aruba/HPE/Juniper manufacturers + device types + interface/console/power templates. Idempotent (re-runs upsert scalars + add-missing templates, never delete/re-type). To add/amend a model, edit `src/seed_catalog.json`, redeploy the spoke, and click again. Renames/port-type changes on an existing name = delete that device type in NetBox + re-seed (re-create).
 
 ## Troubleshooting / common questions
 

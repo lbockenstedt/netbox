@@ -1,9 +1,16 @@
 """DCIM sites/racks/devices + health + universal search methods for NetboxEngine."""
 import ipaddress
+import json
 import logging
+import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")
+
+# Bundled Aruba/HPE/Juniper device-type catalog loaded by seed_catalog(). Lives
+# next to this module so the spoke ships it without an extra install step.
+_SEED_CATALOG_PATH = Path(__file__).parent / "seed_catalog.json"
 
 
 class DcimMixin:
@@ -427,3 +434,180 @@ class DcimMixin:
             return {"status": "ERROR", "message": str(e), "results": []}
 
         return {"status": "SUCCESS", "results": results, "count": len(results)}
+
+    # ─── Catalog seed (device types + templates) ──────────────────────────────
+
+    @staticmethod
+    def _slugify(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
+
+    def _load_seed_catalog(self) -> Dict[str, Any]:
+        """Load and cache the bundled seed_catalog.json (next to this module)."""
+        cat = getattr(self, "_seed_catalog_cache", None)
+        if cat is None:
+            with open(_SEED_CATALOG_PATH) as f:
+                cat = json.load(f)
+            self._seed_catalog_cache = cat
+        return cat
+
+    def _seed_manufacturer(self, name: str, cache: Dict[str, Any]):
+        """Get-or-create a manufacturer by slug. Returns (record, created)."""
+        slug = self._slugify(name)
+        if slug in cache:
+            return cache[slug], False
+        try:
+            mfr = self.nb.dcim.manufacturers.get(slug=slug)
+        except Exception:  # noqa: BLE001
+            mfr = None
+        created = False
+        if not mfr:
+            mfr = self.nb.dcim.manufacturers.create(name=name, slug=slug)
+            created = True
+        cache[slug] = mfr
+        return mfr, created
+
+    def _seed_device_type(self, t: Dict[str, Any], mfr) -> tuple:
+        """Get-or-create a device type; upsert scalar fields on an existing one.
+        Returns (record, created, updated)."""
+        slug = t["slug"]
+        try:
+            dt = self.nb.dcim.device_types.get(slug=slug)
+        except Exception:  # noqa: BLE001
+            dt = None
+        u = int(t.get("u_height", 1))
+        full = bool(t.get("is_full_depth", True))
+        comments = t.get("comments", "") or ""
+        if dt is None:
+            dt = self.nb.dcim.device_types.create(
+                model=t["model"], slug=slug, manufacturer=mfr.id,
+                u_height=u, is_full_depth=full, comments=comments)
+            return dt, True, False
+        # Existing → upsert scalars (templates reconciled separately, add-missing)
+        changed = False
+        if u != int(getattr(dt, "u_height", 0) or 0):
+            dt.u_height = u
+            changed = True
+        if full != bool(getattr(dt, "is_full_depth", False)):
+            dt.is_full_depth = full
+            changed = True
+        if comments != (getattr(dt, "comments", "") or ""):
+            dt.comments = comments
+            changed = True
+        if changed:
+            try:
+                dt.save()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("seed_catalog: %s scalar save failed: %s", slug, e)
+                changed = False
+        return dt, False, changed
+
+    def _seed_templates(self, dt, t: Dict[str, Any]) -> int:
+        """Add-missing interface/console/power templates for a device type.
+        Non-destructive: never deletes or re-types existing templates (so
+        hand-added ports and already-instantiated devices are safe). Returns
+        the number of templates created this run."""
+        added = 0
+        try:
+            existing_ifaces = {r.name for r in
+                               self.nb.dcim.interface_templates.filter(device_type=dt.id)}
+        except Exception:  # noqa: BLE001
+            existing_ifaces = set()
+        try:
+            existing_console = {r.name for r in
+                                self.nb.dcim.console_port_templates.filter(device_type=dt.id)}
+        except Exception:  # noqa: BLE001
+            existing_console = set()
+        try:
+            existing_power = {r.name for r in
+                              self.nb.dcim.power_port_templates.filter(device_type=dt.id)}
+        except Exception:  # noqa: BLE001
+            existing_power = set()
+
+        def _add_iface(name, itype, mgmt_only=False):
+            nonlocal added
+            if name in existing_ifaces:
+                return
+            self.nb.dcim.interface_templates.create(
+                device_type=dt.id, name=name, type=itype, mgmt_only=mgmt_only)
+            existing_ifaces.add(name)
+            added += 1
+
+        for p in t.get("ports", []) or []:
+            prefix = p.get("prefix", "")
+            itype = p.get("type", "1000base-t")
+            start = int(p.get("start", 1))
+            for i in range(int(p.get("count", 0))):
+                _add_iface(f"{prefix}{start + i}", itype)
+        mg = t.get("mgmt")
+        if mg:
+            _add_iface(mg.get("name", "mgmt"), mg.get("type", "1000base-t"), mgmt_only=True)
+        con = t.get("console")
+        if con:
+            cn = con.get("name", "Console")
+            if cn not in existing_console:
+                self.nb.dcim.console_port_templates.create(
+                    device_type=dt.id, name=cn, type=con.get("type", "rj-45"))
+                existing_console.add(cn)
+                added += 1
+        for pw in t.get("power", []) or []:
+            pn = pw.get("name", "PSU1")
+            if pn not in existing_power:
+                self.nb.dcim.power_port_templates.create(
+                    device_type=dt.id, name=pn, type=pw.get("type", "iec-60320-c14"))
+                existing_power.add(pn)
+                added += 1
+        return added
+
+    def seed_catalog(self) -> Dict[str, Any]:
+        """Seed NetBox with the bundled Aruba/HPE/Juniper device-type catalog
+        (manufacturers + device types + interface/console/power templates).
+
+        Idempotent UPSERT — re-runs never error on an existing type:
+        - Manufacturers: get-or-create by slug.
+        - Device types: create if missing; else upsert u_height/is_full_depth/
+          comments (count ``device_types_updated``).
+        - Templates: ADD-MISSING only — fetch the type's existing
+          interface/console/power template names once, then create each catalog
+          template whose name isn't already present. Never deletes or re-types
+          existing templates, so hand-added ports and instantiated devices are
+          safe. ``templates_added`` counts this run's creates.
+
+        Per-model try/except so one bad model doesn't abort the rest.
+        Returns ``{status, manufacturers_created, device_types_created,
+        device_types_updated, templates_added, errors}``."""
+        try:
+            catalog = self._load_seed_catalog()
+            types = catalog.get("device_types") or []
+            mfrs_created = types_created = types_updated = tpl_added = 0
+            errors: List[str] = []
+            mfr_cache: Dict[str, Any] = {}
+            for t in types:
+                slug = t.get("slug", "?")
+                try:
+                    mfr, mfr_created = self._seed_manufacturer(t.get("manufacturer", ""), mfr_cache)
+                    if mfr is None:
+                        errors.append(f"{slug}: manufacturer unresolved")
+                        continue
+                    if mfr_created:
+                        mfrs_created += 1
+                    dt, created, updated = self._seed_device_type(t, mfr)
+                    if created:
+                        types_created += 1
+                    elif updated:
+                        types_updated += 1
+                    n = self._seed_templates(dt, t)
+                    tpl_added += n
+                    action = "created" if created else ("updated" if updated else "ok")
+                    logger.info("seed_catalog: %s %s (+%d templates)", slug, action, n)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("seed_catalog: %s failed: %s", slug, e)
+                    errors.append(f"{slug}: {e}")
+            return {"status": "SUCCESS",
+                    "manufacturers_created": mfrs_created,
+                    "device_types_created": types_created,
+                    "device_types_updated": types_updated,
+                    "templates_added": tpl_added,
+                    "errors": errors}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("seed_catalog failed")
+            return {"status": "ERROR", "message": str(e)}

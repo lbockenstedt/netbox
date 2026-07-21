@@ -349,7 +349,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
-        "NETBOX_MIGRATE_TENANT",
+        "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -852,6 +852,15 @@ class NetboxSpoke(BaseSpoke):
             # engine's report dict (status/total/present/created/attached/...).
             return await self._run_sync(self.engine._ensure_custom_fields,
                                         force=True)
+
+        if normalized == "NETBOX_SEED_CATALOG":
+            # WebUI "Seed catalog" button (Setup → Module Management). Loads the
+            # bundled Aruba/HPE/Juniper device-type catalog and idempotently
+            # upserts manufacturers + device types + interface/console/power
+            # templates (re-runs add missing templates, never delete/re-type).
+            # Long-running (45+ device types × templates) → no per-call timeout
+            # clamp; _run_sync offloads the blocking pynetbox calls to a thread.
+            return await self._run_sync(self.engine.seed_catalog)
 
         if normalized == "INSTALL_CERT":
             # Cert custodian (tiered Hub→Spoke→Agent): the SPOKE holds ALL the
