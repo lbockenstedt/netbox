@@ -151,6 +151,9 @@ class DcimMixin:
                 "name": getattr(rack, "name", "") or "",
                 "u_height": u_height,
                 "site": self._name_of(getattr(rack, "site", None)),
+                # Slug too (add_device_to_rack takes a site SLUG) so the WebUI
+                # "Add device" from the elevation view can prefill correctly.
+                "site_slug": getattr(getattr(rack, "site", None), "slug", "") or "",
                 "tenant": self._name_of(getattr(rack, "tenant", None)),
             }
 
@@ -174,6 +177,20 @@ class DcimMixin:
                     dev = self._elev_devsum(u.get("device"))
                     if dev is not None:
                         dev["face"] = u.get("face") or face
+                    # NetBox elevation can emit half-U (0.5) granularity slots. This
+                    # deployment never mounts at half-U, so drop the EMPTY half-U rows
+                    # (they render as blank ".5" filler rows) and normalize whole
+                    # units to int; keep an occupied half-U slot defensively.
+                    if unit is not None:
+                        try:
+                            uf = float(unit)
+                            if uf != int(uf):
+                                if dev is None:
+                                    continue
+                            else:
+                                unit = int(uf)
+                        except (TypeError, ValueError):
+                            pass
                     out.append({"unit": unit, "device": dev})
                 # Guarantee top→bottom (highest unit first) regardless of API order.
                 out.sort(key=lambda r: (r["unit"] is None, -(r["unit"] or 0)))
