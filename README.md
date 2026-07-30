@@ -1,6 +1,58 @@
 # netbox
 Netbox Lab Manager Module
 
+<!-- INSTALLERS:START -->
+## Installation
+
+Every installer in this repo, with every flag and environment variable it accepts.
+Installers are idempotent — re-running one updates code and preserves credentials.
+
+### NetBox (IPAM) + spoke — `install.sh`
+
+```bash
+curl -sSL https://raw.githubusercontent.com/lbockenstedt/netbox/main/install.sh \
+  | sudo bash -s -- --hub lm-hub.lrbtechnologies.com
+```
+
+Installs NetBox itself — PostgreSQL, Redis, gunicorn, nginx — **and** the LM spoke in one shot. Safe to re-run: it updates code, runs migrations and restarts services without overwriting your data.
+
+| Flag | Purpose |
+| :--- | :--- |
+| `--hub URL` | Hub WebSocket URL. A bare host is fine — `lm-hub.example.com` becomes `wss://lm-hub.example.com:443`, `host:port` gets a `wss://` prefix, and an explicit `ws://`/`wss://` is left alone. Omit it to auto-discover the hub (DNS `lm-hub.<suffix>`, then mDNS `_lm-hub._tcp.local.`). |
+| `--id`, `--name` | Pin the spoke id. Omitted, the id derives from the hostname, so a renamed clone reconnects under its new name. |
+| `--secret` | Pre-shared spoke secret. |
+| `--hub-secret` | Hub PSK for auto-approval. Without it the spoke lands in *pending approval* in the WebUI. |
+| `--all-prereqs` | Accepted and ignored — kept so the hub's install-module call doesn't abort. |
+| `--spoke-only` | Install just the LM spoke against an existing NetBox. |
+| `--infra-only` | Host-level infrastructure only — no spoke runtime. |
+| `--netbox-url` | Base URL of the NetBox instance. |
+| `--netbox-token` | NetBox API token. |
+| `--netbox-version` | NetBox version to install. |
+| `--db-pass` | PostgreSQL password. |
+| `--superuser`, `--admin-user` | NetBox superuser name. |
+| `--superpass`, `--admin-password` | Superuser password. |
+| `--supermail` | Superuser email. |
+| `--reset-admin-password PW` | Reset the superuser password and exit — no reinstall. |
+| `--netbox-sso-tenant` | Entra tenant id for SSO. |
+| `--netbox-sso-client-id` | SSO application (client) id. |
+| `--netbox-sso-client-secret` | SSO client secret. |
+| `--netbox-sso-redirect-uri` | OAuth redirect URI. |
+| `--netbox-sso-group-map` | Group→role mapping. |
+| `--netbox-sso-allowed-group` | Restrict sign-in to this group. |
+| `--provision-cert-helper` | Install the certificate helper. |
+| `--admin-token` | Deprecated (zero-touch provisioning), accepted and ignored. |
+
+**Environment overrides:** `HUB_URL` (same normalization as `--hub`), `SPOKE_ID`., `HUB_SECRET`, `NETBOX_URL`, `NETBOX_TOKEN`, `NETBOX_FQDN`, `NETBOX_IP`, `NB_SUPERPASS`, `LM_NETBOX_SSO_TENANT`, `LM_NETBOX_SSO_CLIENT_ID`, `LM_NETBOX_SSO_CLIENT_SECRET`, `LM_NETBOX_SSO_REDIRECT_URI`, `LM_NETBOX_SSO_GROUP_MAP`, `LM_NETBOX_SSO_ALLOWED_GROUP`
+
+### Kea DHCP helper — `install_kea.sh`
+
+```bash
+sudo bash install_kea.sh
+```
+
+Provisions the Kea DHCP pieces NetBox's DHCP integration depends on. No flags.
+<!-- INSTALLERS:END -->
+
 ## Seed device catalog (`src/seed_catalog.json` + `DcimMixin.seed_catalog`)
 
 A bundled **Aruba / HPE / Juniper** device-type catalog (`src/seed_catalog.json`,
