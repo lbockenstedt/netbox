@@ -157,6 +157,62 @@ class SyncMixin:
             logger.warning("ensure_device_type '%s' failed (creates will error): %s", slug, e)
             return None
 
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """Lowercase, hyphenate a human string into a NetBox slug. Empty →
+        'discovered' so a slug is never blank."""
+        import re as _re
+        s = _re.sub(r"[^a-z0-9]+", "-", str(text or "").strip().lower()).strip("-")
+        return s or "discovered"
+
+    def _ensure_manufacturer(self, name: str = ""):
+        """Get-or-create a ``dcim.manufacturer`` by name ('Unknown' when blank),
+        TTL-cached. Returns the object or None (best-effort)."""
+        name = str(name or "").strip() or "Unknown"
+        slug = self._slugify(name)
+
+        def _fetch():
+            m = self.nb.dcim.manufacturers.get(slug=slug)
+            if m:
+                return m
+            return self.nb.dcim.manufacturers.create(name=name, slug=slug)
+        try:
+            return self._cached_ref("manufacturer", slug, _fetch)
+        except Exception as e:
+            logger.warning("ensure_manufacturer '%s' failed: %s", name, e)
+            return None
+
+    def _device_type_for_model(self, model: str = "", manufacturer: str = ""):
+        """Get-or-create a ``dcim.device_type`` for a DISCOVERED model string so
+        a device lands under its REAL type (e.g. 'Aruba 2930F', 'TrueNAS Mini
+        X+') instead of the generic 'discovered' default. Keyed by a slug
+        derived from manufacturer+model (so the same model under two vendors
+        doesn't collide); ``model`` is the human string; the manufacturer (e.g.
+        the console vendor) is ensured + linked ('Unknown' when absent).
+        TTL-cached per run. Returns the device_type object, or None so the
+        caller falls back to the configured default dtype. Network hardware is
+        the source of truth — a feeder that learns the model (console identify,
+        nw poll, ClearPass profile) upgrades the device off the generic type."""
+        model = str(model or "").strip()
+        if not model:
+            return None
+        mfr_name = str(manufacturer or "").strip()
+        slug = self._slugify(f"{mfr_name}-{model}" if mfr_name else model)
+
+        def _fetch():
+            dt = self.nb.dcim.device_types.get(slug=slug)
+            if dt:
+                return dt
+            mfr = self._ensure_manufacturer(mfr_name)
+            return self.nb.dcim.device_types.create(
+                model=model, slug=slug,
+                manufacturer=(mfr.id if mfr else None))
+        try:
+            return self._cached_ref("device_type_model", slug, _fetch)
+        except Exception as e:
+            logger.warning("device_type_for_model '%s' failed: %s", model, e)
+            return None
+
     def _resolve_site(self, slug: str = "", tenant=None):
         """Resolve a site for device creation. Configured slug first; else the
         first existing site; else AUTO-CREATE a fallback site. NetBox REQUIRES
@@ -366,6 +422,11 @@ class SyncMixin:
                 s_swname = str(dev.get("source_switch_name") or "").strip()
                 s_swip = str(dev.get("source_switch_ip") or "").strip()
                 s_swport = str(dev.get("source_switch_port") or "").strip()
+                # Discovered hardware model + manufacturer (console identify, nw
+                # poll, ClearPass profile). Used to place the device under its
+                # REAL device_type instead of the generic 'discovered' default.
+                model = str(dev.get("model") or "").strip()
+                manufacturer = str(dev.get("manufacturer") or dev.get("vendor") or "").strip()
                 if not ip and not mac:
                     if hostname and hostname.lower() != "unknown":
                         # Hostname-only record (no IP, no MAC): key by hostname so
@@ -396,6 +457,10 @@ class SyncMixin:
                     rec["switch_ip"] = s_swip
                 if s_swport:
                     rec["switch_port"] = s_swport
+                if model:
+                    rec["model"] = model
+                if manufacturer:
+                    rec["manufacturer"] = manufacturer
                 incoming[ip] = rec
 
             # Index existing tenant devices by primary IPv4 (all) + track which
@@ -764,8 +829,12 @@ class SyncMixin:
                             create_kwargs["serial"] = serial
                         if role:
                             create_kwargs["role"] = role.id
-                        if dtype:
-                            create_kwargs["device_type"] = dtype.id
+                        # Prefer a device_type resolved from the DISCOVERED model
+                        # (real hardware type) over the generic default dtype.
+                        rec_dtype = self._device_type_for_model(
+                            rec.get("model", ""), rec.get("manufacturer", "")) or dtype
+                        if rec_dtype:
+                            create_kwargs["device_type"] = rec_dtype.id
                         if site:
                             create_kwargs["site"] = site.id
                         if tenant:
@@ -998,6 +1067,14 @@ class SyncMixin:
                             "interfaces_total": len(interfaces or []), "device_id": None}
                 try:
                     dt = self.nb.dcim.device_types.get(slug=dt_slug)
+                    # Prefer the device_type resolved from the polled hardware
+                    # model (real type, e.g. 'Aruba 2930F') over the generic
+                    # default; a resolved model type also satisfies the required
+                    # device_type even when the default slug is unset/missing.
+                    model_dt = self._device_type_for_model(
+                        str(dev.get("model") or "").strip())
+                    if model_dt:
+                        dt = model_dt
                     # perf-scan D1b: role + site TTL-cached — a fleet POLL NOW
                     # otherwise re-fetches the same two slugs once per device.
                     role = self._cached_ref(
@@ -1459,6 +1536,11 @@ class SyncMixin:
                     nas_name = str(s.get("nas_name") or "").strip()
                     username = str(s.get("username") or "").strip()
                     start_time = str(s.get("start_time") or "").strip()
+                    # ClearPass endpoint profiling (best-effort — present only
+                    # when the CPPM feed profiles the endpoint): device model +
+                    # manufacturer place it under its real device_type.
+                    model = str(s.get("model") or "").strip()
+                    manufacturer = str(s.get("manufacturer") or s.get("vendor") or "").strip()
                     if not mac:
                         skipped += 1
                         continue
@@ -1515,8 +1597,10 @@ class SyncMixin:
                     create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                     if role:
                         create_kwargs["role"] = role.id
-                    if dtype:
-                        create_kwargs["device_type"] = dtype.id
+                    # Prefer a device_type from the profiled model over default.
+                    at_dtype = self._device_type_for_model(model, manufacturer) or dtype
+                    if at_dtype:
+                        create_kwargs["device_type"] = at_dtype.id
                     if site:
                         create_kwargs["site"] = site.id
                     if tenant:

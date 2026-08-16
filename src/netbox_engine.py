@@ -62,10 +62,11 @@ from netbox_vmsync import VmSyncMixin
 from netbox_changelog import ChangelogMixin
 from netbox_sync import SyncMixin
 from netbox_staleness import StalenessMixin
+from netbox_dedupe import DedupeMixin
 from netbox_tenancy import TenancyMixin
 
 
-class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, TenancyMixin):
+class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, DedupeMixin, TenancyMixin):
     """
     NetBox API client. Covers DCIM (devices/racks) and IPAM (prefixes/IPs).
     """

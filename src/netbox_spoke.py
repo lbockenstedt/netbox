@@ -367,6 +367,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
+        "NETBOX_DEDUPE_DEVICES",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
     })
@@ -857,6 +858,18 @@ class NetboxSpoke(BaseSpoke):
                 self.engine.staleness_sweep,
                 stale_days=int(data.get("stale_days", 7)),
                 delete_days=int(data.get("delete_days", 30)),
+            )
+
+        if normalized == "NETBOX_DEDUPE_DEVICES":
+            # Find (and, when apply=True, merge) duplicate devices that share a
+            # serial or MAC — the pre-existing duplicates the unified sync ladder
+            # can't retroactively fix. apply=False (default) is a DRY RUN that
+            # reports the groups it would merge. Scope to one tenant via
+            # tenant_slug. See lm hub Setup → Sync "Merge duplicates" control.
+            return await self._run_sync(
+                self.engine.dedupe_devices,
+                tenant_slug=data.get("tenant_slug", ""),
+                apply=bool(data.get("apply", False)),
             )
 
         if normalized == "NETBOX_SEARCH":
