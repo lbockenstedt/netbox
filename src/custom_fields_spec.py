@@ -44,6 +44,15 @@ CUSTOM_FIELDS_SPEC = [
     ("proxmox_labels", "text", "Proxmox labels", "virtualization.virtualmachine"),
     # Firewall → IPAM device discovery sync (dcim.device)
     ("discovered_from", "text", "Discovered from", "dcim.device"),
+    # Free-form discovery attributes a feeder can attach to a device via the
+    # per-record ``custom_fields`` map on NETBOX_SYNC_DEVICES (only names
+    # provisioned here are written — see SyncMixin._device_cf_whitelist). Seeded
+    # by TrueNAS discovery (product/version/health/pool-count); other modules
+    # may populate the ones that apply. Add a row here to expose a new one.
+    ("product", "text", "Product", "dcim.device"),
+    ("version", "text", "Version", "dcim.device"),
+    ("healthy", "text", "Healthy", "dcim.device"),
+    ("pool_count", "text", "Pool count", "dcim.device"),
     # Network Devices (nw) POLL NOW inventory sync — links a NetBox dcim.device
     # to its nw fleet device id (match key for the polled switch/gateway upsert)
     # and marks dcim.interfaces the nw sync created (so replace-delete only ever
