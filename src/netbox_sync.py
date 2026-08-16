@@ -195,6 +195,88 @@ class SyncMixin:
                            "will 400 on the required site): %s", create_slug, e)
         return None
 
+    def _index_existing_devices(self, rows) -> Dict[str, Dict[str, dict]]:
+        """Index existing NetBox device rows for the canonical reconciliation
+        ladder used by ALL device-creating sinks. Returns five dicts keyed by
+        the identity a feeder might carry: ``by_serial`` (native serial, lower),
+        ``by_mac`` (custom_fields.mac_address, normalized), ``by_nw``
+        (custom_fields.nw_device_id), ``by_ip`` (primary_ip4) and ``by_name``
+        (name, lower). First row wins per key. Every sink builds the SAME index
+        from its ``/api/dcim/devices/`` list so a physical box discovered by
+        different modules — console (serial), switch-poll (nw_device_id),
+        ClearPass (mac), firewall (ip) — resolves to ONE device instead of a
+        duplicate per feeder."""
+        by_serial: Dict[str, dict] = {}
+        by_mac: Dict[str, dict] = {}
+        by_nw: Dict[str, dict] = {}
+        by_ip: Dict[str, dict] = {}
+        by_name: Dict[str, dict] = {}
+        for row in (rows or []):
+            rname = str(row.get("name") or "").strip().lower()
+            if rname:
+                by_name.setdefault(rname, row)
+            rserial = str(row.get("serial") or "").strip()
+            if rserial:
+                by_serial.setdefault(rserial.lower(), row)
+            cf = row.get("custom_fields") or {}
+            rmac = self._norm_mac(cf.get("mac_address", ""))
+            if rmac:
+                by_mac.setdefault(rmac, row)
+            rnw = str(cf.get("nw_device_id") or "").strip()
+            if rnw:
+                by_nw.setdefault(rnw, row)
+            pip = row.get("primary_ip4")
+            addr = ((pip.get("address") or "").split("/")[0].strip()
+                    if isinstance(pip, dict) else "")
+            if addr:
+                by_ip.setdefault(addr, row)
+        return {"by_serial": by_serial, "by_mac": by_mac, "by_nw": by_nw,
+                "by_ip": by_ip, "by_name": by_name}
+
+    @staticmethod
+    def _resolve_existing_device(serial: str = "", mac: str = "",
+                                 nw_device_id: str = "", ip: str = "",
+                                 hostname: str = "", *,
+                                 by_serial: Optional[dict] = None,
+                                 by_mac: Optional[dict] = None,
+                                 by_nw: Optional[dict] = None,
+                                 by_ip: Optional[dict] = None,
+                                 by_name: Optional[dict] = None) -> Optional[dict]:
+        """Canonical device reconciliation ladder shared by every device sink:
+        **SERIAL → MAC → nw_device_id → primary-IP → hostname**. Network
+        hardware is the source of truth, so the strongest hardware identity is
+        tried first: serial (globally unique, survives IP/hostname churn), then
+        MAC, then the fleet ``nw_device_id``, then primary IP, then an exact
+        hostname. The first tier whose key is present on the incoming record AND
+        indexed among existing devices wins — so the same box arriving from
+        different feeders reconciles to one record. A caller passes only the
+        keys/indexes it has (e.g. an ARP feeder has no serial); missing tiers
+        are skipped. ``hostname == 'unknown'`` never matches. Returns the
+        matched existing-device row dict or ``None``."""
+        by_serial = by_serial or {}; by_mac = by_mac or {}
+        by_nw = by_nw or {}; by_ip = by_ip or {}; by_name = by_name or {}
+        if serial:
+            r = by_serial.get(str(serial).strip().lower())
+            if r:
+                return r
+        if mac:
+            r = by_mac.get(mac)
+            if r:
+                return r
+        if nw_device_id:
+            r = by_nw.get(str(nw_device_id).strip())
+            if r:
+                return r
+        if ip:
+            r = by_ip.get(str(ip).strip())
+            if r:
+                return r
+        if hostname and hostname.strip().lower() != "unknown":
+            r = by_name.get(hostname.strip().lower())
+            if r:
+                return r
+        return None
+
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
                      defaults: Optional[Dict[str, Any]] = None,
@@ -830,8 +912,11 @@ class SyncMixin:
         ``dcim.interfaces`` (name/MAC/status/speed) with an ``ipam.ip_address``
         per interface IP.
 
-        Match the existing device by ``custom_fields.nw_device_id`` (the fleet
-        id) first, else by name within the tenant. Create if missing, tagged
+        Match the existing device by ``serial`` (native, hardware truth) first,
+        then ``custom_fields.nw_device_id`` (the fleet id), management IP, and
+        finally name within the tenant — the shared canonical ladder so a switch
+        already in NetBox from another feeder (console serial, ARP IP) is updated
+        in place instead of duplicated. Create if missing, tagged
         ``discovered_from=<source>`` + ``nw_device_id=<id>``; set ``primary_ip4``
         from the device management address. Each incoming interface is upserted
         by name (native ``mac_address``, ``status``, ``speed``) with a
@@ -857,6 +942,7 @@ class SyncMixin:
             dev = device or {}
             nw_id = str(dev.get("id") or "").strip()
             name = str(dev.get("name") or "").strip()
+            serial = str(dev.get("serial") or "").strip()
             mgmt_ip = str(dev.get("address") or "").strip().split("/")[0].strip()
             if not name and not nw_id:
                 return {"status": "ERROR", "message": "nw device has no name/id",
@@ -871,8 +957,13 @@ class SyncMixin:
             if tenant_slug:
                 tenant = self._resolve_tenant_ci(tenant_slug)
 
-            # ── Resolve the existing device (by nw_device_id cf, else by name) ──
-            existing = None
+            # ── Resolve the existing device via the canonical ladder ──────────
+            # SERIAL → MAC → nw_device_id → mgmt-IP → name. A polled switch has
+            # no chassis MAC in this payload, so serial/nw_device_id/IP/name do
+            # the work — but routing through the shared resolver means a device
+            # another feeder created (console by serial, ARP/fw by IP) is found
+            # and updated in place instead of spawning an nw_device_id-keyed
+            # duplicate of the same box.
             try:
                 params: Dict[str, Any] = {"limit": 500}
                 if tenant:
@@ -883,17 +974,11 @@ class SyncMixin:
                         "message": f"failed to list NetBox devices: {e}",
                         "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                         "interfaces_total": len(interfaces or []), "device_id": None}
-            for row in rows:
-                cf = row.get("custom_fields") or {}
-                if nw_id and str(cf.get("nw_device_id") or "").strip() == nw_id:
-                    existing = row
-                    break
-            if existing is None and name:
-                nl = name.lower()
-                for row in rows:
-                    if str(row.get("name") or "").strip().lower() == nl:
-                        existing = row
-                        break
+            idx = self._index_existing_devices(rows)
+            existing = self._resolve_existing_device(
+                serial=serial, nw_device_id=nw_id, ip=mgmt_ip, hostname=name,
+                by_serial=idx["by_serial"], by_nw=idx["by_nw"],
+                by_ip=idx["by_ip"], by_name=idx["by_name"])
 
             # ── Create the device if missing (defaults required) ────────────────
             if existing is None:
@@ -941,6 +1026,8 @@ class SyncMixin:
                                 "device_id": None}
                     ck: Dict[str, Any] = {"name": name, "device_type": dt.id,
                                           "role": role.id, "site": site.id}
+                    if serial:
+                        ck["serial"] = serial
                     if tenant:
                         ck["tenant"] = tenant.id
                     devobj = self.nb.dcim.devices.create(**ck)
@@ -983,6 +1070,11 @@ class SyncMixin:
                         cf["last_seen"] = datetime.now(timezone.utc).strftime(
                             "%Y-%m-%dT%H:%M:%SZ")
                     devobj.custom_fields = cf
+                    # Backfill the native serial only when the matched device
+                    # has none — hardware truth fills a gap, but never clobber a
+                    # serial another feeder already set.
+                    if serial and not str(getattr(devobj, "serial", "") or "").strip():
+                        devobj.serial = serial
                     devobj.save()
                 except Exception as e:
                     logger.debug("sync_nw_device: refresh device cf skipped: %s", e)
@@ -1168,8 +1260,11 @@ class SyncMixin:
 
         Source = CPPM ``/api/session`` (relayed by the hub realtime loop). Each
         incoming session ``{mac, ip, nas_ip, nas_port, nas_name, username,
-        start_time}`` is matched **MAC-first** against the tenant's existing
-        devices (keyed by the device's ``custom_fields.mac_address``). NetBox
+        start_time}`` is matched **MAC then framed-IP** against the tenant's
+        existing devices (the device's ``custom_fields.mac_address``, else its
+        ``primary_ip4``) via the shared canonical resolver — so a device another
+        feeder already created (e.g. console/firewall by IP, MAC not yet
+        stamped) is reconciled, not duplicated. NetBox
         stays source of truth → this is **only-add-missing**: a MAC already in
         NetBox is skipped (never duplicated, never overwritten), with a
         best-effort ``last_seen``/``switch_ip``/``switch_port`` refresh on
@@ -1368,12 +1463,31 @@ class SyncMixin:
                         skipped += 1
                         continue
 
-                    row = existing_by_mac.get(mac)
+                    row = self._resolve_existing_device(
+                        mac=mac, ip=ip,
+                        by_mac=existing_by_mac, by_ip=existing_by_ip)
                     if row:
                         # Already in NetBox → only-add-missing: skip the create.
+                        # Reconciled by MAC OR by framed IP, so a device another
+                        # feeder created (console/fw by IP) with no MAC stamped
+                        # yet is NOT duplicated here. Backfill the MAC (hardware
+                        # truth) when the matched device lacks one — strengthens
+                        # future dedup — without clobbering an existing MAC.
+                        cf = row.get("custom_fields") or {}
+                        matched_mac = self._norm_mac(cf.get("mac_address") or "")
+                        if mac and not matched_mac:
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    merged = dict(devobj.custom_fields or {})
+                                    merged["mac_address"] = mac
+                                    devobj.custom_fields = merged
+                                    devobj.save()
+                                    existing_by_mac.setdefault(mac, row)
+                            except Exception as e:
+                                logger.debug("sync_access_tracker: backfill mac %s failed: %s", mac, e)
                         # Best-effort refresh of topology/last_seen ONLY on a
                         # device we own (never touch another source's record).
-                        cf = row.get("custom_fields") or {}
                         if str((cf.get("discovered_from") or "")).lower() == "cppm-access-tracker":
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])

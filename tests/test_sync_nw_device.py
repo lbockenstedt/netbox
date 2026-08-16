@@ -166,3 +166,44 @@ def test_sync_nw_device_primary_ip_not_overwritten_when_already_set():
                              tenant_slug="", defaults=_DEFAULTS)
     assert res["status"] == "SUCCESS", res
     assert dev_obj.primary_ip4 == 5555  # unchanged
+
+def test_sync_nw_device_matches_existing_by_serial_no_duplicate():
+    # A device already in NetBox by SERIAL (created by another feeder, e.g.
+    # console) but with a DIFFERENT/absent nw_device_id must be updated in
+    # place — the canonical ladder tries serial before nw_device_id/name, so
+    # the switch is NOT duplicated under an nw_device_id key.
+    existing_row = {"id": 55, "name": "console-sw1",
+                    "serial": "SN-ABC-123",
+                    "custom_fields": {"discovered_from": "Console"}}
+    eng = _engine(existing_devices=[existing_row])
+    dev_obj = _Obj(id=55, name="console-sw1", custom_fields={})
+    dev_obj.serial = "SN-ABC-123"
+    eng.nb.dcim.devices.get = MagicMock(return_value=dev_obj)
+    eng.nb.dcim.interfaces.filter = MagicMock(return_value=[])
+
+    dev = {"id": "nw-9", "name": "sw1", "address": "10.0.0.1",
+           "serial": "SN-ABC-123", "object_type": "aos_switch"}
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults=_DEFAULTS)
+
+    assert res["status"] == "SUCCESS", res
+    eng.nb.dcim.devices.create.assert_not_called()   # matched by serial → no dup
+    assert res["device_id"] == 55
+
+
+def test_sync_nw_device_writes_serial_on_create():
+    # A polled device carrying a serial stamps the native dcim.device.serial on
+    # create so a later feeder can reconcile by serial.
+    eng = _engine()
+    dev_obj = _Obj(id=101, name="sw2")
+    eng.nb.dcim.devices.create = MagicMock(return_value=dev_obj)
+    eng.nb.dcim.interfaces.create = MagicMock(return_value=_Obj(name="vlan1"))
+
+    dev = {"id": "nw-2", "name": "sw2", "address": "10.0.0.2",
+           "serial": "SN-XYZ-9", "object_type": "aos_switch"}
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults=_DEFAULTS)
+
+    assert res["status"] == "SUCCESS", res
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck.get("serial") == "SN-XYZ-9"
