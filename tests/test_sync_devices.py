@@ -138,6 +138,61 @@ def test_sync_devices_autocreates_site_when_none_exists():
     assert eng.nb.dcim.devices.create.call_args.kwargs["site"] == 777
 
 
+def test_sync_devices_creates_with_per_record_role_and_custom_fields():
+    # P5: a feeder (e.g. TrueNAS) attaches a per-record role + custom_fields so
+    # the device lands under the right dcim.device_role AND carries its
+    # discovery attributes (product/version/health/pool_count).
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.50", "hostname": "nas-01", "serial": "TN-1",
+                  "model": "TrueNAS Mini X+", "manufacturer": "TrueNAS",
+                  "role": "storage",
+                  "custom_fields": {"product": "TrueNAS SCALE", "version": "25.04",
+                                    "healthy": "true", "pool_count": "2",
+                                    "discovered_from": "BOGUS"}}],
+        tenant_slug="lrb", replace=True, defaults={}, source="TrueNAS")
+
+    assert res["status"] == "SUCCESS" and res["pushed"] == 1
+    # Per-record role resolved (device_roles.get queried with slug 'storage').
+    role_slugs = [c.kwargs.get("slug") for c in eng.nb.dcim.device_roles.get.call_args_list]
+    assert "storage" in role_slugs
+    # Free-form discovery custom fields written onto the device.
+    assert dev.custom_fields.get("product") == "TrueNAS SCALE"
+    assert dev.custom_fields.get("version") == "25.04"
+    assert dev.custom_fields.get("healthy") == "true"
+    assert dev.custom_fields.get("pool_count") == "2"
+    # discovered_from is SINK-MANAGED — the per-record value ("BOGUS") never
+    # overrides the source tag (would break ownership detection).
+    assert dev.custom_fields.get("discovered_from") == "TrueNAS"
+
+
+def test_sync_devices_drops_unprovisioned_custom_field():
+    # A per-record custom field NOT provisioned on dcim.device is dropped, never
+    # written — writing it would 400 ("field does not exist for object type")
+    # and kill the whole device upsert.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.51", "hostname": "nas-02",
+                  "custom_fields": {"product": "TrueNAS", "bogus_field": "x"}}],
+        tenant_slug="lrb", replace=True, defaults={}, source="TrueNAS")
+
+    assert res["status"] == "SUCCESS" and res["pushed"] == 1
+    assert dev.custom_fields.get("product") == "TrueNAS"       # provisioned → written
+    assert "bogus_field" not in dev.custom_fields               # unprovisioned → dropped
+
+
 def test_sync_devices_updates_existing_by_ip_no_duplicate():
     # Existing device (ours, tagged) with primary IP 10.0.0.5 → PUT-refresh, no new device.
     row = {"id": 77, "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},

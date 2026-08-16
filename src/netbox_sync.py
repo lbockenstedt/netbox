@@ -119,6 +119,35 @@ class SyncMixin:
             logger.debug("containing-prefix lookup for %s failed, using /32: %s", ip_str, e)
         return "32"
 
+    # Custom fields the sink OWNS/manages on dcim.device — a per-record
+    # custom_fields map must never override these (ownership, staleness clock,
+    # MAC/topology, nw linkage), or it would e.g. break _owns() by rewriting
+    # discovered_from. Per-record CFs may only set free-form discovery
+    # attributes (product/version/health/pool_count …).
+    _SINK_MANAGED_DEVICE_CFS = frozenset({
+        "discovered_from", "last_seen", "decommissioned_at", "mac_address",
+        "switch_name", "switch_ip", "switch_port", "nw_device_id", "nw_managed",
+    })
+
+    @staticmethod
+    def _device_cf_whitelist():
+        """Return the set of custom-field names PROVISIONED on ``dcim.device``
+        (from the shared ``CUSTOM_FIELDS_SPEC``). sync_devices only writes a
+        per-record custom field whose name is in this set — writing a field
+        that doesn't exist on the object type 400s the ENTIRE device upsert
+        ("Custom field 'X' does not exist for this object type."), so an
+        unknown per-record key (a feeder typo, or a field not yet added to the
+        spec) is silently dropped rather than breaking the whole sync. To add a
+        new pass-through field, add its (name, type, label, 'dcim.device') row
+        to ``custom_fields_spec.CUSTOM_FIELDS_SPEC`` — it then provisions AND
+        becomes writable here automatically (one source of truth, no drift)."""
+        try:
+            from custom_fields_spec import CUSTOM_FIELDS_SPEC
+            return {name for (name, _t, _l, ct) in CUSTOM_FIELDS_SPEC
+                    if ct == "dcim.device"}
+        except Exception:
+            return set()
+
     def _ensure_device_role(self, slug: str = "discovered"):
         """Return the device role (auto-creating 'discovered' if missing). Best-effort."""
         slug = (slug or "discovered").strip().lower() or "discovered"
@@ -427,6 +456,18 @@ class SyncMixin:
                 # REAL device_type instead of the generic 'discovered' default.
                 model = str(dev.get("model") or "").strip()
                 manufacturer = str(dev.get("manufacturer") or dev.get("vendor") or "").strip()
+                # Per-record device role (e.g. TrueNAS→"storage", console→"router")
+                # so a feed can place its device under the right dcim.device_role
+                # instead of the generic 'discovered' default. Applied on CREATE
+                # only (see below) — never re-roles a human/existing device.
+                rec_role = str(dev.get("role") or "").strip()
+                # Free-form per-record custom fields (TrueNAS product/version/
+                # health/pool_count, etc). Only names PROVISIONED on dcim.device
+                # are written (see _device_cf_whitelist) — an unprovisioned field
+                # would 400 the whole device write; unknown keys are dropped.
+                rec_cfs = dev.get("custom_fields")
+                if not isinstance(rec_cfs, dict):
+                    rec_cfs = {}
                 if not ip and not mac:
                     if hostname and hostname.lower() != "unknown":
                         # Hostname-only record (no IP, no MAC): key by hostname so
@@ -448,7 +489,7 @@ class SyncMixin:
                     # MAC-only: index by mac-key so it's at least created, but
                     # replace-delete (which keys on IP) won't track it.
                     ip = f"mac:{mac}"
-                rec: Dict[str, str] = {"mac": mac, "hostname": hostname}
+                rec: Dict[str, Any] = {"mac": mac, "hostname": hostname}
                 if serial:
                     rec["serial"] = serial
                 if s_swname:
@@ -461,6 +502,15 @@ class SyncMixin:
                     rec["model"] = model
                 if manufacturer:
                     rec["manufacturer"] = manufacturer
+                if rec_role:
+                    rec["role"] = rec_role
+                if rec_cfs:
+                    # Keep only string-able values; drop None. Whitelisting to
+                    # provisioned fields happens at write time.
+                    rec["custom_fields"] = {
+                        str(k): ("" if v is None else str(v))
+                        for k, v in rec_cfs.items() if k
+                    }
                 incoming[ip] = rec
 
             # Index existing tenant devices by primary IPv4 (all) + track which
@@ -542,6 +592,10 @@ class SyncMixin:
                         logger.debug("sync_devices: delete stale %s failed: %s", ip_str, e)
 
             role = self._ensure_device_role(defaults.get("role") or "discovered")
+            # Names of custom fields provisioned on dcim.device — the only ones a
+            # per-record custom_fields map may write (unknown keys would 400 the
+            # whole device upsert). Computed once per batch.
+            cf_whitelist = self._device_cf_whitelist()
             dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
             site = self._resolve_site(defaults.get("site") or "", tenant)
             # When a create fails because NetBox requires a site (no site
@@ -711,6 +765,18 @@ class SyncMixin:
                                     if val and merged.get(cf_key) != val:
                                         merged[cf_key] = val
                                         changed = True
+                                # Per-record custom fields (TrueNAS product/
+                                # version/health/pool_count, etc). Refresh live
+                                # status onto a device WE own — never a human's —
+                                # and only whitelisted (provisioned) names so an
+                                # unknown key can't 400 the whole save.
+                                if we_own:
+                                    for ck, cv in (rec.get("custom_fields") or {}).items():
+                                        if (ck in cf_whitelist
+                                                and ck not in self._SINK_MANAGED_DEVICE_CFS
+                                                and merged.get(ck) != cv):
+                                            merged[ck] = cv
+                                            changed = True
                                 # Backfill the serial when the device has none —
                                 # fill-gap only, never clobber a serial already on
                                 # the record (a human-entered or previously
@@ -827,8 +893,15 @@ class SyncMixin:
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                         if serial:
                             create_kwargs["serial"] = serial
-                        if role:
-                            create_kwargs["role"] = role.id
+                        # Prefer a per-record role (e.g. TrueNAS→"storage") over
+                        # the batch-default role, so a feed places its device
+                        # under the right dcim.device_role. Role is set on CREATE
+                        # only — an existing device's role is never overwritten.
+                        rec_role = rec.get("role")
+                        create_role = (self._ensure_device_role(rec_role)
+                                       if rec_role else role)
+                        if create_role:
+                            create_kwargs["role"] = create_role.id
                         # Prefer a device_type resolved from the DISCOVERED model
                         # (real hardware type) over the generic default dtype.
                         rec_dtype = self._device_type_for_model(
@@ -860,6 +933,14 @@ class SyncMixin:
                                 val = rec.get(rec_key)
                                 if val:
                                     merged[cf_key] = val
+                            # Per-record custom fields (TrueNAS product/version/
+                            # health/pool_count, etc) — only whitelisted
+                            # (provisioned) names so an unknown key can't 400 the
+                            # create's cf stamp.
+                            for ck, cv in (rec.get("custom_fields") or {}).items():
+                                if (ck in cf_whitelist
+                                        and ck not in self._SINK_MANAGED_DEVICE_CFS):
+                                    merged[ck] = cv
                             devobj.custom_fields = merged
                             devobj.save()
                         except Exception as e:
