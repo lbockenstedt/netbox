@@ -903,3 +903,88 @@ def test_sync_devices_journal_uses_real_source_tag():
     assert len(calls) == 2
     for c in calls:
         assert "Network Devices" in c.kwargs["comment"]
+
+def test_sync_devices_creates_with_serial():
+    """A record carrying a serial stamps it as the native dcim.device.serial on
+    create (so future syncs can match this device by serial)."""
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA-BB-CC-DD-EE-FF",
+                  "hostname": "sw-01", "serial": "SN-ABC-123"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["serial"] == "SN-ABC-123"
+
+
+def test_sync_devices_matches_existing_by_serial_no_duplicate():
+    """A record whose serial matches an existing device updates that device in
+    place — no duplicate — even when its IP/hostname differ (serial is the
+    strongest key, tried before IP/MAC/hostname)."""
+    row = {"id": 77, "name": "old-name",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "serial": "SN-ABC-123",
+           "custom_fields": {"discovered_from": "Console"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=77, custom_fields={"discovered_from": "Console"})
+    eng.nb.dcim.devices.get.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=556)
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.99", "mac": "11-22-33-44-55-66",
+                  "hostname": "new-name", "serial": "SN-ABC-123"}],
+        tenant_slug="lrb", replace=False, defaults={}, source="Console")
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()  # matched by serial → no dup
+
+
+def test_sync_devices_backfills_serial_when_missing():
+    """An existing device matched by IP with no serial gets the discovered
+    serial backfilled (fill-gap; never clobbers an existing serial)."""
+    row = {"id": 77, "name": "ws",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "Console"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ip = _Obj(id=901, custom_fields={})
+    eng.nb.ipam.ip_addresses.get.return_value = ip
+    dev = _Obj(id=77, custom_fields={"discovered_from": "Console"})
+    eng.nb.dcim.devices.get.return_value = dev
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA-BB-CC-DD-EE-FF",
+                  "hostname": "ws", "serial": "SN-NEW-9"}],
+        tenant_slug="lrb", replace=False, defaults={}, source="Console")
+
+    assert res["status"] == "SUCCESS"
+    eng.nb.dcim.devices.create.assert_not_called()
+    assert dev.serial == "SN-NEW-9"  # backfilled onto the matched device
+
+
+def test_sync_devices_serial_only_record_creates():
+    """A record with only a serial (no IP/MAC/hostname) is still identifiable —
+    it is created (keyed by serial), not dropped as a phantom."""
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=42)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+
+    res = eng.sync_devices(
+        devices=[{"serial": "SN-ONLY-7"}],
+        tenant_slug="lrb", replace=False, defaults={}, source="Console")
+
+    assert res["status"] == "SUCCESS"
+    assert res["pushed"] == 1
+    ck = eng.nb.dcim.devices.create.call_args.kwargs
+    assert ck["serial"] == "SN-ONLY-7"
+    assert ck["name"] == "device-SN-ONLY-7"
