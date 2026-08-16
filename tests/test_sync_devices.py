@@ -988,3 +988,36 @@ def test_sync_devices_serial_only_record_creates():
     ck = eng.nb.dcim.devices.create.call_args.kwargs
     assert ck["serial"] == "SN-ONLY-7"
     assert ck["name"] == "device-SN-ONLY-7"
+
+
+def test_sync_devices_places_device_under_discovered_model_type():
+    # A record carrying a discovered hardware model + manufacturer lands under
+    # its REAL device_type (created from the model) instead of the generic
+    # 'discovered' default.
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=50)
+    eng.nb.dcim.devices.create.return_value = dev
+    eng.nb.dcim.devices.get.return_value = _Obj(id=50)
+    eng.nb.dcim.device_types.get.return_value = None       # all types miss → create
+    eng.nb.dcim.manufacturers.get.return_value = None
+    eng.nb.dcim.manufacturers.create.return_value = MagicMock(id=88)
+
+    def _mk_dt(**kw):
+        # model type gets a distinct id so we can prove it (not the default) was used
+        return MagicMock(id=777 if kw.get("slug") == "aruba-aruba-2930f" else 111)
+    eng.nb.dcim.device_types.create.side_effect = _mk_dt
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.7", "mac": "AA:BB:CC:DD:EE:07", "hostname": "sw",
+                  "model": "Aruba 2930F", "manufacturer": "Aruba"}],
+        tenant_slug="lrb", replace=False, defaults={"site": "s1"})
+
+    assert res["status"] == "SUCCESS", res
+    # A device_type was created from the discovered model (mfr+model slug).
+    slugs = [c.kwargs.get("slug") for c in eng.nb.dcim.device_types.create.call_args_list]
+    assert "aruba-aruba-2930f" in slugs
+    models = [c.kwargs.get("model") for c in eng.nb.dcim.device_types.create.call_args_list]
+    assert "Aruba 2930F" in models
+    # The device was created under the model type (777), not the default (111).
+    cak = eng.nb.dcim.devices.create.call_args.kwargs
+    assert cak["device_type"] == 777
