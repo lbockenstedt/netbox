@@ -204,8 +204,9 @@ class SyncMixin:
 
         Source = a discovery feed relayed by the hub (OPNsense DHCP leases +
         ARP for the firewall sync; switch/gateway ARP tables for the nw sync).
-        Each incoming record ``{ip, mac, hostname}`` is matched to an existing
-        device by its primary IPv4; missing devices are created (mirroring
+        Each incoming record ``{ip, mac, hostname, serial}`` is matched to an
+        existing device by serial (strongest), then primary IPv4, then MAC, then
+        bare hostname; missing devices are created (mirroring
         ``claim_device``: tenant-owned device + ``mgmt`` interface + IP with
         ``custom_fields.mac_address`` + ``primary_ip4``). Writing the MAC onto
         the IP record feeds the NetBox→CPPM endpoint sync (which keys on
@@ -271,6 +272,11 @@ class SyncMixin:
                 ip = str(dev.get("ip") or "").strip().split("/")[0].strip()
                 mac = self._norm_mac(dev.get("mac", ""))
                 hostname = str(dev.get("hostname") or "").strip()
+                # Serial number (console-identified devices carry one even when
+                # they have no IP): the strongest, globally-unique match key —
+                # tried FIRST below so a device is recognised across DHCP IP
+                # moves / hostname changes.
+                serial = str(dev.get("serial") or "").strip()
                 # MAC-sighting enrichment: a feed (nw ARP/MAC table, ClearPass)
                 # may attach the source switch identity + port to a record so the
                 # device in NetBox answers "where is this MAC?" — last seen on
@@ -279,21 +285,29 @@ class SyncMixin:
                 s_swip = str(dev.get("source_switch_ip") or "").strip()
                 s_swport = str(dev.get("source_switch_port") or "").strip()
                 if not ip and not mac:
-                    if not hostname or hostname.lower() == "unknown":
+                    if hostname and hostname.lower() != "unknown":
+                        # Hostname-only record (no IP, no MAC): key by hostname so
+                        # the hostname-match tier adopts any same-name device
+                        # instead of duplicate-creating. The firewall path drops
+                        # no-IP records upstream, so this is defensive; the active
+                        # case is a no-MAC/no-IP discovery row that carries a name.
+                        ip = f"host:{hostname.lower()}"
+                    elif serial:
+                        # Serial-only record (a console-identified device with no
+                        # IP/MAC/hostname): key by serial so the serial-match tier
+                        # adopts an existing device instead of creating a phantom.
+                        ip = f"serial:{serial.lower()}"
+                    else:
                         # Nothing identifiable at all — don't add a phantom row.
                         skipped += 1
                         continue
-                    # Hostname-only record (no IP, no MAC): key by hostname so the
-                    # hostname-match tier adopts any same-name device instead of
-                    # duplicate-creating. The firewall path drops no-IP records
-                    # upstream, so this is defensive; the active case is a
-                    # no-MAC/no-IP discovery row that still carries a name.
-                    ip = f"host:{hostname.lower()}"
                 elif not ip:
                     # MAC-only: index by mac-key so it's at least created, but
                     # replace-delete (which keys on IP) won't track it.
                     ip = f"mac:{mac}"
                 rec: Dict[str, str] = {"mac": mac, "hostname": hostname}
+                if serial:
+                    rec["serial"] = serial
                 if s_swname:
                     rec["switch_name"] = s_swname
                 if s_swip:
@@ -311,6 +325,7 @@ class SyncMixin:
             existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
             existing_by_name: Dict[str, dict] = {}  # name.lower() -> raw device row
             existing_by_mac: Dict[str, dict] = {}   # norm_mac(cf.mac_address) -> row
+            existing_by_serial: Dict[str, dict] = {}  # serial.lower() -> row
             owned_ips: set = set()                   # primary IPs of tagged devices
             # Intra-batch dedup: many discovery records share a hostname across
             # distinct MACs (ks205, sonoszp, iphone…). existing_by_name is a
@@ -346,6 +361,12 @@ class SyncMixin:
                 rmac = self._norm_mac(cf.get("mac_address", ""))
                 if rmac:
                     existing_by_mac.setdefault(rmac, row)
+                # Index by serial (native dcim.device field) so a record can
+                # match an existing device by its serial number regardless of
+                # IP/hostname churn. first row wins per serial.
+                rserial = str(row.get("serial") or "").strip()
+                if rserial:
+                    existing_by_serial.setdefault(rserial.lower(), row)
                 pip = row.get("primary_ip4")
                 addr = ""
                 if isinstance(pip, dict):
@@ -387,26 +408,33 @@ class SyncMixin:
             for ip_str, rec in incoming.items():
                 mac = rec["mac"]
                 hostname = rec["hostname"]
+                serial = rec.get("serial") or ""
                 is_mac_key = ip_str.startswith("mac:")
                 is_host_key = ip_str.startswith("host:")
-                real_ip = "" if (is_mac_key or is_host_key) else ip_str
+                is_serial_key = ip_str.startswith("serial:")
+                real_ip = "" if (is_mac_key or is_host_key or is_serial_key) else ip_str
                 try:
                     # Resolve the existing NetBox device for this record. A
-                    # record is the SAME machine if its IP, MAC, OR hostname
-                    # matches an existing device — matching any one updates that
-                    # device in place instead of creating a duplicate (the bug
-                    # where a device added with no MAC/IP spawned a second copy
-                    # on every sync because the sync could only compare one
-                    # property). IP is the strongest key; MAC catches DHCP
-                    # IP-moves + MAC-only records; hostname adopts a same-name
-                    # device unless the record is PROVABLY a different machine
-                    # (both MAC and IP present on both sides AND both differ) —
-                    # the one case the registry allows a duplicate. A bare
-                    # placeholder (no IP/MAC) is always adopted; an unowned
-                    # non-bare (human) device is never adopted (don't clobber
-                    # human data). A device refreshed this batch
-                    # (refreshed_ids) is never adopted by a later record.
-                    row = existing_by_ip.get(ip_str) if not (is_mac_key or is_host_key) else None
+                    # record is the SAME machine if its SERIAL, IP, MAC, OR
+                    # hostname matches an existing device — matching any one
+                    # updates that device in place instead of creating a
+                    # duplicate (the bug where a device added with no MAC/IP
+                    # spawned a second copy on every sync because the sync could
+                    # only compare one property). SERIAL is the strongest key
+                    # (globally unique, survives IP/hostname churn) so it is
+                    # tried first; IP next; MAC catches DHCP IP-moves + MAC-only
+                    # records; hostname adopts a same-name device unless the
+                    # record is PROVABLY a different machine (both MAC and IP
+                    # present on both sides AND both differ) — the one case the
+                    # registry allows a duplicate. A bare placeholder (no IP/MAC)
+                    # is always adopted; an unowned non-bare (human) device is
+                    # never adopted (don't clobber human data). A device
+                    # refreshed this batch (refreshed_ids) is never re-adopted.
+                    row = None
+                    if serial:
+                        row = existing_by_serial.get(serial.lower())
+                    if row is None and not (is_mac_key or is_host_key or is_serial_key):
+                        row = existing_by_ip.get(ip_str)
                     if row is None and mac:
                         row = existing_by_mac.get(mac)
                     if row is None and hostname and hostname.lower() != "unknown":
@@ -536,8 +564,17 @@ class SyncMixin:
                                     if val and merged.get(cf_key) != val:
                                         merged[cf_key] = val
                                         changed = True
+                                # Backfill the serial when the device has none —
+                                # fill-gap only, never clobber a serial already on
+                                # the record (a human-entered or previously
+                                # discovered value stays authoritative).
+                                ser_changed = False
+                                if serial and not str(getattr(devobj, "serial", "") or "").strip():
+                                    devobj.serial = serial
+                                    ser_changed = True
                                 if changed:
                                     devobj.custom_fields = merged
+                                if changed or ser_changed:
                                     devobj.save()
                         except Exception as e:
                             logger.debug("sync_devices: device cf stamp %s: %s", ip_str, e)
@@ -568,7 +605,8 @@ class SyncMixin:
                         # No existing device for this IP — create one we own.
                         name = (hostname if hostname and hostname.lower() != "unknown"
                                 else (f"device-{mac.replace(':', '')}" if mac
-                                      else f"device-{real_ip or 'unknown'}"))
+                                      else (f"device-{serial}" if serial
+                                            else f"device-{real_ip or 'unknown'}")))
                         # The (name, site, tenant) unique constraint. Two hazards:
                         # (1) the name matches a PRE-existing device (snapshot in
                         # existing_by_name); (2) INTRA-batch duplicates — many
@@ -640,6 +678,8 @@ class SyncMixin:
                             errors += 1
                             continue
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
+                        if serial:
+                            create_kwargs["serial"] = serial
                         if role:
                             create_kwargs["role"] = role.id
                         if dtype:
