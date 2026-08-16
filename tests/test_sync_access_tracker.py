@@ -280,3 +280,29 @@ def test_sync_access_tracker_drops_macless_session():
     assert res["pushed"] == 0
     assert res["skipped"] == 1
     eng.nb.dcim.devices.create.assert_not_called()
+
+def test_sync_access_tracker_matches_existing_by_ip_no_duplicate_and_backfills_mac():
+    # A device already in NetBox by its IP (created by another feeder — e.g.
+    # console/firewall — with NO mac stamped). A NAC session for the same framed
+    # IP must reconcile by IP (not duplicate), and backfill the MAC (hardware
+    # truth) onto that device so future dedup works.
+    row = {"id": 88, "name": "fw-host",
+           "primary_ip4": {"id": 902, "address": "10.0.0.9/24"},
+           "custom_fields": {"discovered_from": "OPNsense"}}  # no mac_address
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    matched_dev = _Obj(id=88, custom_fields={"discovered_from": "OPNsense"},
+                       name="fw-host")
+    eng.nb.dcim.devices.get.return_value = matched_dev
+
+    res = eng.sync_access_tracker(
+        sessions=[{"mac": "11:22:33:44:55:66", "ip": "10.0.0.9",
+                   "nas_ip": "", "nas_port": "", "nas_name": "",
+                   "username": "bob", "start_time": "2026-06-30T11:00:00"}],
+        tenant_slug="lrb", defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 0            # reconciled by IP → no create
+    assert res["skipped"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()
+    # MAC backfilled onto the matched device (was missing).
+    assert matched_dev.custom_fields.get("mac_address") == "11:22:33:44:55:66"
