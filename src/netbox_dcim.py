@@ -158,8 +158,13 @@ class DcimMixin:
             }
 
             def _units(face: str) -> List[Dict[str, Any]]:
+                # limit=0 disables NetBox pagination so we get EVERY rack unit in
+                # one response. Without it the endpoint applies its default page
+                # size (e.g. 25), truncating a taller rack's elevation — a 42U
+                # rack would silently stop at unit 18. Racks are <=100U, so a
+                # single unpaginated page is always sufficient.
                 data = self._api_get(f"/api/dcim/racks/{rack_id}/elevation/",
-                                     {"face": face})
+                                     {"face": face, "limit": 0})
                 # The elevation action returns a plain list; defensively accept
                 # a paginated {results: [...]} shape too.
                 if isinstance(data, dict):
