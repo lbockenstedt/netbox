@@ -5,4 +5,4 @@ uvicorn
 httpx
 gitpython
 python-dotenv
-openpyxl
+openpyxlcryptography>=42,<50
