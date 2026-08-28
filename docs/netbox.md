@@ -1,3 +1,8 @@
+---
+summary: "NetBox spoke. Repo: netbox. moduletype = 'ipam'. See architecture-topology.md."
+keywords: [backends, custom_fields_spec, decommissioned_at, download, kea_ctrl_url, last_seen, lm, netbox, rack, source_of_truth]
+---
+
 # netbox — IPAM/DCIM
 
 NetBox spoke. Repo: `netbox`. `module_type = "ipam"`. See [architecture-topology.md](architecture-topology.md).
