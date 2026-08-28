@@ -13,3 +13,7 @@ __pycache__/
 keys.json
 hub_secret.json
 secrets.json
+
+# Local git worktrees — never part of the repo
+.claude/worktrees/
+.wt-*/
