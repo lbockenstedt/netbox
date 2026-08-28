@@ -1,15 +1,24 @@
 """Tests for NetboxSpoke INSTALL_CERT — the NetBox (ipam) cert target.
 
 NetBox has no cert API and the spoke runs as unprivileged svc_lm, so LE cert
-distribution (hub-brokered) routes INSTALL_CERT here: the spoke validates the
-fullchain+privkey in-process (throwaway ssl ctx — same guard the hub uses in
-``_install_cert_on_hub``), writes both to 0600 temp files under /tmp, and hands
-the paths to the root sudoers helper ``/usr/local/bin/lm-netbox-install-cert``,
-which swaps ``/etc/lm/netbox/tls/netbox.{crt,key}`` + reloads nginx. The helper
-re-validates + nginx -t (restores on failure) — we don't test that here (it's
-root-OS work); we test the spoke's contract: validate BEFORE calling the helper,
-clean up temps always, and map the helper's one-line stdout/exit to
-SUCCESS/ERROR.
+distribution (hub-brokered) routes INSTALL_CERT here. The spoke is a **cert
+custodian**: it validates the fullchain+privkey in-process (throwaway ssl ctx —
+the same guard the hub uses in ``_install_cert_on_hub``), persists the material
+encrypted so a restart or a late-connecting agent still gets it, then drives
+every connected Agent to install it. The Agent does the privileged work:
+WRITE_FILE both PEMs to 0600 temps, then RUN_COMMAND the root sudoers helper
+``/usr/local/bin/lm-netbox-install-cert``, which swaps
+``/etc/lm/netbox/tls/netbox.{crt,key}`` and reloads nginx.
+
+The helper re-validates + runs ``nginx -t`` (restoring on failure) — that is
+root-OS work and is not tested here. What IS tested is the spoke's contract:
+
+* reject junk (missing material / non-PEM / mismatched pair) BEFORE anything
+  reaches a live host;
+* persist the material even when nobody is connected yet, and say so rather
+  than reporting a deploy that did not happen;
+* deploy to each connected agent and summarise the outcome;
+* relay the agent's own failure text instead of a generic message.
 
 Self-contained: inserts netbox/src/ + lm/core/src on sys.path (base_spoke) and
 constructs the spoke via ``__new__`` (skipping ``__init__`` — it builds a real
@@ -22,10 +31,15 @@ import asyncio
 import datetime as _dt
 import os
 import sys
-import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, "/Users/lbockenstedt/vscode/lm/core/src")
+import pytest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "src"))
+# lm/core/src supplies base_spoke. Derive it from THIS file's location — it used
+# to be a hard-coded /Users/... absolute path, which resolved only on one
+# developer's machine and could never work in CI.
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "lm", "core", "src"))
 
 import netbox_spoke as spoke_mod  # noqa: E402
 
@@ -45,7 +59,7 @@ def _real_pair(cn: str = "netbox.test"):
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subj = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    now = _dt.datetime.utcnow()
+    now = _dt.datetime.now(_dt.timezone.utc)
     cert = (x509.CertificateBuilder().subject_name(subj).issuer_name(subj)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
@@ -59,310 +73,239 @@ def _real_pair(cn: str = "netbox.test"):
     return crt_pem, key_pem
 
 
-def _make_spoke(control_plane=None):
-    """NetboxSpoke instance with __init__ skipped (the INSTALL_CERT handler
-    never touches self.engine, so the engine that would hit NetBox is never
-    needed). The handler's ``os.path.exists(_NETBOX_INSTALL_CERT_HELPER)``
-    branch decides between the local-root-helper path (helper present) and the
-    relay-to-netbox-server-agent path (helper absent — the API-only IPAM spoke's
-    normal split-topology path). Point the constant at a path that exists HERE
-    so the exec-path tests below exercise the sudo/helper contract; the relay
-    tests override it to a missing path and supply a fake control_plane."""
+class _FakeControlPlane:
+    """Stand-in for the NetboxControlPlane.
+
+    Records every send_to_agent call so a test can assert the WRITE_FILE +
+    RUN_COMMAND sequence, and returns a canned RUN_COMMAND result.
+    ``connected_agents`` is what the handler reads to decide deploy-vs-cache.
+    """
+
+    def __init__(self, agents=(), rc=0, stdout="OK installed", stderr="",
+                 raise_on=None):
+        self.connected_agents = {a: object() for a in agents}
+        self.secret = "test-secret"
+        self.calls = []
+        self._rc, self._stdout, self._stderr = rc, stdout, stderr
+        self._raise_on = raise_on
+
+    async def send_to_agent(self, cmd, data, agent_id=None, timeout=None):
+        self.calls.append({"cmd": cmd, "data": data, "agent_id": agent_id})
+        if self._raise_on and cmd == self._raise_on:
+            raise RuntimeError("agent link died")
+        if cmd == "RUN_COMMAND":
+            return {"result": {"rc": self._rc, "stdout": self._stdout,
+                               "stderr": self._stderr}}
+        return {"status": "SUCCESS"}
+
+
+@pytest.fixture
+def store(tmp_path):
+    """Path the custodian persists to — tmp so no test writes /etc or /var."""
+    return str(tmp_path / "cert_store.enc")
+
+
+def _make_spoke(store, control_plane=None):
     sp = spoke_mod.NetboxSpoke.__new__(spoke_mod.NetboxSpoke)
     sp.control_plane = control_plane
-    spoke_mod._NETBOX_INSTALL_CERT_HELPER = os.path.abspath(__file__)
+    sp.spoke_id = "netbox-test"
+    sp._cert_material = None
+    sp._cert_store = store
     return sp
 
 
-class _FakeControlPlane:
-    """Stand-in for the NetboxControlPlane — captures the request_to_hub call
-    (the IPAM spoke's relay to the netbox-server agent via the hub) and returns
-    a configured result. ``delay`` simulates a slow hub reply (timeout path)."""
-    def __init__(self, result=None, delay=0.0, exc=None):
-        self.calls = []
-        self._result = result if result is not None else {"status": "SUCCESS",
-                                                           "message": "installed on netbox-server"}
-        self._delay = delay
-        self._exc = exc
-
-    async def request_to_hub(self, req_type, data, timeout=30.0):
-        self.calls.append({"req_type": req_type, "data": data, "timeout": timeout})
-        import asyncio as _aio
-        if self._delay:
-            await _aio.sleep(self._delay)
-        if self._exc is not None:
-            raise self._exc
-        return self._result
+def _install(sp, crt, key, domain="netbox.test"):
+    return _run(sp._handle_install_cert(
+        {"domain": domain, "fullchain": crt, "privkey": key}))
 
 
-class _FakeProc:
-    def __init__(self, returncode, stdout=b"", stderr=b""):
-        self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
-
-    async def communicate(self, input=None):
-        return self._stdout, self._stderr
+def _run_commands(cp):
+    return [c["data"]["command"] for c in cp.calls if c["cmd"] == "RUN_COMMAND"]
 
 
-def _patch_exec(capture, returncode=0, stdout=b"OK installed /etc/lm/netbox/tls/netbox.crt + reloaded nginx",
-                stderr=b"", raises=None):
-    """Replace asyncio.create_subprocess_exec on the spoke module with a fake
-    that records the call (argv) and returns a _FakeProc. ``raises`` (an
-    exception instance) makes the helper invocation raise, to exercise the
-    helper-missing/timeout path. Returns the real exec to restore."""
-    real = spoke_mod.asyncio.create_subprocess_exec
+# ── rejected before anything reaches a host ──────────────────────────────────
 
-    async def fake_exec(bin_, *args, **kwargs):
-        capture.setdefault("calls", []).append([bin_, *args])
-        if raises is not None:
-            raise raises
-        return _FakeProc(returncode, stdout=stdout, stderr=stderr)
-
-    spoke_mod.asyncio.create_subprocess_exec = fake_exec
-    return real
+def test_missing_material_errors_and_never_touches_an_agent(store):
+    cp = _FakeControlPlane(agents=["agent-1"])
+    sp = _make_spoke(store, cp)
+    res = _run(sp._handle_install_cert({"domain": "netbox.test"}))
+    assert res["status"] == "ERROR"
+    assert "missing cert material" in res["message"]
+    assert cp.calls == []
+    assert not os.path.exists(store)          # nothing persisted
 
 
-def _tmp_files_after():
-    """Count leftover temp cert/key files the spoke failed to clean up."""
-    d = tempfile.gettempdir()
-    return [f for f in os.listdir(d) if f.endswith((".crt.pem", ".key.pem"))
-            and f.startswith("tmp")]
+def test_non_pem_rejected_and_never_touches_an_agent(store):
+    cp = _FakeControlPlane(agents=["agent-1"])
+    sp = _make_spoke(store, cp)
+    res = _install(sp, "not-a-cert", "not-a-key")
+    assert res["status"] == "ERROR"
+    assert "not PEM" in res["message"]
+    assert cp.calls == []
+    assert not os.path.exists(store)
 
 
-def test_install_cert_success_calls_helper_and_cleans_temps():
-    crt, key = _real_pair()
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "netbox.test",
-                                      "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert res["status"] == "SUCCESS", res
-    assert "installed" in res["message"].lower()
-    # The helper was invoked via sudo -n with the exact path + two temp file args.
-    assert len(cap["calls"]) == 1
-    call = cap["calls"][0]
-    assert call[0] == "sudo"
-    assert call[1] == "-n"
-    assert call[2] == spoke_mod._NETBOX_INSTALL_CERT_HELPER
-    assert len(call) == 5  # sudo -n <helper> <crt-tmp> <key-tmp>
-    crt_tmp, key_tmp = call[3], call[4]
-    assert crt_tmp != key_tmp
-    assert os.path.basename(crt_tmp).endswith(".crt.pem")
-    assert os.path.basename(key_tmp).endswith(".key.pem")
-    # Both temps are gone (finally unlink).
-    assert not os.path.exists(crt_tmp)
-    assert not os.path.exists(key_tmp)
-
-
-def test_install_cert_missing_material_errors_without_helper():
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        r1 = _run(sp.handle_command("INSTALL_CERT",
-                                    {"domain": "x", "fullchain": "", "privkey": "k"}))
-        r2 = _run(sp.handle_command("INSTALL_CERT",
-                                    {"domain": "x", "fullchain": "c", "privkey": ""}))
-        r3 = _run(sp.handle_command("INSTALL_CERT", {"domain": "x"}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    for r in (r1, r2, r3):
-        assert r["status"] == "ERROR"
-        assert "missing cert material" in r["message"]
-    # No helper invocation on missing material.
-    assert cap.get("calls", []) == []
-
-
-def test_install_cert_non_pem_rejected_without_helper():
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        # Has BEGIN CERTIFICATE but no PRIVATE KEY.
-        r1 = _run(sp.handle_command("INSTALL_CERT",
-                                    {"domain": "x",
-                                     "fullchain": "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n",
-                                     "privkey": "not a key"}))
-        # Has PRIVATE KEY but no BEGIN CERTIFICATE.
-        r2 = _run(sp.handle_command("INSTALL_CERT",
-                                    {"domain": "x", "fullchain": "not a cert",
-                                     "privkey": "-----BEGIN PRIVATE KEY-----\nK\n-----END PRIVATE KEY-----\n"}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert r1["status"] == "ERROR"
-    assert "PEM" in r1["message"]
-    assert r2["status"] == "ERROR"
-    assert "PEM" in r2["message"]
-    assert cap.get("calls", []) == []
-
-
-def test_install_cert_bad_pair_rejected_before_helper():
-    """A cert whose key doesn't match (or malformed PEM) is rejected by the
-    in-process ssl.load_cert_chain BEFORE the helper is invoked — so the live
-    nginx paths are never touched by a bad cert."""
+def test_mismatched_pair_rejected_before_deploy(store):
+    # PEM-shaped and structurally valid, but the key does not match the cert —
+    # only the in-process ssl.load_cert_chain catches this. It must be caught
+    # HERE: shipping it would swap in a cert nginx cannot serve.
     crt, _ = _real_pair()
-    _, key = _real_pair()  # DIFFERENT key, not matching crt
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
+    _, other_key = _real_pair("other.test")
+    cp = _FakeControlPlane(agents=["agent-1"])
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, other_key)
     assert res["status"] == "ERROR"
-    assert "validation failed" in res["message"]
-    assert "helper not called" in res["message"]
-    # Helper never invoked.
-    assert cap.get("calls", []) == []
+    assert "cert validation failed" in res["message"]
+    assert cp.calls == []
+    assert not os.path.exists(store)
 
 
-def test_install_cert_helper_failure_maps_to_error_and_cleans_temps():
+# ── custody ──────────────────────────────────────────────────────────────────
+
+def test_valid_pair_with_no_agent_is_cached_not_reported_as_deployed(store):
+    # The IPAM spoke commonly has no NetBox-host agent attached yet. Caching is
+    # the correct outcome, but it must NOT claim an install happened.
     crt, key = _real_pair()
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap, returncode=1, stdout=b"", stderr=b"ERROR: nginx -t failed")
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
+    cp = _FakeControlPlane(agents=[])
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
+    assert res["status"] == "SUCCESS"
+    assert "cached" in res["message"]
+    assert "deploy" in res["message"]         # tells the operator what happens next
+    assert _run_commands(cp) == []
+    assert sp._cert_material["fullchain"] == crt
+    assert os.path.exists(store)              # survives a restart
+
+
+def test_persisted_material_is_encrypted_at_rest(store):
+    # The private key is the sensitive half; it must not be readable in the file.
+    crt, key = _real_pair()
+    sp = _make_spoke(store, _FakeControlPlane(agents=[]))
+    _install(sp, crt, key)
+    blob = open(store, "rb").read()
+    assert b"PRIVATE KEY" not in blob
+    assert key.encode() not in blob
+
+
+def test_cached_cert_deploys_to_a_late_connecting_agent(store):
+    # The whole point of custody: an agent that shows up after the cert arrived
+    # still gets it, without the hub re-issuing.
+    crt, key = _real_pair()
+    sp = _make_spoke(store, _FakeControlPlane(agents=[]))
+    _install(sp, crt, key)
+
+    cp = _FakeControlPlane(agents=["late-agent"])
+    sp.control_plane = cp
+    _run(sp.deploy_cached_cert_to_agent("late-agent"))
+    assert any(c["cmd"] == "WRITE_FILE" for c in cp.calls)
+    assert any("lm-netbox-install-cert" in c for c in _run_commands(cp))
+
+
+def test_no_cached_cert_means_a_connecting_agent_gets_nothing(store):
+    cp = _FakeControlPlane(agents=["late-agent"])
+    sp = _make_spoke(store, cp)
+    _run(sp.deploy_cached_cert_to_agent("late-agent"))
+    assert cp.calls == []
+
+
+# ── deploy ───────────────────────────────────────────────────────────────────
+
+def test_deploy_writes_both_pems_then_runs_helper_then_cleans_temps(store):
+    crt, key = _real_pair()
+    cp = _FakeControlPlane(agents=["agent-1"])
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
+
+    assert res["status"] == "SUCCESS"
+    assert "1/1" in res["message"]
+
+    writes = [c for c in cp.calls if c["cmd"] == "WRITE_FILE"]
+    assert len(writes) == 2
+    assert [w["data"]["content"] for w in writes] == [crt, key]
+    # Both PEMs land 0600 — the key must never be world-readable on the host.
+    assert all(w["data"]["mode"] == 0o600 for w in writes)
+
+    cmds = _run_commands(cp)
+    assert "lm-netbox-install-cert" in cmds[0]
+    assert cmds[0].startswith("sudo -n ")
+    # Temps are removed even on the success path; both paths written are named.
+    assert cmds[-1].startswith("rm -f ")
+    for w in writes:
+        assert w["data"]["path"] in cmds[-1]
+
+
+def test_helper_failure_maps_to_error_and_still_cleans_temps(store):
+    crt, key = _real_pair()
+    cp = _FakeControlPlane(agents=["agent-1"], rc=1, stdout="",
+                           stderr="ERROR: nginx -t failed")
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
     assert res["status"] == "ERROR"
+    # The agent's own text is relayed — "nginx -t failed" and "helper missing"
+    # need different fixes, so a generic message would cost a debugging round.
     assert "nginx -t failed" in res["message"]
-    # Temps still cleaned up on the failure path.
-    call = cap["calls"][0]
-    assert not os.path.exists(call[3])
-    assert not os.path.exists(call[4])
+    assert _run_commands(cp)[-1].startswith("rm -f ")
 
 
-def test_install_cert_helper_stderr_used_when_stdout_empty():
+def test_helper_stdout_used_when_stderr_empty(store):
     crt, key = _real_pair()
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap, returncode=2, stdout=b"", stderr=b"ERROR: openssl not found")
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
+    cp = _FakeControlPlane(agents=["agent-1"], rc=2,
+                           stdout="ERROR: helper not installed", stderr="")
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
     assert res["status"] == "ERROR"
-    assert "openssl not found" in res["message"]
+    assert "helper not installed" in res["message"]
 
 
-def test_install_cert_helper_missing_raises_cleans_temps_and_errors():
-    """If sudo denies at exec time (helper present but sudo refuses / the binary
-    vanished between the existence check and the exec), create_subprocess_exec
-    raises FileNotFoundError. The handler must surface ERROR + still unlink
-    temps. (A genuinely-absent helper is caught earlier by the os.path.exists
-    check — see test_install_cert_helper_absent_returns_clear_error_no_exec.)"""
+def test_rc_zero_without_ok_prefix_is_still_a_failure(store):
+    # The helper signals success by printing OK. A zero exit alone is not
+    # enough — a helper that no-ops would otherwise read as installed.
     crt, key = _real_pair()
-    sp = _make_spoke()
-    cap = {}
-    real = _patch_exec(cap, raises=FileNotFoundError(2, "No such file", "sudo"))
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
+    cp = _FakeControlPlane(agents=["agent-1"], rc=0, stdout="nothing to do")
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
     assert res["status"] == "ERROR"
-    # Temps written before the helper call are cleaned up in finally.
-    assert cap["calls"]  # the call was attempted
 
 
-def _helper_absent_spoke(control_plane):
-    """Spoke pointed at a missing cert helper (the API-only IPAM spoke's
-    normal split-topology state) with a fake control_plane for the relay."""
-    sp = _make_spoke(control_plane=control_plane)
-    spoke_mod._NETBOX_INSTALL_CERT_HELPER = "/tmp/lm-netbox-install-cert.does.not.exist"
-    return sp
-
-
-def test_install_cert_helper_absent_relays_to_agent_no_exec():
-    """The IPAM spoke is API-only (install.sh --spoke-only, no cert helper on
-    this host). When the helper is absent the handler must RELAY INSTALL_CERT to
-    the netbox-server agent via control_plane.request_to_hub("RELAY_NETBOX_CERT")
-    — NOT attempt a local sudo exec (which would surface the raw
-    'sudo: lm-netbox-install-cert: command not found' the split topology hit).
-    The agent's result is returned verbatim."""
+def test_agent_link_failure_is_reported_not_raised(store):
     crt, key = _real_pair()
-    cp = _FakeControlPlane(result={"status": "SUCCESS",
-                                   "message": "installed on netbox-server"})
-    sp = _helper_absent_spoke(cp)
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "netbox.test",
-                                      "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert res["status"] == "SUCCESS", res
-    assert "netbox-server" in res["message"]
-    # Relay was called with the right shape.
-    assert len(cp.calls) == 1
-    call = cp.calls[0]
-    assert call["req_type"] == "RELAY_NETBOX_CERT"
-    assert call["data"]["domain"] == "netbox.test"
-    assert call["data"]["identifier"] == ""
-    assert call["data"]["cert"]["fullchain"] == crt
-    assert call["data"]["cert"]["privkey"] == key
-    # No local sudo exec attempted.
-    assert not cap.get("calls"), "exec must not be attempted when the helper is absent"
+    cp = _FakeControlPlane(agents=["agent-1"], raise_on="WRITE_FILE")
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
+    assert res["status"] == "ERROR"
+    assert "agent link died" in res["message"]
 
 
-def test_install_cert_helper_absent_no_control_plane_returns_clear_error():
-    """Helper absent AND no control_plane (standalone/test construction): the
-    handler must return a clear ERROR instead of crashing — no relay possible."""
+def test_partial_success_across_agents_reports_success_with_a_count(store):
     crt, key = _real_pair()
-    sp = _helper_absent_spoke(control_plane=None)
-    cap = {}
-    real = _patch_exec(cap)
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert res["status"] == "ERROR"
-    assert "control plane" in res["message"], res["message"]
-    assert not cap.get("calls")
+    cp = _FakeControlPlane(agents=["agent-1", "agent-2"])
+
+    ok = {"agent-1"}
+
+    async def send_to_agent(cmd, data, agent_id=None, timeout=None):
+        cp.calls.append({"cmd": cmd, "data": data, "agent_id": agent_id})
+        if cmd == "RUN_COMMAND":
+            good = agent_id in ok
+            return {"result": {"rc": 0 if good else 1,
+                               "stdout": "OK installed" if good else "",
+                               "stderr": "" if good else "boom"}}
+        return {"status": "SUCCESS"}
+
+    cp.send_to_agent = send_to_agent
+    sp = _make_spoke(store, cp)
+    res = _install(sp, crt, key)
+    # One host serving the new cert is a better outcome than none, so this is
+    # SUCCESS — but the count has to make the partial failure visible.
+    assert res["status"] == "SUCCESS"
+    assert "1/2" in res["message"]
 
 
-def test_install_cert_helper_absent_relay_failure_passes_through():
-    """If the relayed agent install fails (helper error on the agent), the spoke
-    must pass the agent's ERROR through to the hub's distribution loop verbatim."""
+def test_no_control_plane_still_takes_custody(store):
     crt, key = _real_pair()
-    cp = _FakeControlPlane(result={"status": "ERROR",
-                                  "message": "ERROR: nginx -t failed"})
-    sp = _helper_absent_spoke(cp)
-    real = _patch_exec({})
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert res["status"] == "ERROR"
-    assert "nginx -t failed" in res["message"]
-
-
-def test_install_cert_bad_pair_not_relayed():
-    """A cert whose key doesn't match is rejected by the in-process
-    ssl.load_cert_chain BEFORE the relay — so the netbox-server agent is never
-    asked to install a bad pair. The relay must NOT be called."""
-    crt, _ = _real_pair()
-    _, key = _real_pair()  # DIFFERENT key, not matching crt
-    cp = _FakeControlPlane()
-    sp = _helper_absent_spoke(cp)
-    real = _patch_exec({})
-    try:
-        res = _run(sp.handle_command("INSTALL_CERT",
-                                     {"domain": "x", "fullchain": crt, "privkey": key}))
-    finally:
-        spoke_mod.asyncio.create_subprocess_exec = real
-    assert res["status"] == "ERROR"
-    assert "validation failed" in res["message"]
-    assert cp.calls == [], "relay must not be called for a bad cert pair"
+    sp = _make_spoke(store, control_plane=None)
+    res = _install(sp, crt, key)
+    # Custody does not depend on a control plane: the material is kept so it can
+    # be deployed once one exists.
+    assert sp._cert_material is not None
+    assert res["status"] == "SUCCESS"
+    assert "cached" in res["message"]

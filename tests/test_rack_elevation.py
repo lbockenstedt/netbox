@@ -30,9 +30,10 @@ from netbox_engine import NetboxEngine  # noqa: E402
 
 
 class _Ref:
-    """Nested object stand-in with a .name (pynetbox-Record-like)."""
-    def __init__(self, name):
+    """Nested object stand-in with a .name/.slug (pynetbox-Record-like)."""
+    def __init__(self, name, slug=""):
         self.name = name
+        self.slug = slug
 
 
 class _Rack:
@@ -69,14 +70,21 @@ def _unit(unit, device, face):
 def _engine(front_units, rear_units, all_devs, rack):
     eng = NetboxEngine("http://localhost", "tok")
 
-    def _api_get(path, params=None):
+    # BOTH the elevation and the device list go through _api_get_all: the
+    # elevation endpoint is paginated and honours the deployment's page-size
+    # cap, so it has to follow ``next`` links or a tall rack silently truncates.
+    # The fake therefore has to dispatch on path — when it returned the device
+    # list for every call, the elevation parsed devices as rack units.
+    def _api_get_all(path, params=None):
         if path.endswith("/elevation/"):
             face = (params or {}).get("face")
             return list(front_units if face == "front" else rear_units)
-        return {"results": []}
+        if "/devices/" in path:
+            return list(all_devs)
+        return []
 
-    eng._api_get = MagicMock(side_effect=_api_get)
-    eng._api_get_all = MagicMock(return_value=list(all_devs))
+    eng._api_get = MagicMock(return_value={"results": []})
+    eng._api_get_all = MagicMock(side_effect=_api_get_all)
     eng.nb = MagicMock()
     eng.nb.dcim.racks.get = MagicMock(return_value=rack)
     return eng
@@ -95,13 +103,17 @@ def test_front_rear_units_top_to_bottom():
     front = [_unit(42, A, "front"), _unit(41, A, "front"), _unit(40, A, "front"),
              _unit(39, None, "front"), _unit(38, B, "front")]
     rear = [_unit(42, C, "rear")]
-    rack = _Rack(7, "HH1", 42, _Ref("Site A"), _Ref("acme"))
+    rack = _Rack(7, "HH1", 42, _Ref("Site A", "site-a"), _Ref("acme"))
     eng = _engine(front, rear, [A, B, C], rack)
 
     res = eng.get_rack_elevation(7)
     assert res["status"] == "SUCCESS"
+    # site_slug is carried alongside the display name because add_device_to_rack
+    # takes a site SLUG — the WebUI's "Add device" from this view needs it to
+    # prefill.
     assert res["rack"] == {"id": 7, "name": "HH1", "u_height": 42,
-                           "site": "Site A", "tenant": "acme"}
+                           "site": "Site A", "site_slug": "site-a",
+                           "tenant": "acme"}
 
     f = res["faces"]["front"]
     assert [u["unit"] for u in f] == [42, 41, 40, 39, 38]
@@ -176,3 +188,24 @@ def test_unit_id_falls_back_to_name():
     eng = _engine(front, [], [A], rack)
     u = eng.get_rack_elevation(7)["faces"]["front"][0]
     assert u["unit"] == 5
+
+def test_empty_half_u_rows_dropped_but_occupied_ones_kept():
+    """NetBox can emit half-U (0.5) granularity slots. This deployment never
+    mounts at half-U, so an EMPTY half-U row is filler that renders as a blank
+    '.5' line — drop it. An OCCUPIED half-U slot is real and must survive, or a
+    device would silently vanish from the elevation."""
+    A = _dev(11, "sw", "3810M", "Switch", "3aa84f", position=42)
+    front = [
+        _unit(42, A, "front"),
+        {"id": 41.5, "name": "U41.5", "face": "front", "device": None},
+        _unit(41, None, "front"),
+        {"id": 40.5, "name": "U40.5", "face": "front", "device": A},
+    ]
+    rack = _Rack(7, "HH1", 42, _Ref("Site A", "site-a"), None)
+    eng = _engine(front, [], [A], rack)
+
+    units = eng.get_rack_elevation(7)["faces"]["front"]
+    assert [u["unit"] for u in units] == [42, 41, 40.5]
+    # Whole units are normalized to int, not left as floats, so the WebUI
+    # renders "U42" rather than "U42.0".
+    assert all(isinstance(u["unit"], int) for u in units[:2])
