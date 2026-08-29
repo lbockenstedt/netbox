@@ -17,3 +17,8 @@ secrets.json
 # Local git worktrees — never part of the repo
 .claude/worktrees/
 .wt-*/
+
+# mTLS material and runtime secrets issued by the hub — never commit these
+certs/
+.env.lock
+*.crt
