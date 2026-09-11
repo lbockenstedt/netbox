@@ -77,11 +77,19 @@ class IpamMixin:
                             "message": f"NetBox tenant '{tenant_slug}' not found — subnet not attributed. Check the tenant's NetBox slug mapping."}
 
             if requested_prefix:
+                # A bare address with no explicit "/mask" (e.g. the user typed
+                # "172.17.0.0" instead of "172.17.0.0/24") would make
+                # ipaddress.ip_network() silently default to /32, discarding
+                # the separately-selected prefix_length and creating a
+                # single-host prefix instead of the requested subnet. Apply
+                # the dropdown's prefix_length in that case.
+                if "/" not in requested_prefix:
+                    requested_prefix = f"{requested_prefix}/{prefix_length}"
                 parent_net = ipaddress.ip_network(parent_prefix, strict=False)
                 req_net = ipaddress.ip_network(requested_prefix, strict=False)
                 if not req_net.subnet_of(parent_net):
                     return {"status": "ERROR", "message": f"{requested_prefix} is not within {parent_prefix}"}
-                payload["prefix"] = requested_prefix
+                payload["prefix"] = str(req_net)
                 allocated = self.nb.ipam.prefixes.create(payload)
             else:
                 payload["prefix_length"] = prefix_length
