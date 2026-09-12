@@ -33,6 +33,14 @@ class IpamMixin:
                     "vrf": p["vrf"]["name"] if p.get("vrf") else "",
                     "description": p.get("description") or "",
                     "is_pool": p.get("is_pool", False),
+                    # Forward custom_fields so the hub's DHCP sync can read
+                    # dhcp_enabled/gateway/dns_servers, and the WebUI edit
+                    # modal can pre-check "Enable DHCP scope" — this was
+                    # dropped entirely before, so dhcp_enabled always read as
+                    # false downstream regardless of what was actually saved
+                    # in NetBox (no prefix could ever become a Kea scope, and
+                    # the edit modal's checkbox could never reflect reality).
+                    "custom_fields": p.get("custom_fields") or {},
                 })
             return {"status": "SUCCESS", "prefixes": prefixes}
         except Exception as e:
@@ -47,18 +55,24 @@ class IpamMixin:
         status: str = "active",
         requested_prefix: Optional[str] = None,
         tenant_slug: Optional[str] = None,
+        custom_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Allocate a child prefix of a parent.
 
         When ``requested_prefix`` is supplied, that exact subnet is created
         directly (after verifying it is a subnet of ``parent_prefix``); otherwise
-        NetBox auto-allocates the next available child of ``prefix_length``."""
+        NetBox auto-allocates the next available child of ``prefix_length``.
+        ``custom_fields`` (e.g. ``dhcp_enabled``/``gateway``/``dns_servers``)
+        is written at creation time so the WebUI's "Enable DHCP scope"
+        checkbox on the Allocate Subnet modal actually takes effect."""
         try:
             parent = self.nb.ipam.prefixes.get(prefix=parent_prefix)
             if not parent:
                 return {"status": "ERROR", "message": f"Parent prefix '{parent_prefix}' not found"}
 
             payload: Dict[str, Any] = {"description": description, "status": status}
+            if custom_fields:
+                payload["custom_fields"] = custom_fields
             if site_slug:
                 site = self.nb.dcim.sites.get(slug=site_slug)
                 if site:
@@ -408,8 +422,19 @@ class IpamMixin:
 
     def update_prefix(self, prefix_id: int, description: Optional[str] = None,
                       status: Optional[str] = None,
-                      site_slug: Optional[str] = None) -> Dict[str, Any]:
-        """Edit a prefix's description/status/site."""
+                      site_slug: Optional[str] = None,
+                      custom_fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Edit a prefix's description/status/site/custom_fields.
+
+        ``custom_fields`` (e.g. ``{"dhcp_enabled": true}``) is MERGED onto the
+        prefix's existing custom fields rather than replacing the dict
+        outright — a partial update (just the DHCP checkbox) must not blank
+        out any other custom field NetBox is tracking on this prefix. This
+        was previously silently dropped entirely: the WebUI's "Enable DHCP
+        scope" checkbox on Edit never persisted, so a prefix could never
+        become a Kea DHCP scope through the edit path, and the checkbox
+        never reflected NetBox's actual saved state on reopen.
+        """
         try:
             pfx = self.nb.ipam.prefixes.get(prefix_id)
             if not pfx:
@@ -426,6 +451,10 @@ class IpamMixin:
                     pfx.site = site.id
                 else:
                     pfx.site = None
+            if custom_fields:
+                merged = dict(pfx.custom_fields or {})
+                merged.update(custom_fields)
+                pfx.custom_fields = merged
             pfx.save()
             return {"status": "SUCCESS", "id": pfx.id, "prefix": str(pfx.prefix)}
         except Exception as e:
