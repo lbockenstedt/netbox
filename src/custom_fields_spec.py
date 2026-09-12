@@ -82,4 +82,15 @@ CUSTOM_FIELDS_SPEC = [
     # Proxmox VMID auto-allocation range on tenancy.tenant (integer fields).
     ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
     ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
+    # DHCP module opt-in + per-scope options on ipam.prefix — read by the hub's
+    # dns_dhcp_sync.build_dhcp_payload() (custom_fields.dhcp_enabled/gateway/
+    # dns_servers) to decide whether/how a NetBox prefix becomes a Kea DHCP
+    # scope. dhcp_enabled is the WebUI "Enable DHCP scope" checkbox on the
+    # Allocate/Edit Subnet modals; without these three rows registered here,
+    # every write of custom_fields.dhcp_enabled 400s with "Custom field
+    # 'dhcp_enabled' does not exist for this object type." and the checkbox can
+    # never persist.
+    ("dhcp_enabled", "boolean", "DHCP enabled", "ipam.prefix"),
+    ("gateway", "text", "Gateway", "ipam.prefix"),
+    ("dns_servers", "text", "DNS servers", "ipam.prefix"),
 ]
