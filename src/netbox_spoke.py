@@ -677,6 +677,7 @@ class NetboxSpoke(BaseSpoke):
                 status=data.get("status", "active"),
                 requested_prefix=data.get("requested_prefix"),
                 tenant_slug=data.get("tenant"),
+                custom_fields=data.get("custom_fields"),
             )
 
         if normalized == "NETBOX_FIND_AVAILABLE_PREFIXES":
@@ -712,6 +713,7 @@ class NetboxSpoke(BaseSpoke):
                 description=data.get("description"),
                 status=data.get("status"),
                 site_slug=data.get("site"),
+                custom_fields=data.get("custom_fields"),
             )
 
         if normalized == "NETBOX_DELETE_PREFIX":
