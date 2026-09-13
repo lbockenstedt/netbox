@@ -65,6 +65,22 @@ def test_spec_has_expected_fields_and_no_duplicate_name_ct_pairs():
     assert types["proxmox_labels"] == "text"
 
 
+def test_spec_has_dhcp_scope_fields_on_ipam_prefix():
+    """The Lab Manager DHCP/IPAM WebUI panel writes these onto ipam.prefix
+    (see dns_dhcp_sync.build_dhcp_payload + kea_manager.build_subnet4 in the
+    lm repo) — they were previously missing here entirely, which is why every
+    write that touched dhcp_enabled/gateway/dns_servers 400'd with "Custom
+    field ... does not exist for this object type."."""
+    by_name_ct = {(n, ct): t for n, t, _l, ct in CUSTOM_FIELDS_SPEC}
+    expected_text = ("gateway", "dns_servers", "search_domain", "domain_name",
+                     "ntp_servers", "tftp_server_name", "boot_file_name",
+                     "netbios_name_servers", "broadcast_address")
+    for name in expected_text:
+        assert by_name_ct.get((name, "ipam.prefix")) == "text", name
+    assert by_name_ct.get(("dhcp_enabled", "ipam.prefix")) == "boolean"
+    assert by_name_ct.get(("lease_time", "ipam.prefix")) == "integer"
+
+
 def test_ensure_custom_fields_idempotent_when_all_present_and_attached():
     # Every spec field already exists AND is attached to its content type → the
     # run is a no-op that reports SUCCESS, present=total, created=0, attached=0,
