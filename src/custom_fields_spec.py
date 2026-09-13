@@ -100,4 +100,5 @@ CUSTOM_FIELDS_SPEC = [
     ("netbios_name_servers", "text", "NetBIOS name servers (comma-separated)", "ipam.prefix"),
     ("broadcast_address", "text", "Broadcast address", "ipam.prefix"),
     ("lease_time", "integer", "DHCP lease time (seconds)", "ipam.prefix"),
+    ("exclusion_ranges", "text", "DHCP exclusion ranges (comma-separated)", "ipam.prefix"),
 ]
