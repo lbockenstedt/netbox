@@ -82,15 +82,22 @@ CUSTOM_FIELDS_SPEC = [
     # Proxmox VMID auto-allocation range on tenancy.tenant (integer fields).
     ("vmid_start", "integer", "Proxmox VMID range start", "tenancy.tenant"),
     ("vmid_end", "integer", "Proxmox VMID range end", "tenancy.tenant"),
-    # DHCP module opt-in + per-scope options on ipam.prefix — read by the hub's
-    # dns_dhcp_sync.build_dhcp_payload() (custom_fields.dhcp_enabled/gateway/
-    # dns_servers) to decide whether/how a NetBox prefix becomes a Kea DHCP
-    # scope. dhcp_enabled is the WebUI "Enable DHCP scope" checkbox on the
-    # Allocate/Edit Subnet modals; without these three rows registered here,
-    # every write of custom_fields.dhcp_enabled 400s with "Custom field
-    # 'dhcp_enabled' does not exist for this object type." and the checkbox can
-    # never persist.
+    # DHCP scope config on ipam.prefix (Lab Manager's DHCP/IPAM WebUI panel →
+    # dns_dhcp_sync.build_dhcp_payload on the hub → kea_manager.build_subnet4
+    # on the DHCP spoke, which turns these into Kea subnet4 option-data). This
+    # is the missing half of a feature that was wired up end-to-end on the
+    # hub/DHCP side without ever being added here — every prefix write that
+    # touched these fields 400'd with "Custom field 'dhcp_enabled' does not
+    # exist for this object type." until now.
     ("dhcp_enabled", "boolean", "DHCP enabled", "ipam.prefix"),
     ("gateway", "text", "Gateway", "ipam.prefix"),
-    ("dns_servers", "text", "DNS servers", "ipam.prefix"),
+    ("dns_servers", "text", "DNS servers (comma-separated)", "ipam.prefix"),
+    ("search_domain", "text", "DNS search domain(s) (comma-separated)", "ipam.prefix"),
+    ("domain_name", "text", "Domain name", "ipam.prefix"),
+    ("ntp_servers", "text", "NTP servers (comma-separated)", "ipam.prefix"),
+    ("tftp_server_name", "text", "TFTP server name", "ipam.prefix"),
+    ("boot_file_name", "text", "Boot file name", "ipam.prefix"),
+    ("netbios_name_servers", "text", "NetBIOS name servers (comma-separated)", "ipam.prefix"),
+    ("broadcast_address", "text", "Broadcast address", "ipam.prefix"),
+    ("lease_time", "integer", "DHCP lease time (seconds)", "ipam.prefix"),
 ]
