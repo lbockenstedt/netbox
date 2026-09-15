@@ -355,12 +355,30 @@ class IpamMixin:
         dns_name: str = "",
         status: str = "active",
         address: Optional[str] = None,
+        tenant_slug: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Allocate an IP address from a prefix.
 
         When ``address`` is supplied, that exact address is created directly
         (mask derived from ``prefix`` if not included, and verified to be inside
-        the prefix); otherwise NetBox auto-allocates the next available address."""
+        the prefix); otherwise NetBox auto-allocates the next available address.
+
+        The new address is always attributed to a tenant: ``tenant_slug`` when
+        the caller names one, otherwise the containing prefix's tenant. NetBox
+        does **not** inherit tenancy from the parent prefix on its own, so
+        without this every address minted here landed tenant-less while every
+        address created by hand carried its prefix's tenant. That breaks the
+        fleet rule that new resources carry tenant context: a tenant-scoped
+        IPAM view filters the address out, so the operator who just reserved it
+        cannot see it. It bit the DHCP reservation write-back in particular,
+        which creates the IP object behind the scenes and had no tenant to pass.
+
+        An explicitly named tenant that cannot be resolved is an error rather
+        than a silent fallback (mirrors ``allocate_prefix``) — quietly
+        attributing the address to the prefix's tenant instead of the one the
+        caller asked for is exactly the kind of tenant mismatch this guards
+        against. An unset tenant on the prefix itself is not an error; there is
+        simply nothing to inherit."""
         try:
             prefix_obj = self.nb.ipam.prefixes.get(prefix=prefix)
             if not prefix_obj:
@@ -369,6 +387,21 @@ class IpamMixin:
             payload: Dict[str, Any] = {"description": description, "status": status}
             if dns_name:
                 payload["dns_name"] = dns_name
+
+            if tenant_slug:
+                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                if not tenant:
+                    logger.warning(
+                        f"allocate_ip: NetBox tenant '{tenant_slug}' not found; "
+                        f"refusing unattributed allocate under {prefix}")
+                    return {"status": "ERROR",
+                            "message": f"NetBox tenant '{tenant_slug}' not found — address not attributed. Check the tenant's NetBox slug mapping."}
+                payload["tenant"] = tenant.id
+            else:
+                inherited = getattr(prefix_obj, "tenant", None)
+                inherited_id = getattr(inherited, "id", None)
+                if inherited_id is not None:
+                    payload["tenant"] = inherited_id
 
             if address:
                 # Derive the mask from the containing prefix when the caller
@@ -385,7 +418,8 @@ class IpamMixin:
                 ip_obj = self.nb.ipam.ip_addresses.create(payload)
             else:
                 ip_obj = prefix_obj.available_ips.create(payload)
-            return {"status": "SUCCESS", "address": ip_obj.address, "id": ip_obj.id, "dns_name": dns_name}
+            return {"status": "SUCCESS", "address": ip_obj.address, "id": ip_obj.id,
+                    "dns_name": dns_name, "tenant": payload.get("tenant")}
         except Exception as e:
             logger.error(f"allocate_ip failed: {e}")
             return {"status": "ERROR", "message": str(e)}
