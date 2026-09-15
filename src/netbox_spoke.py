@@ -747,6 +747,7 @@ class NetboxSpoke(BaseSpoke):
                 dns_name=data.get("dns_name"),
                 description=data.get("description"),
                 status=data.get("status"),
+                custom_fields=data.get("custom_fields"),
             )
 
         if normalized == "NETBOX_UPDATE_IP":

@@ -402,8 +402,25 @@ class IpamMixin:
 
     def update_ip_address(self, ip_id: int, dns_name: Optional[str] = None,
                           description: Optional[str] = None,
-                          status: Optional[str] = None) -> Dict[str, Any]:
-        """Edit an IP address's mutable attributes (dns_name/description/status)."""
+                          status: Optional[str] = None,
+                          custom_fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Edit an IP address's mutable attributes.
+
+        ``custom_fields`` (e.g. ``{"mac_address": "aa:bb:.."}``) is MERGED onto
+        the IP's existing custom fields rather than replacing the dict outright,
+        for the same reason as ``update_prefix``: a partial update must not
+        blank out any other custom field NetBox tracks on this address.
+
+        This was previously silently dropped entirely, and the consequence was
+        severe rather than cosmetic. The hub mirrors every DHCP reservation's
+        MAC onto its NetBox IP via this call, because ``build_dhcp_payload``
+        mints a reservation only for an IP carrying ``custom_fields.mac_address``
+        and ``core.dns_dhcp_sync`` rebuilds Kea's whole ``subnet4`` from NetBox
+        alone. With the MAC never landing here, a reservation added in the
+        WebUI stayed Kea-only and the next sync deleted it — the add returned
+        SUCCESS and the row appeared in the list, so the loss looked like the
+        reservation had simply vanished on its own some minutes later.
+        """
         try:
             ip_obj = self.nb.ipam.ip_addresses.get(ip_id)
             if not ip_obj:
@@ -414,6 +431,10 @@ class IpamMixin:
                 ip_obj.description = description
             if status:
                 ip_obj.status = status
+            if custom_fields:
+                merged = dict(ip_obj.custom_fields or {})
+                merged.update(custom_fields)
+                ip_obj.custom_fields = merged
             ip_obj.save()
             return {"status": "SUCCESS", "id": ip_obj.id, "address": ip_obj.address}
         except Exception as e:
