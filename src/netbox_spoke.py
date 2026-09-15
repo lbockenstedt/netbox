@@ -735,6 +735,7 @@ class NetboxSpoke(BaseSpoke):
                 dns_name=data.get("dns_name", ""),
                 status=data.get("status", "active"),
                 address=data.get("address"),
+                tenant_slug=data.get("tenant_slug") or data.get("tenant"),
             )
 
         if normalized == "NETBOX_RELEASE_IP":
