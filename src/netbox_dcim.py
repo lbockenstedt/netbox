@@ -3,10 +3,114 @@ import ipaddress
 import json
 import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")
+
+_SEARCH_INV_TTL = 60.0      # seconds a cached inventory snapshot stays valid
+_SEARCH_INV_MAX = 20000     # max rows kept per type (device / ip / vm)
+_SEARCH_MATCH_LIMIT = 50    # max inventory matches returned per type
+_MAC_QUERY_RE = re.compile(r"^[0-9a-f:.\-]+$")
+_NON_HEX_RE = re.compile(r"[^0-9a-f]")
+
+
+def _status_of(obj: Dict, key: str = "value") -> str:
+    st = obj.get("status") or {}
+    return st.get(key, "") if isinstance(st, dict) else str(st)
+
+
+def _tags_of(obj: Dict) -> str:
+    names = []
+    for t in obj.get("tags") or []:
+        n = (t.get("name") or t.get("display") or "") if isinstance(t, dict) else str(t)
+        if n:
+            names.append(n)
+    return ",".join(names)
+
+
+def _nested(obj: Dict, key: str, field: str = "name") -> str:
+    v = obj.get(key)
+    return (v.get(field) or "") if isinstance(v, dict) else ""
+
+
+def _finish_row(row: Dict, extra: List[str]) -> Dict:
+    """Attach the private _hay / _mac_hex search keys to an inventory row."""
+    ip = row.get("ip") or ""
+    parts = [row.get(k) or "" for k in (
+        "name", "serial", "asset_tag", "device_type", "manufacturer", "role",
+        "site", "rack", "tenant", "tags", "status", "dns_name", "cluster",
+        "mac", "assigned_to")]
+    parts.append(ip)
+    parts.append(ip.split("/")[0])
+    parts.extend(extra)
+    row["_hay"] = " ".join(str(p) for p in parts if p).lower()
+    row["_mac_hex"] = _NON_HEX_RE.sub("", (row.get("mac") or "").lower())
+    return row
+
+
+def _device_row(d: Dict) -> Dict:
+    cf = d.get("custom_fields") or {}
+    pip = d.get("primary_ip")
+    dt = d.get("device_type") if isinstance(d.get("device_type"), dict) else {}
+    role = d.get("role") if d.get("role") is not None else d.get("device_role")
+    return _finish_row({
+        "source":       "netbox",
+        "type":         "device",
+        "id":           d["id"],
+        "name":         d.get("name") or "",
+        "ip":           (pip.get("address") or "") if isinstance(pip, dict) else "",
+        "mac":          cf.get("mac_address") or "",
+        "status":       _status_of(d),
+        "site":         _nested(d, "site"),
+        "rack":         _nested(d, "rack"),
+        "role":         (role.get("name") or "") if isinstance(role, dict) else "",
+        "device_type":  dt.get("display") or dt.get("model") or "",
+        "url":          f"/dcim/devices/{d['id']}/",
+        "serial":       d.get("serial") or "",
+        "asset_tag":    d.get("asset_tag") or "",
+        "manufacturer": _nested(dt, "manufacturer"),
+        "tenant":       _nested(d, "tenant"),
+        "tags":         _tags_of(d),
+    }, [])
+
+
+def _ip_row(ip: Dict) -> Dict:
+    cf = ip.get("custom_fields") or {}
+    ao = ip.get("assigned_object")
+    return _finish_row({
+        "source":      "netbox",
+        "type":        "ip",
+        "id":          ip["id"],
+        "name":        ip.get("address") or "",
+        "ip":          ip.get("address") or "",
+        "mac":         cf.get("mac_address") or "",
+        "dns_name":    ip.get("dns_name") or "",
+        "status":      _status_of(ip),
+        "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
+        "url":         f"/ipam/ip-addresses/{ip['id']}/",
+        "tenant":      _nested(ip, "tenant"),
+        "tags":        _tags_of(ip),
+    }, [])
+
+
+def _vm_row(vm: Dict) -> Dict:
+    pip = vm.get("primary_ip")
+    return _finish_row({
+        "source":  "netbox",
+        "type":    "vm",
+        "id":      vm["id"],
+        "name":    vm.get("name") or "",
+        "cluster": _nested(vm, "cluster"),
+        "status":  _status_of(vm, "label"),
+        "site":    _nested(vm, "site"),
+        "url":     f"/virtualization/virtual-machines/{vm['id']}/",
+        "ip":      (pip.get("address") or "") if isinstance(pip, dict) else "",
+        "tenant":  _nested(vm, "tenant"),
+        "tags":    _tags_of(vm),
+    }, [_status_of(vm)])
 
 # Bundled Aruba/HPE/Juniper device-type catalog loaded by seed_catalog(). Lives
 # next to this module so the spoke ships it without an extra install step.
@@ -530,6 +634,61 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
+    def _search_inventory(self, tenant_slugs: List[str]) -> Dict[str, List[Dict]]:
+        """Scoped device / ip / vm inventory with precomputed search haystacks,
+        cached per tenant scope for _SEARCH_INV_TTL seconds. Never raises; a
+        type that failed to load is empty and its entry is not cached."""
+        key = tuple(sorted(tenant_slugs))
+        lock = getattr(self, "_search_inv_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault("_search_inv_lock", threading.Lock())
+        with lock:
+            cache = self.__dict__.setdefault("_search_inv_cache", {})
+            hit = cache.get(key)
+            if hit and time.monotonic() - hit[0] < _SEARCH_INV_TTL:
+                return hit[1]
+
+        params_list = [{"tenant": s} for s in tenant_slugs] or [{}]
+        inv: Dict[str, List[Dict]] = {}
+        ok = True
+        for name, path, build in (
+                ("device", "/api/dcim/devices/", _device_row),
+                ("ip", "/api/ipam/ip-addresses/", _ip_row),
+                ("vm", "/api/virtualization/virtual-machines/", _vm_row)):
+            try:
+                seen_ids: set = set()
+                rows: List[Dict] = []
+                for tp in params_list:
+                    for obj in self._api_get_all(path, dict(tp)):
+                        if obj["id"] in seen_ids:
+                            continue
+                        seen_ids.add(obj["id"])
+                        rows.append(build(obj))
+                inv[name] = rows[:_SEARCH_INV_MAX]
+            except Exception as e:
+                logger.error(f"NetBox search inventory {name} failed: {e}")
+                inv[name] = []
+                ok = False
+        if ok:
+            with lock:
+                cache[key] = (time.monotonic(), inv)
+        return inv
+
+    @staticmethod
+    def _inventory_matches(row: Dict, q: str) -> bool:
+        """Case-insensitive substring match over the row haystack, plus a
+        separator-insensitive partial-MAC match (>= 4 hex digits)."""
+        q_low = (q or "").strip().lower()
+        if not q_low:
+            return False
+        if q_low in row.get("_hay", ""):
+            return True
+        if _MAC_QUERY_RE.match(q_low):
+            q_hex = _NON_HEX_RE.sub("", q_low)
+            if len(q_hex) >= 4 and q_hex in row.get("_mac_hex", ""):
+                return True
+        return False
+
     def search(self, query: str, tenant: Optional[str] = None,
                is_admin: bool = False) -> Dict[str, Any]:
         """
@@ -537,6 +696,12 @@ class DcimMixin:
         VLANs, sites, and virtual machines. Returns a normalised list of hits
         tagged with source="netbox" and carrying the common keys the UI groups
         on (source/type/name/ip/mac/cluster).
+
+        A partial-match inventory pass runs first: a short-lived cached
+        snapshot of the scoped devices/IPs/VMs is matched case-insensitively
+        as a substring across name, IP, MAC, serial, asset tag, type,
+        manufacturer, role, site, rack, tenant, tags and status. The NetBox
+        ``q=`` sections below then add anything the snapshot missed.
 
         Tenant scoping: a scoped caller (non-admin, or an admin viewing a
         tenant) is restricted to its NetBox tenant PLUS the ``shared`` tenant
@@ -580,6 +745,20 @@ class DcimMixin:
                 return
             seen.add(key)
             results.append(r)
+
+        # ── Partial-match inventory pass (richer rows win the (type, id) de-dupe) ─
+        try:
+            inv = self._search_inventory(tenant_slugs)
+            for kind in ("device", "ip", "vm"):
+                n = 0
+                for row in inv.get(kind, []):
+                    if n >= _SEARCH_MATCH_LIMIT:
+                        break
+                    if self._inventory_matches(row, q):
+                        _add({k: v for k, v in row.items() if not k.startswith("_")})
+                        n += 1
+        except Exception as e:
+            logger.error(f"NetBox search inventory failed: {e}")
 
         _MAC_RE = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
         is_mac = bool(_MAC_RE.match(q))
