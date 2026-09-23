@@ -18,11 +18,13 @@ _NON_HEX_RE = re.compile(r"[^0-9a-f]")
 
 
 def _status_of(obj: Dict, key: str = "value") -> str:
+    """Extract status string value or label from a dictionary object."""
     st = obj.get("status") or {}
     return st.get(key, "") if isinstance(st, dict) else str(st)
 
 
 def _tags_of(obj: Dict) -> str:
+    """Format an object's tags list into a comma-separated string."""
     names = []
     for t in obj.get("tags") or []:
         n = (t.get("name") or t.get("display") or "") if isinstance(t, dict) else str(t)
@@ -32,6 +34,7 @@ def _tags_of(obj: Dict) -> str:
 
 
 def _nested(obj: Dict, key: str, field: str = "name") -> str:
+    """Safely extract a nested dictionary field string."""
     v = obj.get(key)
     return (v.get(field) or "") if isinstance(v, dict) else ""
 
@@ -52,6 +55,7 @@ def _finish_row(row: Dict, extra: List[str]) -> Dict:
 
 
 def _device_row(d: Dict) -> Dict:
+    """Format a NetBox device dict into a normalized search inventory row."""
     cf = d.get("custom_fields") or {}
     pip = d.get("primary_ip")
     dt = d.get("device_type") if isinstance(d.get("device_type"), dict) else {}
@@ -78,6 +82,7 @@ def _device_row(d: Dict) -> Dict:
 
 
 def _ip_row(ip: Dict) -> Dict:
+    """Format a NetBox IP address dict into a normalized search inventory row."""
     cf = ip.get("custom_fields") or {}
     ao = ip.get("assigned_object")
     return _finish_row({
@@ -97,6 +102,7 @@ def _ip_row(ip: Dict) -> Dict:
 
 
 def _vm_row(vm: Dict) -> Dict:
+    """Format a NetBox VM dict into a normalized search inventory row."""
     pip = vm.get("primary_ip")
     return _finish_row({
         "source":  "netbox",
@@ -123,6 +129,7 @@ class DcimMixin:
     # ─── Health ────────────────────────────────────────────────────────────────
 
     def get_system_health(self) -> Dict[str, Any]:
+        """Perform a quick health check query against the NetBox DCIM API."""
         try:
             data = self._api_get("/api/dcim/sites/", {"limit": 1})
             return {"status": "SUCCESS", "api_reachable": True, "site_count": data.get("count", 0)}
@@ -132,6 +139,7 @@ class DcimMixin:
     # ─── DCIM – Sites / Racks / Devices ───────────────────────────────────────
 
     def get_sites(self) -> Dict[str, Any]:
+        """Retrieve all sites configured in NetBox."""
         try:
             rows = self._api_get_all("/api/dcim/sites/")
             sites = [{"id": s["id"], "name": s["name"], "slug": s["slug"]}
@@ -141,6 +149,7 @@ class DcimMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def get_racks(self, site: Optional[str] = None, tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve racks filtered optionally by site or tenant."""
         try:
             params: Dict[str, Any] = {}
             if site:
@@ -163,6 +172,7 @@ class DcimMixin:
 
     def get_devices(self, site: Optional[str] = None, rack: Optional[str] = None,
                     tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve devices filtered optionally by site, rack, or tenant."""
         try:
             params: Dict[str, Any] = {}
             if site:
@@ -492,6 +502,7 @@ class DcimMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def delete_device(self, device_id: int) -> Dict[str, Any]:
+        """Delete a device record from NetBox by ID."""
         try:
             device = self.nb.dcim.devices.get(device_id)
             if not device:
@@ -568,6 +579,7 @@ class DcimMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def delete_rack(self, rack_id: int) -> Dict[str, Any]:
+        """Delete a rack record from NetBox by ID."""
         try:
             rack = self.nb.dcim.racks.get(rack_id)
             if not rack:
@@ -612,6 +624,7 @@ class DcimMixin:
     # ─── Legacy methods ────────────────────────────────────────────────────────
 
     def update_device_ip(self, device_name: str, ip_address: str) -> Dict[str, Any]:
+        """Update or assign an IP address to a device's primary interface."""
         try:
             device = self.nb.dcim.devices.get(name=device_name)
             if not device:
@@ -926,6 +939,7 @@ class DcimMixin:
 
     @staticmethod
     def _slugify(name: str) -> str:
+        """Convert an arbitrary name string into a lowercase URL-friendly slug."""
         return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
 
     def _load_seed_catalog(self) -> Dict[str, Any]:
