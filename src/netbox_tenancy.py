@@ -11,6 +11,7 @@ class TenancyMixin:
     # ─── Tenancy ───────────────────────────────────────────────────────────────
 
     def get_tenants(self) -> Dict[str, Any]:
+        """Retrieve all tenants configured in NetBox."""
         try:
             rows = self._api_get_all("/api/tenancy/tenants/")
             tenants = [
