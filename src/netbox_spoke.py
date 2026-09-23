@@ -1,3 +1,9 @@
+"""NetBox IPAM and DCIM spoke implementation for Lab Manager.
+
+Provides synchronization, allocation, and lifecycle management for IP prefixes,
+IP addresses, devices, racks, sites, and multi-tenant assets in NetBox.
+"""
+
 import logging
 import asyncio
 import base64
@@ -47,13 +53,12 @@ _SYSTEM_COMMANDS = frozenset({
 _NETBOX_INSTALL_CERT_HELPER = "/usr/local/bin/lm-netbox-install-cert"
 
 
-def _as_bool(val, default: bool = True) -> bool:
-    """Parse a config/env value into a bool. Accepts real bools, and the strings
-    0/1/true/false/yes/no/on/off (case-insensitive). Anything else → default."""
-    if isinstance(val, bool):
-        return val
+def _as_bool(val: Any, default: bool = True) -> bool:
+    """Coerce env/config string to bool."""
     if val is None:
         return default
+    if isinstance(val, bool):
+        return val
     s = str(val).strip().lower()
     if s in ("1", "true", "yes", "on"):
         return True
@@ -68,6 +73,7 @@ class NetboxSpoke(BaseSpoke):
     """
     def __init__(self, spoke_id: str, config: Dict[str, Any],
                  control_plane: Any = None):
+        """Initialize NetBox spoke with configuration, engine, and cert custodian."""
         super().__init__(spoke_id, config)
         # Reference to the NetboxControlPlane so the API-only INSTALL_CERT
         # handler can relay the cert install to the netbox-server agent via
@@ -127,6 +133,7 @@ class NetboxSpoke(BaseSpoke):
         # restricted token never breaks the spoke (failures DEBUG-logged).
 
     def _persist_env(self, key: str, value: str):
+        """Update or insert key=value in local .env configuration file."""
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         env_path = os.path.abspath(env_path)
         try:
@@ -152,6 +159,7 @@ class NetboxSpoke(BaseSpoke):
     _KEA_DEFAULT_GATEWAY = "10.0.0.1"
 
     async def start_kea_sync(self):
+        """Start the background Kea DHCP periodic scope synchronization task."""
         if self._sync_task is None:
             # Fresh task → forget pushed state so the first tick pushes
             # everything (Kea may have restarted while the loop was down).
@@ -159,11 +167,13 @@ class NetboxSpoke(BaseSpoke):
             self._sync_task = asyncio.create_task(self._kea_sync_loop())
 
     async def stop_kea_sync(self):
+        """Cancel and stop the background Kea DHCP synchronization task."""
         if self._sync_task:
             self._sync_task.cancel()
             self._sync_task = None
 
     async def _kea_sync_loop(self):
+        """Periodically pull DHCP prefixes from NetBox and reconcile Kea subnets."""
         while True:
             try:
                 res = await self._run_sync(self.engine.get_dhcp_prefixes)
@@ -383,6 +393,7 @@ class NetboxSpoke(BaseSpoke):
         return Fernet(base64.urlsafe_b64encode(hashlib.sha256(seed).digest()))
 
     def _persist_cert(self):
+        """Persist encrypted TLS certificate material to disk storage."""
         try:
             enc = self._cert_fernet().encrypt(json.dumps(self._cert_material).encode())
             d = os.path.dirname(self._cert_store)
@@ -397,6 +408,7 @@ class NetboxSpoke(BaseSpoke):
             logger.warning("[cert] custodian persist failed: %s", e)
 
     def _load_persisted_cert(self):
+        """Load and decrypt stored TLS certificate material from disk."""
         try:
             if os.path.exists(self._cert_store):
                 with open(self._cert_store, "rb") as f:
@@ -507,6 +519,7 @@ class NetboxSpoke(BaseSpoke):
                 "message": (results[0].get("message") if results else "deploy failed")}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch incoming NetBox DCIM/IPAM commands to corresponding engine methods."""
         normalized = command_type.upper()
         logger.info(f"NetBox command: {normalized}")
 
@@ -918,6 +931,7 @@ class NetboxSpoke(BaseSpoke):
             # Pure parse — no NetBox writes — so this arm is NOT a picklist
             # mutation (the COMMIT arm below is). _run_sync offloads openpyxl.
             def _detect():
+                """Download Excel workbook and detect rack layout sheets."""
                 raw = self._fetch_upload_bytes(
                     data.get("download_url", ""), data.get("token", ""))
                 wb = load_workbook_from_bytes(raw)
@@ -936,6 +950,7 @@ class NetboxSpoke(BaseSpoke):
             dry_run = bool(data.get("dry_run"))
 
             def _commit():
+                """Parse mapped sheets and commit rack/device layouts to NetBox."""
                 raw = self._fetch_upload_bytes(
                     data.get("download_url", ""), data.get("token", ""))
                 wb = load_workbook_from_bytes(raw)
@@ -986,6 +1001,7 @@ class NetboxSpoke(BaseSpoke):
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
     async def get_status(self) -> Dict[str, Any]:
+        """Return spoke status and NetBox API reachability health."""
         # get_system_health() issues a pynetbox HTTP round-trip; run it in a
         # thread so the spoke's asyncio loop stays free to heartbeats / inbound
         # commands while NetBox (or its DB) is slow to answer.
@@ -999,6 +1015,7 @@ class NetboxSpoke(BaseSpoke):
         }
 
     def get_version(self) -> str:
+        """Read and return version string from VERSION file."""
         try:
             vp = os.path.join(os.path.dirname(__file__), "../VERSION")
             with open(vp) as f:
