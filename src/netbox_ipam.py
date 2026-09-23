@@ -13,6 +13,7 @@ class IpamMixin:
 
     def get_prefixes(self, site: Optional[str] = None, vrf: Optional[str] = None,
                      tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch prefixes from NetBox filtered by site, VRF, or tenant."""
         try:
             params: Dict[str, Any] = {}
             if site:
@@ -299,7 +300,8 @@ class IpamMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def get_ip_addresses(self, prefix: Optional[str] = None, device: Optional[str] = None,
-                         tenant: Optional[str] = None) -> Dict[str, Any]:
+                          tenant: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch IP addresses from NetBox filtered by prefix, device, or tenant."""
         try:
             # Paginated: follow NetBox ``next`` links so a tenant with >500 IPs
             # (routine at thousands-of-VMs scale) isn't silently truncated in
@@ -425,6 +427,7 @@ class IpamMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def release_ip(self, ip_id: int) -> Dict[str, Any]:
+        """Release (delete) an IP address record by ID."""
         try:
             ip_obj = self.nb.ipam.ip_addresses.get(ip_id)
             if not ip_obj:
@@ -517,6 +520,7 @@ class IpamMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def delete_prefix(self, prefix_id: int) -> Dict[str, Any]:
+        """Delete an IP prefix record by ID."""
         try:
             pfx = self.nb.ipam.prefixes.get(prefix_id)
             if not pfx:

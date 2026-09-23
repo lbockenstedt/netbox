@@ -1,5 +1,109 @@
-# netbox
-Netbox Lab Manager Module
+# netbox — NetBox DCIM/IPAM Spoke (Lab Manager Module)
+
+The **NetBox Spoke** (`module_type = "ipam"`) provides the authoritative single source of truth for all DCIM (sites, racks, physical devices) and IPAM (subnets/prefixes, IP addresses, VLANs, VRFs) assets across the Lab Manager fleet. In addition to serving interactive queries and mutations from the Lab Manager WebUI, it acts as the centralized discovery sink for network scans (`nw`), hypervisor VM inventories (`pxmx`), firewall leases (`opnsense`), and NAC sessions (`cppm`), complete with automated staleness retirement sweeps and background Kea DHCP synchronization.
+
+---
+
+## Architecture Overview
+
+The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel (`wss://<hub>:443/ws/spoke`) using the standard push-ack-retry mailbox pattern (`BaseSpoke`). It interfaces with NetBox REST endpoints using `pynetbox` through a thread-pool executor (`_run_sync`) to ensure long-running database operations never block the event loop.
+
+```
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                    Lab Manager Hub                      │
+                  │       (WebUI / REST API / Discovery Ingestion)          │
+                  └────────────────────────────┬────────────────────────────┘
+                                               │ WebSocket (Port 443)
+                                               ▼
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                 NetboxSpoke (BaseSpoke)                 │
+                  │   src/netbox_spoke.py ── Worker Dispatch & Picklist     │
+                  └────────────┬─────────────────────────────┬──────────────┘
+                               │                             │
+                     pynetbox (REST)             Kea REST API (Port 8760)
+                               ▼                             ▼
+                  ┌────────────────────────┐    ┌───────────────────────────┐
+                  │     NetBox Server      │    │    Kea Control Agent      │
+                  │   DCIM / IPAM / Tenancy│    │   (subnet4-add / pools)   │
+                  └────────────────────────┘    └───────────────────────────┘
+```
+
+### Key Components
+
+- **`src/netbox_spoke.py` (`NetboxSpoke`)**: Core command router, background Kea sync loop (default 300s interval), environment persistence (`_persist_env`), and picklist caching.
+- **`src/netbox_engine.py` (`NetboxEngine`)**: Composition class binding domain mixins with shared HTTP concurrency semaphores (`_netbox_http_sem`) and paginated API walkers.
+- **`src/netbox_ipam.py` (`IpamMixin`)**: Prefix allocation, free-subnet finder grid calculations, IP address reservations, and custom field updates.
+- **`src/netbox_dcim.py` (`DcimMixin`)**: Sites, racks, device CRUD, front/rear rack elevation models, bundled catalog seeding, and universal multi-attribute search.
+- **`src/netbox_vmsync.py` (`VmSyncMixin`)**: Proxmox cluster VM ingestion, primary IP assignment, tag-driven tenancy mappings, and VMID range queries.
+- **`src/netbox_sync.py` (`SyncMixin`)**: Multi-source device discovery upsert (switches, APs, firewalls, ClearPass access tracker) with MAC normalization and prefix-length derivation.
+- **`src/netbox_tenancy.py` (`TenancyMixin`)**: Tenant queries, multi-model tenant data reassignment/migration (`migrate_tenant`), and DHCP scope harvesting.
+- **`src/netbox_staleness.py` (`StalenessMixin`)**: Scheduled discovery record retirement (marking devices offline after inactivity, followed by automatic purge).
+- **`src/custom_fields_spec.py`**: Pure-data specification defining custom fields required for discovery tracking, Proxmox links, switch ports, and tenancy ranges.
+
+---
+
+## Key Features
+
+1. **IPAM Source of Truth**: Full lifecycle management of IPv4/IPv6 prefixes and addresses. Includes an intelligent free-subnet finder that locates contiguous available subnets within supernets.
+2. **DCIM & Rack Elevations**: Visual front and rear rack layout rendering with RU-level precision, multi-U aggregation, 0U device capture, and device role color tinting.
+3. **Proxmox VM Cluster Sync**: Ingests complete hypervisor inventories, mapping Proxmox tags to NetBox tenants while tracking VM status, MACs, and primary IPs.
+4. **Multi-Source Discovery Sink**: Consolidates live observations from switches (`nw`), firewalls (`opnsense`), and NAC (`cppm`), eliminating manual inventory entry.
+5. **Multi-Tenant Isolation & Migration**: Enforces strict tenant boundaries across all models, supports Proxmox VMID range reservations (`vmid_start`/`vmid_end`), and offers one-click tenant migration.
+6. **Kea DHCP Scope Synchronization**: Harvests subnets marked with `gateway` and `dhcp_enabled` custom fields and pushes them to Kea DHCP via its Control Agent.
+7. **Excel Rack Importer**: Dynamic spreadsheet parser (`netbox_xlsx.py`) that reads rack elevation workbooks and provisions racks and devices with column auto-detection.
+
+---
+
+## Spoke Commands Reference Table
+
+| Spoke Command | Handler / Target | Description |
+| :--- | :--- | :--- |
+| `GET_VERSION` | `get_version` | Returns spoke software version and git commit hash. |
+| `UPDATE_CONFIG` | `_reconnect` / `_persist_env` | Updates NetBox URL, API token, or Kea URL; re-runs schema self-heal. |
+| `SPOKE_UPDATE` | Self-update | Triggers automated git pull and spoke service restart. |
+| `NETBOX_HEALTH` | `get_system_health` | Checks reachability and latency against the NetBox REST API. |
+| `NETBOX_GET_SITES` | `get_sites` | Lists all DCIM sites configured in NetBox. |
+| `NETBOX_GET_RACKS` | `get_racks` | Retrieves racks filtered by site or tenant. |
+| `NETBOX_ADD_RACK` | `add_rack` | Provisions a new rack with specified height, facility ID, and tenant. |
+| `NETBOX_UPDATE_RACK` | `update_rack` | Edits rack name, height, facility ID, or tenant ownership. |
+| `NETBOX_DELETE_RACK` | `delete_rack` | Removes a rack by ID from NetBox. |
+| `NETBOX_GET_RACK_ELEVATION` | `get_rack_elevation` | Generates front/rear elevation unit slots and 0U summaries. |
+| `NETBOX_GET_DEVICES` | `get_devices` | Retrieves devices filtered by site, rack, or tenant. |
+| `NETBOX_ADD_DEVICE` | `add_device_to_rack` | Places a device into a specified rack unit and face. |
+| `NETBOX_UPDATE_DEVICE` | `update_device` | Modifies device name, status, or rack position. |
+| `NETBOX_DELETE_DEVICE` | `delete_device` | Deletes a device record and disassociates its interfaces. |
+| `NETBOX_CLAIM_DEVICE` | `claim_device` | Creates a device, configures primary interface, and assigns IP. |
+| `NETBOX_GET_DEVICE_FORM_OPTIONS` | `get_device_form_options` | Returns cached picklists for roles, device types, sites, and racks. |
+| `NETBOX_DEDUPE_DEVICES` | `dedupe_devices` | Reconciles and merges duplicate device records. |
+| `NETBOX_GET_PREFIXES` | `get_prefixes` | Lists IP prefixes filtered by site, VRF, or tenant. |
+| `NETBOX_ALLOCATE_PREFIX` | `allocate_prefix` | Allocates the next available child subnet within a parent prefix. |
+| `NETBOX_FIND_AVAILABLE_PREFIXES` | `find_available_prefixes` | Discovers available contiguous subnets near a target anchor. |
+| `NETBOX_CLAIM_PREFIX` | `claim_prefix` | Directly reserves a specified subnet prefix for a tenant. |
+| `NETBOX_UPDATE_PREFIX` | `update_prefix` | Modifies prefix description, tenant, or custom fields. |
+| `NETBOX_DELETE_PREFIX` | `delete_prefix` | Deletes an IP prefix from NetBox. |
+| `NETBOX_GET_IPS` | `get_ip_addresses` | Lists IP addresses filtered by prefix, device, or tenant. |
+| `NETBOX_ALLOCATE_IP` | `allocate_ip` | Reserves the next available IP address in a prefix. |
+| `NETBOX_RELEASE_IP` | `release_ip` | Deletes an IP address record. |
+| `NETBOX_UPDATE_IP_ADDR` / `NETBOX_UPDATE_IP` | `update_ip_address` | Updates DNS name, description, status, or custom fields of an IP. |
+| `NETBOX_DOC_VM` | `create_vm_entry` | Creates or updates a virtual machine entry with primary IP. |
+| `NETBOX_GET_TENANTS` | `get_tenants` | Lists all tenants configured in NetBox. |
+| `NETBOX_MIGRATE_TENANT` | `migrate_tenant` | Reassigns all DCIM/IPAM/VM objects from source to target tenant. |
+| `NETBOX_TENANT_VMID_RANGE` | `get_tenant_vmid_range` | Queries tenant `vmid_start`/`vmid_end` and allocated VMIDs. |
+| `NETBOX_SYNC_DHCP` | `_kea_sync_loop` / `get_dhcp_prefixes` | Pushes NetBox subnets and router options to Kea DHCP agent. |
+| `NETBOX_SYNC_VMS` | `sync_vms` | Synchronizes Proxmox VM inventories into NetBox. |
+| `NETBOX_SYNC_DEVICES` | `sync_devices` | Ingests switch/firewall discovery feeds into DCIM devices. |
+| `NETBOX_SYNC_NW_DEVICE` | `sync_nw_device` | Upserts switches and APs with interface tables from `nw`. |
+| `NETBOX_SYNC_ACCESS_TRACKER` | `sync_access_tracker` | Ingests 802.1X/MAB client sessions from ClearPass. |
+| `NETBOX_STALENESS_SWEEP` | `staleness_sweep` | Flags inactive discovery assets offline and purges aged records. |
+| `NETBOX_SEARCH` | `search` | Multi-attribute fast regex and substring search across inventory. |
+| `NETBOX_PROVISION_CUSTOM_FIELDS` | `_ensure_custom_fields` | Forces idempotent provisioning of required custom fields. |
+| `NETBOX_SEED_CATALOG` | `seed_catalog` | Seeds bundled Aruba/HPE/Juniper hardware models into NetBox. |
+| `NETBOX_IMPORT_RACK_DETECT` | `detect_rack_sheets` | Analyzes uploaded Excel workbook for rack elevations. |
+| `NETBOX_IMPORT_RACK_COMMIT` | `import_rack_layout` | Commits mapped Excel rack elevation data to NetBox. |
+| `INSTALL_CERT` | `_persist_cert` | Stores and activates custom SSL/TLS certificates for the spoke. |
+
+---
+
 
 <!-- INSTALLERS:START -->
 ## Installation
