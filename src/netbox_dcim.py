@@ -148,13 +148,20 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
-    def get_racks(self, site: Optional[str] = None, tenant: Optional[str] = None) -> Dict[str, Any]:
-        """Retrieve racks filtered optionally by site or tenant."""
+    def get_racks(self, site: Optional[str] = None, tenant: Optional[str] = None,
+                  tenant_group: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve racks filtered optionally by site, tenant or tenant group.
+
+        ``tenant_group`` supersedes ``tenant`` and unions every tenant in the
+        group (and its descendant groups) — see :meth:`get_prefixes`."""
         try:
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
-            if tenant:
+            # NetBox's tree-aware union filter — see get_prefixes.
+            if tenant_group:
+                params["tenant_group"] = tenant_group
+            elif tenant:
                 params["tenant"] = tenant
             rows = self._api_get_all("/api/dcim/racks/", params)
             racks = []
@@ -171,15 +178,22 @@ class DcimMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def get_devices(self, site: Optional[str] = None, rack: Optional[str] = None,
-                    tenant: Optional[str] = None) -> Dict[str, Any]:
-        """Retrieve devices filtered optionally by site, rack, or tenant."""
+                    tenant: Optional[str] = None,
+                    tenant_group: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve devices filtered optionally by site, rack, tenant or tenant group.
+
+        ``tenant_group`` supersedes ``tenant`` and unions every tenant in the
+        group (and its descendant groups) — see :meth:`get_prefixes`."""
         try:
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
             if rack:
                 params["rack_id"] = rack
-            if tenant:
+            # NetBox's tree-aware union filter — see get_prefixes.
+            if tenant_group:
+                params["tenant_group"] = tenant_group
+            elif tenant:
                 params["tenant"] = tenant
             rows = self._api_get_all("/api/dcim/devices/", params)
             devices = []
