@@ -52,6 +52,41 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
   - **Response**: `{"status": "SUCCESS", "pushed": N, "errors": N, "skipped": N, "deleted": N, "devices_total": N, "message": "..."}`
   - **Errors**: unknown tenant → `{"status": "ERROR", "message": "NetBox tenant '<slug>' not found ..."}`. Missing `discovered_from`/`mac_address` custom fields are tolerated (writes skipped, replace-delete becomes a safe no-op).
 
+### Tenancy
+- **`NETBOX_GET_TENANTS`**
+  - **Purpose**: Lists NetBox tenants for the hub's tenant sync and the tenant
+    picker. Each tenant is tagged with the tenant group that owns it, so the hub
+    can nest tenants under their group without a second round trip.
+  - **Payload**: `{}`
+  - **Response**: `{"status": "SUCCESS", "tenants": [{"id", "name", "slug",
+    "description", "group_slug", "group_name"}]}` — `group_slug`/`group_name`
+    are `""` for an ungrouped tenant.
+- **`NETBOX_GET_TENANT_GROUPS`**
+  - **Purpose**: Lists NetBox **tenant groups** so the hub can offer a group as
+    a selectable pseudo-tenant. Selecting a group shows the **union** of its
+    member tenants, which is how a user can be assigned to a whole group
+    instead of one tenant.
+  - **Membership is TRANSITIVE and rolls UPWARD**: a group's `tenant_slugs`
+    contains its own tenants **plus** every tenant of a descendant group. A
+    child group never inherits its parent's tenants. (Matches NetBox's own
+    tree-aware `?tenant_group=` filter.)
+  - **Payload**: `{}`
+  - **Response**: `{"status": "SUCCESS", "groups": [{"id", "name", "slug",
+    "description", "parent_slug", "tenant_slugs": ["<slug>", ...],
+    "tenant_count": N}]}` — sorted by name; `parent_slug` is `""` at the root.
+  - **Notes**: The hub stores each group as its own tenant keyed
+    `group:<slug>`. `tenant_slugs` is used only to authorize writes (you cannot
+    create an object *into* a group) — reads use the `tenant_group` filter
+    below.
+
+**Tenant-group scoping on list commands.** `NETBOX_GET_RACKS`,
+`NETBOX_GET_DEVICES`, `NETBOX_GET_PREFIXES` and `NETBOX_GET_IPS` accept an
+optional **`tenant_group`** slug alongside the existing `tenant` slug.
+`tenant_group` **supersedes** `tenant` when both are sent, and maps to NetBox's
+`?tenant_group=` query filter, which unions the group and its sub-groups
+server-side. Sending neither is unscoped (all tenants), exactly as before — so
+an older hub that never sends `tenant_group` is unaffected.
+
 ### Tenant Self-Service Subnet Allocation
 - **`NETBOX_FIND_AVAILABLE_PREFIXES`**
   - **Purpose**: Finds the closest free subnets of a requested size to a
