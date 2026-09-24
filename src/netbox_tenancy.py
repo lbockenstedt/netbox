@@ -11,15 +11,76 @@ class TenancyMixin:
     # ─── Tenancy ───────────────────────────────────────────────────────────────
 
     def get_tenants(self) -> Dict[str, Any]:
-        """Retrieve all tenants configured in NetBox."""
+        """Retrieve all tenants configured in NetBox, each tagged with its group.
+
+        ``group_slug``/``group_name`` are "" for an ungrouped tenant. The hub
+        stores them so a tenant record knows its parent group without a second
+        round trip."""
         try:
             rows = self._api_get_all("/api/tenancy/tenants/")
-            tenants = [
-                {"id": t["id"], "name": t["name"], "slug": t["slug"],
-                 "description": t.get("description") or ""}
-                for t in rows
-            ]
+            tenants = []
+            for t in rows:
+                g = t.get("group")
+                g = g if isinstance(g, dict) else {}
+                tenants.append({
+                    "id": t["id"], "name": t["name"], "slug": t["slug"],
+                    "description": t.get("description") or "",
+                    "group_slug": g.get("slug") or "",
+                    "group_name": g.get("name") or "",
+                })
             return {"status": "SUCCESS", "tenants": tenants}
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+    def get_tenant_groups(self) -> Dict[str, Any]:
+        """List NetBox tenant groups with their TRANSITIVE tenant membership.
+
+        ``tenant_slugs`` rolls UPWARD: a group carries its own tenants plus
+        every tenant of a descendant group, so selecting a parent group shows
+        the union of the whole subtree. That matches NetBox's own
+        ``?tenant_group=<slug>`` filter, which is tree-aware — the hub sends
+        that filter rather than a slug list, and uses ``tenant_slugs`` only to
+        authorize writes. The ancestor walk is cycle-guarded: NetBox cannot
+        express a parent loop, but a hand-edited fixture can."""
+        try:
+            groups = self._api_get_all("/api/tenancy/tenant-groups/")
+            tenants = self._api_get_all("/api/tenancy/tenants/")
+
+            direct: Dict[Any, list] = {}
+            for t in tenants:
+                g = t.get("group")
+                if isinstance(g, dict) and g.get("id") is not None:
+                    direct.setdefault(g["id"], []).append(t["slug"])
+
+            parent_of: Dict[Any, Any] = {}
+            for g in groups:
+                p = g.get("parent")
+                parent_of[g["id"]] = p["id"] if isinstance(p, dict) else None
+
+            # Each group donates its OWN tenants to itself and every ancestor.
+            rollup: Dict[Any, set] = {}
+            for g in groups:
+                donated = direct.get(g["id"], [])
+                seen = set()
+                node = g["id"]
+                while node is not None and node not in seen:
+                    seen.add(node)
+                    rollup.setdefault(node, set()).update(donated)
+                    node = parent_of.get(node)
+
+            out = []
+            for g in groups:
+                members = sorted(rollup.get(g["id"], set()))
+                p = g.get("parent")
+                out.append({
+                    "id": g["id"], "name": g["name"], "slug": g["slug"],
+                    "description": g.get("description") or "",
+                    "parent_slug": p["slug"] if isinstance(p, dict) else "",
+                    "tenant_slugs": members,
+                    "tenant_count": len(members),
+                })
+            out.sort(key=lambda x: x["name"])
+            return {"status": "SUCCESS", "groups": out}
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
