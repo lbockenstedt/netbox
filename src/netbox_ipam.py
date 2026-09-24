@@ -12,15 +12,27 @@ class IpamMixin:
     # ─── IPAM – Prefixes / IPs ─────────────────────────────────────────────────
 
     def get_prefixes(self, site: Optional[str] = None, vrf: Optional[str] = None,
-                     tenant: Optional[str] = None) -> Dict[str, Any]:
-        """Fetch prefixes from NetBox filtered by site, VRF, or tenant."""
+                     tenant: Optional[str] = None,
+                     tenant_group: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch prefixes from NetBox filtered by site, VRF, tenant or tenant group.
+
+        ``tenant_group`` supersedes ``tenant``: NetBox's own ``?tenant_group=``
+        filter is tree-aware, so it unions every tenant in the group AND its
+        descendant groups server-side. We deliberately do not expand a group
+        into a list of tenant slugs — one unknown slug makes NetBox reject the
+        entire query."""
         try:
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
             if vrf:
                 params["vrf"] = vrf
-            if tenant:
+            # ``tenant_group`` is NetBox's own tree-aware union filter: it
+            # matches every tenant in the group AND its sub-groups, server-side.
+            # It supersedes ``tenant`` when both arrive.
+            if tenant_group:
+                params["tenant_group"] = tenant_group
+            elif tenant:
                 params["tenant"] = tenant
             rows = self._api_get_all("/api/ipam/prefixes/", params)
             prefixes = []
@@ -300,8 +312,12 @@ class IpamMixin:
             return {"status": "ERROR", "message": str(e)}
 
     def get_ip_addresses(self, prefix: Optional[str] = None, device: Optional[str] = None,
-                          tenant: Optional[str] = None) -> Dict[str, Any]:
-        """Fetch IP addresses from NetBox filtered by prefix, device, or tenant."""
+                         tenant: Optional[str] = None,
+                         tenant_group: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch IP addresses from NetBox filtered by prefix, device, tenant or
+        tenant group.
+
+        ``tenant_group`` supersedes ``tenant`` — see :meth:`get_prefixes`."""
         try:
             # Paginated: follow NetBox ``next`` links so a tenant with >500 IPs
             # (routine at thousands-of-VMs scale) isn't silently truncated in
@@ -309,7 +325,9 @@ class IpamMixin:
             # results list (not a dict), capped at max_pages=200 as a runaway
             # guard.
             params: Dict[str, Any] = {}
-            if tenant:
+            if tenant_group:
+                params["tenant_group"] = tenant_group
+            elif tenant:
                 params["tenant"] = tenant
             if prefix:
                 params["parent"] = prefix
