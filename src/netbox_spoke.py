@@ -593,9 +593,11 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_RACKS":
             return await self._run_picklist(
-                f"GET_RACKS|site={data.get('site')}|tenant={data.get('tenant')}",
+                f"GET_RACKS|site={data.get('site')}|tenant={data.get('tenant')}"
+                f"|tgroup={data.get('tenant_group')}",
                 self.engine.get_racks,
-                site=data.get("site"), tenant=data.get("tenant"))
+                site=data.get("site"), tenant=data.get("tenant"),
+                tenant_group=data.get("tenant_group"))
 
         if normalized == "NETBOX_ADD_RACK":
             return await self._run_sync(
@@ -622,7 +624,8 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_DEVICES":
             return await self._run_sync(self.engine.get_devices, site=data.get("site"),
-                                        rack=data.get("rack"), tenant=data.get("tenant"))
+                                        rack=data.get("rack"), tenant=data.get("tenant"),
+                                        tenant_group=data.get("tenant_group"))
 
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(
@@ -678,7 +681,8 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_PREFIXES":
             return await self._run_sync(self.engine.get_prefixes, site=data.get("site"),
-                                        tenant=data.get("tenant"))
+                                        tenant=data.get("tenant"),
+                                        tenant_group=data.get("tenant_group"))
 
         if normalized == "NETBOX_ALLOCATE_PREFIX":
             return await self._run_sync(
@@ -738,6 +742,7 @@ class NetboxSpoke(BaseSpoke):
                 prefix=data.get("prefix"),
                 device=data.get("device"),
                 tenant=data.get("tenant"),
+                tenant_group=data.get("tenant_group"),
             )
 
         if normalized == "NETBOX_ALLOCATE_IP":
@@ -777,6 +782,10 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_TENANTS":
             return await self._run_picklist("GET_TENANTS", self.engine.get_tenants)
+
+        if normalized == "NETBOX_GET_TENANT_GROUPS":
+            return await self._run_picklist("GET_TENANT_GROUPS",
+                                            self.engine.get_tenant_groups)
 
         if normalized == "NETBOX_MIGRATE_TENANT":
             return await self._run_sync(
