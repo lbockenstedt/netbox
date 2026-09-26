@@ -170,8 +170,10 @@ jobs:
           # Preflight: a push carrying a .github/workflows/ change is rejected
           # outright unless the credential holds `workflow` scope. Detecting it
           # here turns an opaque git failure into an instruction.
+          has_wf=false
           if wf="$(git diff --name-only "origin/$TGT...$BR" 2>/dev/null)"; then
             if printf '%s\n' "$wf" | grep -q '^\.github/workflows/'; then
+              has_wf=true
               if [ "$HAS_WORKFLOW_TOKEN" != "true" ]; then
                 echo "::error::This promotion changes .github/workflows/, which the Actions GITHUB_TOKEN is forbidden to push. Add a repository secret WORKFLOW_TOKEN holding a token with 'workflow' scope, then re-run. No permissions: block can grant this -- it is a GitHub platform restriction."
                 printf 'Workflow files carried by this promotion:\n%s\n' \
@@ -182,7 +184,12 @@ jobs:
           else
             echo "::warning::could not diff origin/$TGT...$BR to preflight the push credential; attempting the push anyway"
           fi
-          git push -f -q origin "$BR"
+          if ! git push -f -q origin "$BR"; then
+            if [ "$has_wf" = "true" ]; then
+              echo "::error::Push failed while carrying .github/workflows/ changes. If WORKFLOW_TOKEN is set, verify that it has 'workflow' scope and has not expired."
+            fi
+            exit 1
+          fi
 
       - name: Open or update the promotion PR
         if: steps.build.outputs.changed == 'true'
