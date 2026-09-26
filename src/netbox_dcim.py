@@ -234,7 +234,7 @@ class DcimMixin:
         role = d.get("role") or {}
         status = d.get("status") or {}
         tenant = d.get("tenant") or {}
-        primary_ip = d.get("primary_ip") or d.get("primary_ip4") or {}
+        primary_ip = d.get("primary_ip") or d.get("primary_ip4") or d.get("primary_ip6") or {}
         try:
             u_h = int(dt.get("u_height") or 1)
         except (TypeError, ValueError):
@@ -469,8 +469,9 @@ class DcimMixin:
                     full = ip_str
                 else:
                     # Derive the mask from the most specific containing prefix;
-                    # fall back to /32 (a host route) if the lookup fails/empty.
-                    mask = "32"
+                    # fall back to a family-correct host route (/32 IPv4,
+                    # /128 IPv6) if the lookup fails/empty.
+                    mask = "128" if ipaddress.ip_address(ip_str).version == 6 else "32"
                     try:
                         pdata = self._api_get("/api/ipam/prefixes/", {"contains": ip_str, "limit": 500})
                         prefs = [ipaddress.ip_network(p["prefix"], strict=False)
@@ -505,7 +506,15 @@ class DcimMixin:
                         ip_obj.save()
                     except Exception as e:
                         logger.debug("claim_device: mac_address custom field set on IP %s skipped: %s", full, e)
-                device.primary_ip4 = ip_obj.id
+                # Dual-stack: an IPv6 claim must set primary_ip6, not
+                # primary_ip4 — assigning an IPv6 address object to
+                # primary_ip4 is rejected by NetBox (family mismatch), and
+                # silently forcing it to primary_ip4 would leave IPv4-only
+                # devices with no primary IP at all once a v6-only claim ran.
+                if ipaddress.ip_interface(full).ip.version == 6:
+                    device.primary_ip6 = ip_obj.id
+                else:
+                    device.primary_ip4 = ip_obj.id
                 device.save()
                 attached_ip = ip_obj.address
 
