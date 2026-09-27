@@ -139,17 +139,33 @@ class IpamMixin:
         ipaddress.ip_network("172.16.0.0/12"),
         ipaddress.ip_network("192.168.0.0/16"),
     )
+    # Default IPv6 private-space container, mirroring RFC1918 for v4. A lab
+    # using a real ISP/tunnel-broker GUA (not ULA) instead should pass
+    # ``rfc1918=False`` so ``near`` itself becomes the search container (see
+    # ``find_available_prefixes``) instead of being forced inside fc00::/7.
+    _ULA_BLOCKS = (
+        ipaddress.ip_network("fc00::/7"),
+    )
 
     @staticmethod
-    def _mask_for_hosts(hosts: int) -> int:
+    def _mask_for_hosts(hosts: int, family: int = 4) -> int:
         """Smallest prefix length whose usable host count fits ``hosts``.
 
-        Usable = 2^(32-L) - 2 (network + broadcast reserved). Minimum /30
-        (2 usable). Capped at /22 (1022 usable) — the largest subnet a tenant
-        may request through the self-service finder. A host count that needs
-        more than /22 yields /22 rather than going larger."""
+        IPv4: usable = 2^(32-L) - 2 (network + broadcast reserved). Minimum
+        /30 (2 usable), capped at /22 (1022 usable) — the largest subnet a
+        tenant may request through the self-service finder.
+
+        IPv6: no broadcast address is reserved, so usable = 2^(128-L). Floor
+        is /64 (the smallest subnet SLAAC-capable hosts expect), capped at
+        /48 (a full "site" allocation) — a host count needing more than /48
+        still yields /48 rather than going larger."""
         if hosts < 1:
             hosts = 1
+        if family == 6:
+            for length in range(64, 47, -1):
+                if (1 << (128 - length)) >= hosts:
+                    return length
+            return 48
         for length in range(30, 21, -1):
             if (1 << (32 - length)) - 2 >= hosts:
                 return length
@@ -161,23 +177,37 @@ class IpamMixin:
         """Return up to ``count`` free subnets of ``prefix_length`` closest to
         ``near``, ranked by numeric distance.
 
-        ``near`` anchors the search and must lie within RFC1918. ``exact`` (if
-        given) is checked first and returned as distance 0 when free — this is
-        the "type a subnet, try it first, else nearest" path."""
+        Family (v4/v6) is inferred from ``near``. When ``rfc1918`` is true
+        (the default), ``near`` must lie within RFC1918 (v4) or ULA fc00::/7
+        (v6). Passing ``rfc1918=False`` skips that containment check and uses
+        ``near`` itself as the search container instead — the path a lab using
+        a real GUA allocation (e.g. a tunnel-broker-routed /48) should take,
+        since that space is neither RFC1918 nor ULA. ``exact`` (if given) is
+        checked first and returned as distance 0 when free — this is the
+        "type a subnet, try it first, else nearest" path."""
         try:
             near_net = ipaddress.ip_network(near, strict=False)
         except (ValueError, TypeError) as e:
             return {"status": "ERROR", "message": f"Invalid 'near' CIDR: {e}"}
-        if not 0 <= prefix_length <= 32:
-            return {"status": "ERROR", "message": "prefix_length must be 0..32"}
+        family = near_net.version
+        bits = 128 if family == 6 else 32
+        if not 0 <= prefix_length <= bits:
+            return {"status": "ERROR", "message": f"prefix_length must be 0..{bits}"}
         if not 1 <= count <= 200:
             return {"status": "ERROR", "message": "count must be 1..200"}
 
-        container = next((b for b in self._RFC1918_BLOCKS
-                          if near_net.subnet_of(b) or near_net.overlaps(b)), None)
-        if not container:
-            return {"status": "ERROR",
-                    "message": "near must be within RFC1918 (10/8, 172.16/12, 192.168/16)"}
+        if rfc1918:
+            blocks = self._ULA_BLOCKS if family == 6 else self._RFC1918_BLOCKS
+            container = next((b for b in blocks
+                              if near_net.subnet_of(b) or near_net.overlaps(b)), None)
+            if not container:
+                label = "ULA (fc00::/7)" if family == 6 else "RFC1918 (10/8, 172.16/12, 192.168/16)"
+                return {"status": "ERROR", "message": f"near must be within {label}"}
+        else:
+            # No private-space restriction: treat ``near`` itself as the
+            # bounding container (e.g. a routed GUA /48) that candidates are
+            # carved from.
+            container = near_net
 
         exact_net = None
         if exact:
@@ -185,31 +215,38 @@ class IpamMixin:
                 exact_net = ipaddress.ip_network(exact, strict=False)
             except (ValueError, TypeError) as e:
                 return {"status": "ERROR", "message": f"Invalid 'exact' CIDR: {e}"}
+            if exact_net.version != family:
+                return {"status": "ERROR", "message": "exact must be the same IP family as near"}
             if not (exact_net.subnet_of(container) or exact_net.overlaps(container)):
                 return {"status": "ERROR",
-                        "message": "exact must be within the same RFC1918 block as near"}
+                        "message": "exact must be within the same search container as near"}
 
         # Authoritative occupied set = every tenant-assigned prefix inside the
-        # containing RFC1918 block. Unassigned/undefined prefixes are free space
-        # and do not make a candidate occupied.
+        # container, restricted to matching family (mixed-family overlap
+        # comparisons raise TypeError). Unassigned/undefined prefixes are free
+        # space and do not make a candidate occupied.
         try:
             rows = self._api_get_all("/api/ipam/prefixes/",
                                      {"within_include": str(container), "limit": 500})
         except Exception as e:
             return {"status": "ERROR", "message": f"NetBox prefix fetch failed: {e}"}
-        occupied: List[ipaddress.IPv4Network] = []
+        occupied: List[ipaddress._BaseNetwork] = []
         for r in rows:
             if not r.get("tenant"):
                 continue
             try:
-                occupied.append(ipaddress.ip_network(r["prefix"], strict=False))
+                onet = ipaddress.ip_network(r["prefix"], strict=False)
             except (ValueError, TypeError):
                 continue
+            if onet.version != family:
+                continue
+            occupied.append(onet)
 
-        def is_free(cand: ipaddress.IPv4Network) -> bool:
+        def is_free(cand) -> bool:
             return not any(cand.overlaps(o) for o in occupied)
 
-        step = 1 << (32 - prefix_length)          # address span of one candidate
+        net_cls = ipaddress.IPv6Network if family == 6 else ipaddress.IPv4Network
+        step = 1 << (bits - prefix_length)        # address span of one candidate
         base = int(near_net.network_address)
         base = (base // step) * step             # align anchor to candidate grid
         start = int(exact_net.network_address) if exact_net else base
@@ -229,7 +266,7 @@ class IpamMixin:
                 if cand_int + (step - 1) > clast:
                     continue
                 try:
-                    cand = ipaddress.ip_network((cand_int, prefix_length))
+                    cand = net_cls((cand_int, prefix_length))
                 except ValueError:
                     continue
                 if not is_free(cand):
@@ -429,7 +466,11 @@ class IpamMixin:
                 if "/" in address:
                     full_address = address
                 else:
-                    mask = prefix.split("/")[-1] if "/" in prefix else "32"
+                    # Host mask must match the address family: /32 for IPv4,
+                    # /128 for IPv6 (a hardcoded "32" here silently truncated
+                    # every bare IPv6 address to a /32, which is invalid).
+                    default_mask = "128" if ipaddress.ip_address(address).version == 6 else "32"
+                    mask = prefix.split("/")[-1] if "/" in prefix else default_mask
                     full_address = f"{address}/{mask}"
                 parent_net = ipaddress.ip_network(prefix, strict=False)
                 if ipaddress.ip_interface(full_address).ip not in parent_net:
