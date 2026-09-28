@@ -134,10 +134,11 @@ stage_to() {
 
 picked=""
 picked_idx=0
-conflicted=0
+last_rc=0
 for i in "${!units[@]}"; do
   sel_rc=0
   stage_to "${units[$i]}" || sel_rc=$?
+  last_rc="$sel_rc"
   if [ "$sel_rc" -eq 0 ]; then
     picked="${units[$i]}"
     picked_idx="$i"
@@ -158,7 +159,6 @@ for i in "${!units[@]}"; do
     # conflicted against it forever -- even after a back-merge had made the
     # full $SRC -> $TGT merge clean. tsa failed this way every run while
     # `git merge origin/qa` into main succeeded by hand.
-    conflicted=1
     echo "::warning::unit ${units[$i]} conflicts against $TGT in isolation --" \
          "batching it with the next unit"
     continue
@@ -166,11 +166,11 @@ for i in "${!units[@]}"; do
   [ "$SPLIT" = "1" ] && echo "  skipping ${units[$i]} -- no content change against $TGT (VERSION-only?)"
 done
 
-# Every endpoint conflicted, including the tip of $SRC. That is a real
+# The final endpoint (the tip of $SRC) conflicted. That is a real
 # divergence a human must reconcile -- and it must NOT fall through to the
 # "Nothing to promote" branch below, which would report success while
 # promoting nothing.
-if [ -z "$picked" ] && [ "$conflicted" -eq 1 ]; then
+if [ -z "$picked" ] && [ "$last_rc" -eq 2 ]; then
   echo "::error::merge conflict outside VERSION -- resolve $SRC -> $TGT by hand"
   exit 1
 fi
@@ -240,9 +240,16 @@ if [ "$SPLIT" = "1" ]; then
   if [ "$ext_idx" -ne "$picked_idx" ]; then
     echo "  extending unit $picked_idx -> $ext_idx: later unit(s) modify the same" \
          "file(s); promoting an already-superseded version would be rejected"
-    if stage_to "${units[$ext_idx]}"; then
+    ext_rc=0
+    stage_to "${units[$ext_idx]}" || ext_rc=$?
+    if [ "$ext_rc" -eq 0 ]; then
       picked="${units[$ext_idx]}"
       picked_idx="$ext_idx"
+    elif [ "$ext_rc" -eq 2 ]; then
+      # Falling back would promote a version a later unit already superseded,
+      # reintroducing the rejected-unit deadlock. Fail loudly instead.
+      echo "::error::extension to ${units[$ext_idx]} conflicts against $TGT -- resolve $SRC -> $TGT by hand"
+      exit 1
     else
       # Cannot happen (a superset of a real change is a real change), but if
       # it ever did, fall back to the unextended unit rather than promoting a
