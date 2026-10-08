@@ -12,6 +12,13 @@ Three compounding bugs, all in this repo:
 3. ``update_prefix()`` (edit) never accepted or wrote ``custom_fields``
    either — checking the box on Edit and saving silently discarded it.
 
+A fourth, narrower variant of the same bug: ``claim_prefix()`` — the "Add
+Prefix" one-click finder/assign flow — never accepted ``custom_fields``
+either, on EITHER its create-new or reassign-existing-unassigned branch. That
+flow has no edit step of its own, so a prefix "created" through it could
+never become a Kea DHCP scope until someone separately opened Edit Subnet and
+re-saved it — exactly the "works on edit, not on initial creation" report.
+
 Uses a pynetbox stand-in (no live NetBox), mirroring
 test_allocate_prefix_mask.py.
 """
@@ -130,3 +137,47 @@ def test_update_prefix_no_op_when_custom_fields_not_given():
 
     eng.update_prefix(5, description="renamed")
     assert pfx.custom_fields == {"dhcp_enabled": True}
+
+
+def test_claim_prefix_writes_custom_fields_on_create():
+    eng = _engine()
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=None)  # not yet in NetBox
+    created = {}
+
+    def _create(payload):
+        created.update(payload)
+        return _Rec(prefix="10.0.0.0/24", id=9003)
+
+    eng.nb.ipam.prefixes.create = MagicMock(side_effect=_create)
+
+    r = eng.claim_prefix("10.0.0.0/24", custom_fields={"dhcp_enabled": True, "gateway": "10.0.0.1"})
+    assert r["status"] == "SUCCESS"
+    assert created["custom_fields"] == {"dhcp_enabled": True, "gateway": "10.0.0.1"}
+
+
+def test_claim_prefix_merges_custom_fields_onto_existing_unassigned():
+    eng = _engine()
+    pfx = _Rec(id=6, prefix="10.0.0.0/24", tenant=None,
+              custom_fields={"gateway": "10.0.0.1"})
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=pfx)
+    pfx.save = MagicMock()
+
+    r = eng.claim_prefix("10.0.0.0/24", custom_fields={"dhcp_enabled": True})
+    assert r["status"] == "SUCCESS"
+    assert pfx.custom_fields == {"gateway": "10.0.0.1", "dhcp_enabled": True}
+    pfx.save.assert_called_once()
+
+
+def test_claim_prefix_omits_custom_fields_when_not_given():
+    eng = _engine()
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=None)
+    created = {}
+
+    def _create(payload):
+        created.update(payload)
+        return _Rec(prefix="10.0.0.0/24", id=9004)
+
+    eng.nb.ipam.prefixes.create = MagicMock(side_effect=_create)
+
+    eng.claim_prefix("10.0.0.0/24")
+    assert "custom_fields" not in created

@@ -281,13 +281,22 @@ class IpamMixin:
 
     def claim_prefix(self, prefix: str, tenant_slug: Optional[str] = None,
                       description: str = "", site_slug: Optional[str] = None,
-                      status: str = "active") -> Dict[str, Any]:
+                      status: str = "active",
+                      custom_fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Assign a specific free subnet to a tenant (the "Assign" action).
 
         If the prefix already exists in NetBox but has no tenant, reassign it
         (no duplicate). If it exists and is already tenant-assigned, refuse —
         it wasn't actually free. Otherwise create it with the tenant/site
-        attached. Tenant/site slug→id resolution mirrors ``allocate_prefix``."""
+        attached. Tenant/site slug→id resolution mirrors ``allocate_prefix``.
+
+        ``custom_fields`` (e.g. ``dhcp_enabled``/``gateway``/``dns_servers``)
+        is written at creation time and MERGED onto an existing unassigned
+        prefix — mirrors ``allocate_prefix``/``update_prefix``. Before this,
+        the "Add Prefix" finder was the one creation path that silently
+        dropped the DHCP options a caller supplied: a prefix "created" through
+        it could never become a Kea scope until someone separately edited it
+        afterward."""
         try:
             prefix = str(ipaddress.ip_network(prefix, strict=False))
         except (ValueError, TypeError) as e:
@@ -334,6 +343,10 @@ class IpamMixin:
                     existing.status = status
                 if site_id is not None:
                     existing.site = site_id
+                if custom_fields:
+                    merged = dict(existing.custom_fields or {})
+                    merged.update(custom_fields)
+                    existing.custom_fields = merged
                 existing.save()
                 return {"status": "SUCCESS", "prefix": str(existing.prefix), "id": existing.id}
             payload: Dict[str, Any] = {"prefix": prefix, "status": status,
@@ -342,6 +355,8 @@ class IpamMixin:
                 payload["tenant"] = tenant_id
             if site_id is not None:
                 payload["site"] = site_id
+            if custom_fields:
+                payload["custom_fields"] = custom_fields
             created = self.nb.ipam.prefixes.create(payload)
             return {"status": "SUCCESS", "prefix": str(created.prefix), "id": created.id}
         except Exception as e:
