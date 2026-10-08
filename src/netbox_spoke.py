@@ -721,6 +721,7 @@ class NetboxSpoke(BaseSpoke):
                 description=data.get("description", ""),
                 site_slug=data.get("site"),
                 status=data.get("status", "active"),
+                custom_fields=data.get("custom_fields"),
             )
 
         if normalized == "NETBOX_UPDATE_PREFIX":
