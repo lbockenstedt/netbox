@@ -62,10 +62,19 @@ class ChangelogMixin:
         the reuse path never raises. A mask-mismatch duplicate on create falls
         back to a bare-IP lookup + reassign so the record isn't lost.
         """
+        # Tenants have overlapping address space, each in its own VRF: create
+        # in the tenant's VRF and only reuse a record from that same VRF.
+        vrf_id = self._vrf_id_for_tenant(tenant) if tenant else None
+        if vrf_id is not None:
+            create_kwargs = {**create_kwargs, "vrf": vrf_id}
+            lookup: Dict[str, Any] = {"vrf_id": vrf_id}
+        else:
+            lookup = {}
+
         # 1) Proactive reuse: an exact host/prefix match already exists.
         ipobj = None
         try:
-            ipobj = self.nb.ipam.ip_addresses.get(address=addr)
+            ipobj = self.nb.ipam.ip_addresses.get(address=addr, **lookup)
         except Exception as e:
             logger.debug("%s: existing-IP lookup %s failed: %s", source, addr, e)
         if ipobj:
@@ -87,7 +96,7 @@ class ChangelogMixin:
             # the create still 400s. Fall back to a bare-IP lookup + reassign.
             matches: List[Any] = []
             try:
-                matches = list(self.nb.ipam.ip_addresses.filter(address=bare_ip))
+                matches = list(self.nb.ipam.ip_addresses.filter(address=bare_ip, **lookup))
             except Exception:
                 matches = []
             if not matches:

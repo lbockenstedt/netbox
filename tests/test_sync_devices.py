@@ -1076,3 +1076,75 @@ def test_sync_devices_places_device_under_discovered_model_type():
     # The device was created under the model type (777), not the default (111).
     cak = eng.nb.dcim.devices.create.call_args.kwargs
     assert cak["device_type"] == 777
+
+
+# ── Cross-module fill-gap: a DHCP/DNS-learned hostname must reach NetBox ──
+
+def _existing_placeholder_row(name="device-aabbccddeeff", owner="Network Devices",
+                              ip_id=None, dev_mac=""):
+    return {"id": 7, "name": name,
+            "custom_fields": {"discovered_from": owner, "mac_address": dev_mac},
+            "primary_ip4": ({"id": ip_id, "address": "10.0.0.5/24"} if ip_id else None)}
+
+
+def test_netbox_sot_fills_empty_dns_name_and_renames_placeholder():
+    row = _existing_placeholder_row(ip_id=55)
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ip = _Obj(id=55); ip.dns_name = ""
+    dev = _Obj(id=7); dev.name = row["name"]
+    eng.nb.ipam.ip_addresses.get.return_value = ip
+    eng.nb.dcim.devices.get.return_value = dev
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "printer1"}],
+        tenant_slug="lrb", replace=False, defaults={}, source_of_truth="netbox")
+    assert res["status"] == "SUCCESS"
+    assert ip.dns_name == "printer1"
+    assert ip.custom_fields["mac_address"] == "aa:bb:cc:dd:ee:ff"
+    assert dev.name == "printer1"
+    assert dev.custom_fields["mac_address"] == "aa:bb:cc:dd:ee:ff"
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_netbox_sot_never_overwrites_populated_values():
+    row = _existing_placeholder_row(name="core-sw1", owner="", ip_id=55,
+                                    dev_mac="11:11:11:11:11:11")
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ip = _Obj(id=55, custom_fields={"mac_address": "11:11:11:11:11:11"})
+    ip.dns_name = "human-set"
+    dev = _Obj(id=7); dev.name = "core-sw1"
+    eng.nb.ipam.ip_addresses.get.return_value = ip
+    eng.nb.dcim.devices.get.return_value = dev
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "dhcp-name"}],
+        tenant_slug="lrb", replace=False, defaults={}, source_of_truth="netbox")
+    assert ip.dns_name == "human-set"
+    assert ip.custom_fields["mac_address"] == "11:11:11:11:11:11"
+    assert dev.name == "core-sw1"
+    ip.save.assert_not_called()
+
+
+def test_netbox_sot_skips_invalid_dns_name_but_still_fills_mac():
+    row = _existing_placeholder_row(ip_id=55)
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    ip = _Obj(id=55); ip.dns_name = ""
+    eng.nb.ipam.ip_addresses.get.return_value = ip
+    eng.nb.dcim.devices.get.return_value = _Obj(id=7)
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "Larry's iPhone"}],
+        tenant_slug="lrb", replace=False, defaults={}, source_of_truth="netbox")
+    assert ip.dns_name == ""
+    assert ip.custom_fields["mac_address"] == "aa:bb:cc:dd:ee:ff"
+
+
+def test_external_mode_renames_foreign_placeholder_but_not_foreign_real_name():
+    for name, expect in (("device-aabbccddeeff", "laptop9"), ("bobs-pc", "bobs-pc")):
+        row = _existing_placeholder_row(name=name, owner="Network Devices", ip_id=55)
+        eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+        ip = _Obj(id=55); ip.dns_name = ""
+        dev = _Obj(id=7); dev.name = name
+        eng.nb.ipam.ip_addresses.get.return_value = ip
+        eng.nb.dcim.devices.get.return_value = dev
+        eng.sync_devices(
+            devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "laptop9"}],
+            tenant_slug="lrb", replace=False, defaults={}, source="Kea (LM DHCP)")
+        assert dev.name == expect, name

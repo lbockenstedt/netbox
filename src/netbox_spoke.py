@@ -380,6 +380,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DEDUPE_DEVICES",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
+        "NETBOX_SYNC_CABLE",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -627,6 +628,19 @@ class NetboxSpoke(BaseSpoke):
                                         rack=data.get("rack"), tenant=data.get("tenant"),
                                         tenant_group=data.get("tenant_group"))
 
+        if normalized == "NETBOX_GET_CABLES":
+            return await self._run_sync(self.engine.get_cables, site=data.get("site"))
+
+        if normalized == "NETBOX_SYNC_CABLE":
+            return await self._run_sync(
+                self.engine.sync_cable,
+                a_device=data.get("a_device", ""),
+                a_port=data.get("a_port", ""),
+                b_device=data.get("b_device", ""),
+                b_port=data.get("b_port", ""),
+                status=data.get("status", "connected"),
+            )
+
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(
                 self.engine.add_device_to_rack,
@@ -711,6 +725,7 @@ class NetboxSpoke(BaseSpoke):
                 count=int(data.get("count", 20)),
                 exact=data.get("exact"),
                 rfc1918=bool(data.get("rfc1918", True)),
+                tenant_slug=data.get("tenant"),
             )
 
         if normalized == "NETBOX_CLAIM_PREFIX":

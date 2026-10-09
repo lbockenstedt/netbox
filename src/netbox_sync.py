@@ -8,6 +8,16 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("NetboxEngine")
 
 
+# Auto-generated names the create branch mints when a record has no hostname
+# (device-<mac12>, device-<ip>, device-<serial>/unknown, optionally uniquified).
+# A device still carrying one was never named by a human, so any source that
+# later learns its real hostname (DHCP/DNS) may rename it.
+_PLACEHOLDER_NAME_RE = re.compile(
+    r"^device-(?:[0-9a-f]{12}|\d{1,3}(?:\.\d{1,3}){3}|unknown)(?:-[0-9a-z]+)*$", re.I)
+# NetBox's own ipaddress.dns_name validator; anything else 400s the save.
+_DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
+
+
 class SyncMixin:
     """Device / NW-device / access-tracker sync + discovery helpers for NetboxEngine."""
 
@@ -59,22 +69,30 @@ class SyncMixin:
         stays None and every lookup falls back to the per-IP API path."""
         try:
             nets = []
+            by_vrf: Dict[Any, list] = {}
             for p in self._api_get_all("/api/ipam/prefixes/", {"limit": 500}):
                 pfx = (p or {}).get("prefix")
                 if not pfx:
                     continue
                 try:
-                    nets.append(ipaddress.ip_network(pfx, strict=False))
+                    net = ipaddress.ip_network(pfx, strict=False)
                 except ValueError:
                     continue
+                nets.append(net)
+                vrf = p.get("vrf")
+                by_vrf.setdefault(vrf.get("id") if isinstance(vrf, dict) else None,
+                                  []).append(net)
             self._prefix_prefetch = nets
+            self._prefix_prefetch_vrf = by_vrf
         except Exception as e:
             logger.debug("prefix prefetch failed (per-IP fallback stays): %s", e)
             self._prefix_prefetch = None
+            self._prefix_prefetch_vrf = None
 
     def _end_prefix_prefetch(self) -> None:
         """Drop the per-run prefix cache (call in the sync's ``finally``)."""
         self._prefix_prefetch = None
+        self._prefix_prefetch_vrf = None
 
     @staticmethod
     def _mask_from_prefixes(ip_str: str, nets) -> Optional[str]:
@@ -93,15 +111,23 @@ class SyncMixin:
                     best = net.prefixlen
         return str(best) if best is not None else None
 
-    def _mask_for_ip(self, ip_str: str) -> str:
+    def _mask_for_ip(self, ip_str: str, tenant: Any = None) -> str:
         """Derive the mask from the most specific containing prefix; /32 if none.
 
         Mirrors the inline lookup in ``claim_device`` (engine.py ~296-304),
         extracted so the device sync reuses it. When a sync run has prefetched
         the prefix set (``_begin_prefix_prefetch``) the match is local — no
         API call; only an uncovered IP hits the per-IP fallback below.
+
+        With overlapping tenant address space, a ``tenant`` whose VRF is known
+        restricts the match to that VRF's prefixes (plus global-table ones) so
+        another tenant's overlapping prefix can't supply the mask.
         """
+        vrf_id = self._vrf_id_for_tenant(tenant) if tenant else None
         nets = getattr(self, "_prefix_prefetch", None)
+        by_vrf = getattr(self, "_prefix_prefetch_vrf", None)
+        if nets is not None and vrf_id is not None and by_vrf is not None:
+            nets = by_vrf.get(vrf_id, []) + by_vrf.get(None, [])
         if nets is not None:
             local = self._mask_from_prefixes(ip_str, nets)
             if local is not None:
@@ -109,7 +135,10 @@ class SyncMixin:
             # uncovered by the prefetched set → per-IP API fallback (catches a
             # prefix added mid-run; otherwise resolves to /32 as before).
         try:
-            pdata = self._api_get("/api/ipam/prefixes/", {"contains": ip_str, "limit": 500})
+            q: Dict[str, Any] = {"contains": ip_str, "limit": 500}
+            if vrf_id is not None:
+                q["present_in_vrf_id"] = vrf_id
+            pdata = self._api_get("/api/ipam/prefixes/", q)
             prefs = [ipaddress.ip_network(p["prefix"], strict=False)
                      for p in pdata.get("results", []) if p.get("prefix")]
             if prefs:
@@ -361,6 +390,54 @@ class SyncMixin:
             if r:
                 return r
         return None
+
+    def _fill_device_gaps(self, row: dict, hostname: str, mac: str,
+                          existing_by_name: dict, used_names: set) -> None:
+        """Fill-gap update for an existing device when NetBox is the source of
+        truth: never overwrite a populated value, only fill EMPTY ones."""
+        good_host = bool(hostname) and hostname.lower() != "unknown"
+        ip_id = None
+        pip = row.get("primary_ip4")
+        if isinstance(pip, dict):
+            ip_id = pip.get("id")
+        if ip_id and (mac or good_host):
+            try:
+                ipobj = self.nb.ipam.ip_addresses.get(ip_id)
+                changed = False
+                if ipobj and good_host and _DNS_NAME_RE.match(hostname) and not str(getattr(ipobj, "dns_name", "") or "").strip():
+                    ipobj.dns_name = hostname
+                    changed = True
+                cfs = dict((ipobj.custom_fields if ipobj else None) or {})
+                if ipobj and mac and not cfs.get("mac_address"):
+                    cfs["mac_address"] = mac
+                    ipobj.custom_fields = cfs
+                    changed = True
+                if changed:
+                    ipobj.save()
+            except Exception as e:
+                logger.debug("sync_devices: fill-gap IP %s: %s", ip_id, e)
+        cf = row.get("custom_fields") or {}
+        cur_name = str(row.get("name") or "").strip()
+        need_mac = bool(mac) and not cf.get("mac_address")
+        need_name = good_host and bool(_PLACEHOLDER_NAME_RE.match(cur_name))
+        if need_mac or need_name:
+            try:
+                devobj = self.nb.dcim.devices.get(row["id"])
+                if devobj is None:
+                    raise LookupError("device vanished")
+                if need_mac:
+                    merged = dict(devobj.custom_fields or {})
+                    merged["mac_address"] = mac
+                    devobj.custom_fields = merged
+                if need_name:
+                    new_name = self._uniq_device_name(hostname, mac, "", existing_by_name, used_names)
+                    devobj.name = new_name
+                    used_names.add(new_name.lower())
+                devobj.save()
+                if need_name:
+                    logger.info("sync_devices: renamed placeholder %s -> %s", cur_name, devobj.name)
+            except Exception as e:
+                logger.debug("sync_devices: fill-gap device %s: %s", row.get("id"), e)
 
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
@@ -676,6 +753,12 @@ class SyncMixin:
                         # "external" (the discovery feed is the source of truth)
                         # updates as below.
                         if source_of_truth == "netbox":
+                            # Only-add-missing still means ADD what's missing:
+                            # a DHCP/DNS-learned hostname fills an empty
+                            # dns_name / mac and replaces a device-<mac>
+                            # placeholder, so names reach NetBox and DNS.
+                            self._fill_device_gaps(row, hostname, mac,
+                                                   existing_by_name, used_names)
                             try:
                                 # perf FIX A: the listed row already carries the
                                 # stored last_seen — skip the per-device GET +
@@ -713,7 +796,7 @@ class SyncMixin:
                             try:
                                 iface = self.nb.dcim.interfaces.create(
                                     device=row["id"], name="mgmt", type="other")
-                                mask = self._mask_for_ip(real_ip)
+                                mask = self._mask_for_ip(real_ip, tenant)
                                 ip_kwargs: Dict[str, Any] = {
                                     "address": f"{real_ip}/{mask}",
                                     "assigned_object_type": "dcim.interface",
@@ -792,14 +875,18 @@ class SyncMixin:
                         except Exception as e:
                             logger.debug("sync_devices: device cf stamp %s: %s", ip_str, e)
                         # Rename only if we own it (don't clobber a human device's
-                        # name); then mark the device seen.
-                        if we_own and hostname and hostname.lower() != "unknown":
+                        # name) or it still has an auto placeholder name another
+                        # feed minted (nw's device-<mac>); then mark it seen.
+                        placeholder = bool(_PLACEHOLDER_NAME_RE.match(str(row.get("name") or "").strip()))
+                        if (we_own or placeholder) and hostname and hostname.lower() != "unknown":
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
                                 if devobj:
-                                    devobj.name = hostname
+                                    devobj.name = (hostname if we_own else
+                                                   self._uniq_device_name(hostname, mac, real_ip,
+                                                                          existing_by_name, used_names))
                                     devobj.save()
-                                    used_names.add(hostname.strip().lower())
+                                    used_names.add(str(devobj.name).strip().lower())
                                     self._stamp_last_seen(devobj)
                             except Exception as e:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
@@ -958,7 +1045,7 @@ class SyncMixin:
                             # resolved.
                             iface = self.nb.dcim.interfaces.create(
                                 device=devobj.id, name="mgmt", type="other")
-                            mask = self._mask_for_ip(real_ip)
+                            mask = self._mask_for_ip(real_ip, tenant)
                             ip_kwargs: Dict[str, Any] = {
                                 "address": f"{real_ip}/{mask}",
                                 "assigned_object_type": "dcim.interface",
@@ -1317,7 +1404,7 @@ class SyncMixin:
 
                     # Per-interface IP (reuse global record, attach to the iface).
                     if ip:
-                        mask = self._mask_for_ip(ip)
+                        mask = self._mask_for_ip(ip, tenant)
                         ip_kwargs = {
                             "address": f"{ip}/{mask}",
                             "assigned_object_type": "dcim.interface",
@@ -1533,20 +1620,24 @@ class SyncMixin:
                         try:
                             miface = self.nb.dcim.interfaces.create(
                                 device=sw.id, name="mgmt", type="other")
-                            mask = self._mask_for_ip(nas_ip)
-                            ipo = self.nb.ipam.ip_addresses.create(
-                                address=f"{nas_ip}/{mask}",
-                                assigned_object_type="dcim.interface",
-                                assigned_object_id=miface.id)
+                            mask = self._mask_for_ip(nas_ip, tenant)
+                            ipk: Dict[str, Any] = {
+                                "address": f"{nas_ip}/{mask}",
+                                "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": miface.id,
+                            }
                             if tenant:
-                                ipo.tenant = tenant.id
-                                ipo.save()
+                                ipk["tenant"] = tenant.id
+                                _vrf = self._vrf_id_for_tenant(tenant)
+                                if _vrf is not None:
+                                    ipk["vrf"] = _vrf
+                            ipo = self.nb.ipam.ip_addresses.create(**ipk)
                             sw.primary_ip4 = ipo.id
                             sw.save()
                         except Exception as e:
                             logger.debug("sync_access_tracker: switch mgmt/IP %s skipped: %s", nas_ip, e)
                         row = {"id": sw.id, "name": sw.name,
-                               "primary_ip4": {"address": f"{nas_ip}/{self._mask_for_ip(nas_ip)}"}}
+                               "primary_ip4": {"address": f"{nas_ip}/{self._mask_for_ip(nas_ip, tenant)}"}}
                         switch_by_ip[nas_ip] = row
                         existing_by_ip[nas_ip] = row
                         return row
@@ -1715,7 +1806,7 @@ class SyncMixin:
                         nic = self.nb.dcim.interfaces.create(
                             device=devobj.id, name="eth0", type="other",
                             mac_address=mac)
-                        mask = self._mask_for_ip(ip)
+                        mask = self._mask_for_ip(ip, tenant)
                         ip_kwargs: Dict[str, Any] = {
                             "address": f"{ip}/{mask}",
                             "assigned_object_type": "dcim.interface",

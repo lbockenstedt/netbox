@@ -79,11 +79,14 @@ class IpamMixin:
         is written at creation time so the WebUI's "Enable DHCP scope"
         checkbox on the Allocate Subnet modal actually takes effect."""
         try:
-            parent = self.nb.ipam.prefixes.get(prefix=parent_prefix)
+            vrf_id = self._vrf_id_for_tenant_slug(tenant_slug) if tenant_slug else None
+            parent = self._get_prefix_obj(parent_prefix, vrf_id)
             if not parent:
                 return {"status": "ERROR", "message": f"Parent prefix '{parent_prefix}' not found"}
 
             payload: Dict[str, Any] = {"description": description, "status": status}
+            if vrf_id is not None:
+                payload["vrf"] = vrf_id
             if custom_fields:
                 payload["custom_fields"] = custom_fields
             if site_slug:
@@ -118,6 +121,16 @@ class IpamMixin:
                     return {"status": "ERROR", "message": f"{requested_prefix} is not within {parent_prefix}"}
                 payload["prefix"] = str(req_net)
                 allocated = self.nb.ipam.prefixes.create(payload)
+            elif vrf_id is not None and self._obj_vrf_id(parent) != vrf_id:
+                # Parent is a global-table container: NetBox would create the
+                # child in the parent's (global) VRF, so pick a free block
+                # ourselves — free in the tenant's VRF — and create it there.
+                cand = self._next_free_in_vrf(parent_prefix, prefix_length, vrf_id)
+                if not cand:
+                    return {"status": "ERROR",
+                            "message": f"No free /{prefix_length} available in {parent_prefix} for this tenant's VRF"}
+                payload["prefix"] = cand
+                allocated = self.nb.ipam.prefixes.create(payload)
             else:
                 payload["prefix_length"] = prefix_length
                 allocated = parent.available_prefixes.create(payload)
@@ -125,6 +138,29 @@ class IpamMixin:
         except Exception as e:
             logger.error(f"allocate_prefix failed: {e}")
             return {"status": "ERROR", "message": str(e)}
+
+    @staticmethod
+    def _obj_vrf_id(obj: Any):
+        vid = getattr(getattr(obj, "vrf", None), "id", None)
+        return vid if isinstance(vid, int) else None
+
+    def _next_free_in_vrf(self, parent_prefix: str, prefix_length: int, vrf_id: int) -> Optional[str]:
+        """First ``/prefix_length`` inside ``parent_prefix`` not overlapping any
+        prefix already in VRF ``vrf_id``."""
+        parent_net = ipaddress.ip_network(parent_prefix, strict=False)
+        if prefix_length < parent_net.prefixlen:
+            return None
+        used = []
+        for r in self._api_get_all("/api/ipam/prefixes/",
+                                   {"within": str(parent_net), "vrf_id": vrf_id, "limit": 500}):
+            try:
+                used.append(ipaddress.ip_network(r["prefix"], strict=False))
+            except (ValueError, TypeError, KeyError):
+                continue
+        for cand in parent_net.subnets(new_prefix=prefix_length):
+            if not any(cand.overlaps(u) for u in used):
+                return str(cand)
+        return None
 
     # ─── IPAM – Free-subnet finder + claim (tenant self-service) ────────────────
     #
@@ -173,7 +209,8 @@ class IpamMixin:
 
     def find_available_prefixes(self, near: str, prefix_length: int = 24,
                                 count: int = 20, exact: Optional[str] = None,
-                                rfc1918: bool = True) -> Dict[str, Any]:
+                                rfc1918: bool = True,
+                                tenant_slug: Optional[str] = None) -> Dict[str, Any]:
         """Return up to ``count`` free subnets of ``prefix_length`` closest to
         ``near``, ranked by numeric distance.
 
@@ -225,9 +262,14 @@ class IpamMixin:
         # container, restricted to matching family (mixed-family overlap
         # comparisons raise TypeError). Unassigned/undefined prefixes are free
         # space and do not make a candidate occupied.
+        # With overlapping tenant address space, "occupied" is per-VRF: only the
+        # tenant's own VRF (when it has one) counts, not other tenants' prefixes.
+        params: Dict[str, Any] = {"within_include": str(container), "limit": 500}
+        vrf_id = self._vrf_id_for_tenant_slug(tenant_slug) if tenant_slug else None
+        if vrf_id is not None:
+            params["vrf_id"] = vrf_id
         try:
-            rows = self._api_get_all("/api/ipam/prefixes/",
-                                     {"within_include": str(container), "limit": 500})
+            rows = self._api_get_all("/api/ipam/prefixes/", params)
         except Exception as e:
             return {"status": "ERROR", "message": f"NetBox prefix fetch failed: {e}"}
         occupied: List[ipaddress._BaseNetwork] = []
@@ -302,16 +344,23 @@ class IpamMixin:
         except (ValueError, TypeError) as e:
             return {"status": "ERROR", "message": f"Invalid prefix: {e}"}
 
-        try:
-            existing = self.nb.ipam.prefixes.get(prefix=prefix)
-        except Exception as e:
-            return {"status": "ERROR", "message": f"NetBox lookup failed: {e}"}
-
         tenant_id = None
+        vrf_id = None
         if tenant_slug:
             tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
             if tenant:
                 tenant_id = tenant.id
+                vrf_id = self._vrf_id_for_tenant(tenant)
+
+        try:
+            if vrf_id is not None:
+                # Only a prefix already in the tenant's VRF (or the global
+                # table, which we adopt into the VRF) can be "this" prefix.
+                existing = self._get_prefix_obj(prefix, vrf_id)
+            else:
+                existing = self.nb.ipam.prefixes.get(prefix=prefix)
+        except Exception as e:
+            return {"status": "ERROR", "message": f"NetBox lookup failed: {e}"}
         site_id = None
         if site_slug:
             site = self.nb.dcim.sites.get(slug=site_slug)
@@ -337,6 +386,8 @@ class IpamMixin:
                             "message": f"Prefix {prefix} is already assigned to a tenant"}
                 if tenant_id is not None:
                     existing.tenant = tenant_id
+                if vrf_id is not None:
+                    existing.vrf = vrf_id
                 if description:
                     existing.description = description
                 if status:
@@ -353,6 +404,8 @@ class IpamMixin:
                                        "description": description}
             if tenant_id is not None:
                 payload["tenant"] = tenant_id
+            if vrf_id is not None:
+                payload["vrf"] = vrf_id
             if site_id is not None:
                 payload["site"] = site_id
             if custom_fields:
@@ -409,6 +462,7 @@ class IpamMixin:
                     "status": status.get("value", "") if isinstance(status, dict) else str(status),
                     "dns_name": ip.get("dns_name") or "",
                     "description": ip.get("description") or "",
+                    "vrf": (ip.get("vrf") or {}).get("name", "") if isinstance(ip.get("vrf"), dict) else "",
                     "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
                     "device": device_name,
                     # Forward custom_fields so the hub can read mac_address for
@@ -452,7 +506,11 @@ class IpamMixin:
         against. An unset tenant on the prefix itself is not an error; there is
         simply nothing to inherit."""
         try:
-            prefix_obj = self.nb.ipam.prefixes.get(prefix=prefix)
+            pre_tenant = None
+            if tenant_slug:
+                pre_tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+            vrf_id = self._vrf_id_for_tenant(pre_tenant) if pre_tenant else None
+            prefix_obj = self._get_prefix_obj(prefix, vrf_id)
             if not prefix_obj:
                 return {"status": "ERROR", "message": f"Prefix '{prefix}' not found"}
 
@@ -474,6 +532,14 @@ class IpamMixin:
                 inherited_id = getattr(inherited, "id", None)
                 if inherited_id is not None:
                     payload["tenant"] = inherited_id
+                    vrf_id = self._vrf_id_for_tenant(inherited_id)
+            # The address lives in the prefix's own VRF; fall back to the
+            # tenant's VRF only for a global-table prefix.
+            pfx_vrf = self._obj_vrf_id(prefix_obj)
+            if pfx_vrf is not None:
+                vrf_id = pfx_vrf
+            if vrf_id is not None:
+                payload["vrf"] = vrf_id
 
             if address:
                 # Derive the mask from the containing prefix when the caller

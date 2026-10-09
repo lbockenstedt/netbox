@@ -5,6 +5,26 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
 ## Command Set
 
 ### IPAM & Device Management
+- **`NETBOX_GET_CABLES`**
+  - **Purpose**: Returns physical device-to-device cable connections, flattened
+    to one device/port pair per end. Feeds the `nw` module's topology map with
+    NetBox's operator-maintained cable inventory, which is the only link source
+    for gear the fleet never logs into (unmanaged switches, PDUs, patch
+    panels). Cables not terminating on two device interfaces are skipped.
+  - **Payload**: `{"site": "<slug>"}` (optional)
+  - **Response**: `{"status": "SUCCESS", "cables": [{"id", "a_device", "a_port",
+    "b_device", "b_port", "status", "label"}]}`
+- **`NETBOX_SYNC_CABLE`**
+  - **Purpose**: Idempotently records a device-to-device link discovered
+    elsewhere (nw's live LLDP topology) as a real NetBox `dcim.cable`, so an
+    LLDP-confirmed adjacency persists in NetBox past nw's in-memory cache.
+    Conservative: never creates a device (only an existing device's missing
+    interface), and never overwrites an existing cable to a different far
+    end — a human's own cable record always wins.
+  - **Payload**: `{"a_device", "a_port", "b_device", "b_port", "status":
+    "connected"}` (`status` optional)
+  - **Response**: `{"status": "SUCCESS"|"UNCHANGED"|"SKIPPED"|"ERROR",
+    "message": "<detail>"}`
 - **`NETBOX_UPDATE_IP`**
   - **Purpose**: Updates the primary IP address for a specific device.
   - **Payload**: `{"device": "vm-name", "ip": "10.0.0.x"}`
