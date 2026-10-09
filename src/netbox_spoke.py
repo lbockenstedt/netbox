@@ -380,6 +380,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DEDUPE_DEVICES",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
+        "NETBOX_SYNC_CABLE",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -629,6 +630,16 @@ class NetboxSpoke(BaseSpoke):
 
         if normalized == "NETBOX_GET_CABLES":
             return await self._run_sync(self.engine.get_cables, site=data.get("site"))
+
+        if normalized == "NETBOX_SYNC_CABLE":
+            return await self._run_sync(
+                self.engine.sync_cable,
+                a_device=data.get("a_device", ""),
+                a_port=data.get("a_port", ""),
+                b_device=data.get("b_device", ""),
+                b_port=data.get("b_port", ""),
+                status=data.get("status", "connected"),
+            )
 
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(

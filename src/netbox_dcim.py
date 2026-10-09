@@ -252,6 +252,84 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
+    def sync_cable(self, a_device: str, a_port: str, b_device: str,
+                   b_port: str, status: str = "connected") -> Dict[str, Any]:
+        """Idempotently record a device-to-device cable discovered elsewhere
+        (nw's live LLDP topology) as a real NetBox ``dcim.cable``.
+
+        Conservative by design, mirroring ``netbox_sync._cable_nic_to_port``:
+        only connects devices/interfaces that **already exist** in NetBox by
+        name (never creates a device — a switch nw can see over SSH but that
+        was never entered into NetBox inventory is not this method's job to
+        invent). An interface that's missing on an existing device IS created
+        (ports are a cheap, expected gap — operators rarely pre-populate every
+        switchport). If the target interface is already cabled:
+          * to the expected far end → no-op, already correct (``"status":
+            "UNCHANGED"``)
+          * to something else → never overwritten (a human's own cable record
+            always wins); returns ``"status": "SKIPPED"`` with a reason.
+        Returns ``"status": "ERROR"`` only for missing device/port inputs or
+        an unexpected NetBox API failure; never raises.
+        """
+        try:
+            if not a_device or not b_device or not a_port or not b_port:
+                return {"status": "ERROR",
+                        "message": "a_device/a_port/b_device/b_port are all required"}
+
+            dev_a = self.nb.dcim.devices.get(name=a_device)
+            dev_b = self.nb.dcim.devices.get(name=b_device)
+            if not dev_a or not dev_b:
+                missing = a_device if not dev_a else b_device
+                return {"status": "SKIPPED",
+                        "message": f"device '{missing}' not in NetBox"}
+
+            def _find_or_create_iface(dev, port_name):
+                iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
+                if iface:
+                    return iface
+                return self.nb.dcim.interfaces.create(
+                    device=dev.id, name=port_name, type="other")
+
+            iface_a = _find_or_create_iface(dev_a, a_port)
+            iface_b = _find_or_create_iface(dev_b, b_port)
+
+            def _connected_device_port(iface):
+                """(device_name, port_name) of whatever an interface is
+                already cabled to, or ``None`` if it's unconnected."""
+                try:
+                    fresh = self.nb.dcim.interfaces.get(iface.id)
+                    endpoint = getattr(fresh, "connected_endpoint", None) \
+                        if fresh else None
+                    if not endpoint:
+                        return None
+                    dev = getattr(endpoint, "device", None)
+                    return (self._name_of(dev), getattr(endpoint, "name", "") or "")
+                except Exception as e:
+                    logger.debug("sync_cable: connected-endpoint check failed: %s", e)
+                    return None
+
+            existing = _connected_device_port(iface_a)
+            if existing is not None:
+                if existing[0].casefold() == b_device.casefold():
+                    return {"status": "UNCHANGED",
+                            "message": f"{a_device}:{a_port} already cabled to "
+                                       f"{b_device}:{b_port}"}
+                return {"status": "SKIPPED",
+                        "message": f"{a_device}:{a_port} already cabled to "
+                                   f"{existing[0]}:{existing[1]} — not overwriting"}
+
+            self.nb.dcim.cables.create(
+                a_terminations=[{"object_type": "dcim.interface",
+                                 "object_id": iface_a.id}],
+                b_terminations=[{"object_type": "dcim.interface",
+                                 "object_id": iface_b.id}],
+                status=status or "connected")
+            return {"status": "SUCCESS",
+                    "message": f"cabled {a_device}:{a_port} <-> {b_device}:{b_port}"}
+        except Exception as e:
+            logger.error("sync_cable failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
     @staticmethod
     def _first_interface_termination(terminations) -> Optional[Dict[str, str]]:
         """Pick the first ``dcim.interface`` termination out of a cable end's
