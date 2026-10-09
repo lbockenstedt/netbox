@@ -8,6 +8,16 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("NetboxEngine")
 
 
+# Auto-generated names the create branch mints when a record has no hostname
+# (device-<mac12>, device-<ip>, device-<serial>/unknown, optionally uniquified).
+# A device still carrying one was never named by a human, so any source that
+# later learns its real hostname (DHCP/DNS) may rename it.
+_PLACEHOLDER_NAME_RE = re.compile(
+    r"^device-(?:[0-9a-f]{12}|\d{1,3}(?:\.\d{1,3}){3}|unknown)(?:-[0-9a-z]+)*$", re.I)
+# NetBox's own ipaddress.dns_name validator; anything else 400s the save.
+_DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
+
+
 class SyncMixin:
     """Device / NW-device / access-tracker sync + discovery helpers for NetboxEngine."""
 
@@ -362,6 +372,54 @@ class SyncMixin:
                 return r
         return None
 
+    def _fill_device_gaps(self, row: dict, hostname: str, mac: str,
+                          existing_by_name: dict, used_names: set) -> None:
+        """Fill-gap update for an existing device when NetBox is the source of
+        truth: never overwrite a populated value, only fill EMPTY ones."""
+        good_host = bool(hostname) and hostname.lower() != "unknown"
+        ip_id = None
+        pip = row.get("primary_ip4")
+        if isinstance(pip, dict):
+            ip_id = pip.get("id")
+        if ip_id and (mac or good_host):
+            try:
+                ipobj = self.nb.ipam.ip_addresses.get(ip_id)
+                changed = False
+                if ipobj and good_host and _DNS_NAME_RE.match(hostname) and not str(getattr(ipobj, "dns_name", "") or "").strip():
+                    ipobj.dns_name = hostname
+                    changed = True
+                cfs = dict((ipobj.custom_fields if ipobj else None) or {})
+                if ipobj and mac and not cfs.get("mac_address"):
+                    cfs["mac_address"] = mac
+                    ipobj.custom_fields = cfs
+                    changed = True
+                if changed:
+                    ipobj.save()
+            except Exception as e:
+                logger.debug("sync_devices: fill-gap IP %s: %s", ip_id, e)
+        cf = row.get("custom_fields") or {}
+        cur_name = str(row.get("name") or "").strip()
+        need_mac = bool(mac) and not cf.get("mac_address")
+        need_name = good_host and bool(_PLACEHOLDER_NAME_RE.match(cur_name))
+        if need_mac or need_name:
+            try:
+                devobj = self.nb.dcim.devices.get(row["id"])
+                if devobj is None:
+                    raise LookupError("device vanished")
+                if need_mac:
+                    merged = dict(devobj.custom_fields or {})
+                    merged["mac_address"] = mac
+                    devobj.custom_fields = merged
+                if need_name:
+                    new_name = self._uniq_device_name(hostname, mac, "", existing_by_name, used_names)
+                    devobj.name = new_name
+                    used_names.add(new_name.lower())
+                devobj.save()
+                if need_name:
+                    logger.info("sync_devices: renamed placeholder %s -> %s", cur_name, devobj.name)
+            except Exception as e:
+                logger.debug("sync_devices: fill-gap device %s: %s", row.get("id"), e)
+
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
                      defaults: Optional[Dict[str, Any]] = None,
@@ -676,6 +734,12 @@ class SyncMixin:
                         # "external" (the discovery feed is the source of truth)
                         # updates as below.
                         if source_of_truth == "netbox":
+                            # Only-add-missing still means ADD what's missing:
+                            # a DHCP/DNS-learned hostname fills an empty
+                            # dns_name / mac and replaces a device-<mac>
+                            # placeholder, so names reach NetBox and DNS.
+                            self._fill_device_gaps(row, hostname, mac,
+                                                   existing_by_name, used_names)
                             try:
                                 # perf FIX A: the listed row already carries the
                                 # stored last_seen — skip the per-device GET +
@@ -792,14 +856,18 @@ class SyncMixin:
                         except Exception as e:
                             logger.debug("sync_devices: device cf stamp %s: %s", ip_str, e)
                         # Rename only if we own it (don't clobber a human device's
-                        # name); then mark the device seen.
-                        if we_own and hostname and hostname.lower() != "unknown":
+                        # name) or it still has an auto placeholder name another
+                        # feed minted (nw's device-<mac>); then mark it seen.
+                        placeholder = bool(_PLACEHOLDER_NAME_RE.match(str(row.get("name") or "").strip()))
+                        if (we_own or placeholder) and hostname and hostname.lower() != "unknown":
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
                                 if devobj:
-                                    devobj.name = hostname
+                                    devobj.name = (hostname if we_own else
+                                                   self._uniq_device_name(hostname, mac, real_ip,
+                                                                          existing_by_name, used_names))
                                     devobj.save()
-                                    used_names.add(hostname.strip().lower())
+                                    used_names.add(str(devobj.name).strip().lower())
                                     self._stamp_last_seen(devobj)
                             except Exception as e:
                                 logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
