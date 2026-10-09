@@ -627,6 +627,9 @@ class NetboxSpoke(BaseSpoke):
                                         rack=data.get("rack"), tenant=data.get("tenant"),
                                         tenant_group=data.get("tenant_group"))
 
+        if normalized == "NETBOX_GET_CABLES":
+            return await self._run_sync(self.engine.get_cables, site=data.get("site"))
+
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(
                 self.engine.add_device_to_rack,
@@ -711,6 +714,7 @@ class NetboxSpoke(BaseSpoke):
                 count=int(data.get("count", 20)),
                 exact=data.get("exact"),
                 rfc1918=bool(data.get("rfc1918", True)),
+                tenant_slug=data.get("tenant"),
             )
 
         if normalized == "NETBOX_CLAIM_PREFIX":
