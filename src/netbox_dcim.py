@@ -214,6 +214,138 @@ class DcimMixin:
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
 
+    def get_cables(self, site: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve physical device-to-device cable connections.
+
+        NetBox models a cable as one or more terminations per end (multi-point
+        for breakout/fanout cables), each pointing at some object — usually a
+        ``dcim.interface``. This flattens every cable down to the single
+        device/port pair on each end that the nw topology map actually draws:
+        the first interface termination per side. A cable that doesn't
+        terminate on two device interfaces (e.g. one end on a power port, or a
+        far-end circuit) carries nothing useful for the map and is skipped,
+        not raised as an error — an operator's cable inventory is never fully
+        "topology-clean" and one odd row must not blank the rest.
+        """
+        try:
+            params: Dict[str, Any] = {}
+            if site:
+                params["site"] = site
+            rows = self._api_get_all("/api/dcim/cables/", params)
+            cables = []
+            for c in rows:
+                a = self._first_interface_termination(c.get("a_terminations"))
+                b = self._first_interface_termination(c.get("b_terminations"))
+                if not a or not b:
+                    continue
+                status = c.get("status") or {}
+                cables.append({
+                    "id": c["id"],
+                    "a_device": a["device"],
+                    "a_port": a["port"],
+                    "b_device": b["device"],
+                    "b_port": b["port"],
+                    "status": status.get("value", "") if isinstance(status, dict) else str(status),
+                    "label": c.get("label") or "",
+                })
+            return {"status": "SUCCESS", "cables": cables}
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+    def sync_cable(self, a_device: str, a_port: str, b_device: str,
+                   b_port: str, status: str = "connected") -> Dict[str, Any]:
+        """Idempotently record a device-to-device cable discovered elsewhere
+        (nw's live LLDP topology) as a real NetBox ``dcim.cable``.
+
+        Conservative by design, mirroring ``netbox_sync._cable_nic_to_port``:
+        only connects devices/interfaces that **already exist** in NetBox by
+        name (never creates a device — a switch nw can see over SSH but that
+        was never entered into NetBox inventory is not this method's job to
+        invent). An interface that's missing on an existing device IS created
+        (ports are a cheap, expected gap — operators rarely pre-populate every
+        switchport). If the target interface is already cabled:
+          * to the expected far end → no-op, already correct (``"status":
+            "UNCHANGED"``)
+          * to something else → never overwritten (a human's own cable record
+            always wins); returns ``"status": "SKIPPED"`` with a reason.
+        Returns ``"status": "ERROR"`` only for missing device/port inputs or
+        an unexpected NetBox API failure; never raises.
+        """
+        try:
+            if not a_device or not b_device or not a_port or not b_port:
+                return {"status": "ERROR",
+                        "message": "a_device/a_port/b_device/b_port are all required"}
+
+            dev_a = self.nb.dcim.devices.get(name=a_device)
+            dev_b = self.nb.dcim.devices.get(name=b_device)
+            if not dev_a or not dev_b:
+                missing = a_device if not dev_a else b_device
+                return {"status": "SKIPPED",
+                        "message": f"device '{missing}' not in NetBox"}
+
+            def _find_or_create_iface(dev, port_name):
+                iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
+                if iface:
+                    return iface
+                return self.nb.dcim.interfaces.create(
+                    device=dev.id, name=port_name, type="other")
+
+            iface_a = _find_or_create_iface(dev_a, a_port)
+            iface_b = _find_or_create_iface(dev_b, b_port)
+
+            def _connected_device_port(iface):
+                """(device_name, port_name) of whatever an interface is
+                already cabled to, or ``None`` if it's unconnected."""
+                try:
+                    fresh = self.nb.dcim.interfaces.get(iface.id)
+                    endpoint = getattr(fresh, "connected_endpoint", None) \
+                        if fresh else None
+                    if not endpoint:
+                        return None
+                    dev = getattr(endpoint, "device", None)
+                    return (self._name_of(dev), getattr(endpoint, "name", "") or "")
+                except Exception as e:
+                    logger.debug("sync_cable: connected-endpoint check failed: %s", e)
+                    return None
+
+            existing = _connected_device_port(iface_a)
+            if existing is not None:
+                if existing[0].casefold() == b_device.casefold():
+                    return {"status": "UNCHANGED",
+                            "message": f"{a_device}:{a_port} already cabled to "
+                                       f"{b_device}:{b_port}"}
+                return {"status": "SKIPPED",
+                        "message": f"{a_device}:{a_port} already cabled to "
+                                   f"{existing[0]}:{existing[1]} — not overwriting"}
+
+            self.nb.dcim.cables.create(
+                a_terminations=[{"object_type": "dcim.interface",
+                                 "object_id": iface_a.id}],
+                b_terminations=[{"object_type": "dcim.interface",
+                                 "object_id": iface_b.id}],
+                status=status or "connected")
+            return {"status": "SUCCESS",
+                    "message": f"cabled {a_device}:{a_port} <-> {b_device}:{b_port}"}
+        except Exception as e:
+            logger.error("sync_cable failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
+    @staticmethod
+    def _first_interface_termination(terminations) -> Optional[Dict[str, str]]:
+        """Pick the first ``dcim.interface`` termination out of a cable end's
+        termination list, returning its device name + interface name, or
+        ``None`` if that end has no interface termination at all."""
+        for t in (terminations or []):
+            if not isinstance(t, dict) or t.get("object_type") != "dcim.interface":
+                continue
+            obj = t.get("object") or {}
+            device = obj.get("device") or {}
+            device_name = device.get("name") if isinstance(device, dict) else ""
+            port_name = obj.get("name") or ""
+            if device_name:
+                return {"device": device_name, "port": port_name}
+        return None
+
     @staticmethod
     def _name_of(obj) -> str:
         """Read a .name from a NetBox nested object that may be a pynetbox
@@ -473,7 +605,10 @@ class DcimMixin:
                     # /128 IPv6) if the lookup fails/empty.
                     mask = "128" if ipaddress.ip_address(ip_str).version == 6 else "32"
                     try:
-                        pdata = self._api_get("/api/ipam/prefixes/", {"contains": ip_str, "limit": 500})
+                        q: Dict[str, Any] = {"contains": ip_str, "limit": 500}
+                        if tenant and self._vrf_id_for_tenant(tenant) is not None:
+                            q["present_in_vrf_id"] = self._vrf_id_for_tenant(tenant)
+                        pdata = self._api_get("/api/ipam/prefixes/", q)
                         prefs = [ipaddress.ip_network(p["prefix"], strict=False)
                                  for p in pdata.get("results", []) if p.get("prefix")]
                         if prefs:
@@ -491,6 +626,9 @@ class DcimMixin:
                 }
                 if tenant:
                     ip_kwargs["tenant"] = tenant.id
+                    _vrf = self._vrf_id_for_tenant(tenant)
+                    if _vrf is not None:
+                        ip_kwargs["vrf"] = _vrf
                 if dns_name:
                     ip_kwargs["dns_name"] = dns_name
                 ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
@@ -661,11 +799,18 @@ class DcimMixin:
                 ip_obj.address = ip_address
                 ip_obj.save()
             else:
-                self.nb.ipam.ip_addresses.create(
-                    address=ip_address,
-                    assigned_object_type="dcim.interface",
-                    assigned_object_id=interface.id,
-                )
+                ip_kwargs: Dict[str, Any] = {
+                    "address": ip_address,
+                    "assigned_object_type": "dcim.interface",
+                    "assigned_object_id": interface.id,
+                }
+                dev_tenant = getattr(device, "tenant", None)
+                if dev_tenant is not None:
+                    ip_kwargs["tenant"] = dev_tenant.id
+                    _vrf = self._vrf_id_for_tenant(dev_tenant)
+                    if _vrf is not None:
+                        ip_kwargs["vrf"] = _vrf
+                self.nb.ipam.ip_addresses.create(**ip_kwargs)
             return {"status": "SUCCESS", "device": device_name, "ip": ip_address}
         except Exception as e:
             return {"status": "ERROR", "message": str(e)}
@@ -1453,7 +1598,7 @@ class DcimMixin:
                         mgmt_ip = (dev.get("mgmt_ip") or "").strip()
                         if mgmt_ip:
                             ip_str = mgmt_ip.split("/")[0].strip()
-                            full = mgmt_ip if "/" in mgmt_ip else f"{ip_str}/{self._mask_for_ip(ip_str)}"
+                            full = mgmt_ip if "/" in mgmt_ip else f"{ip_str}/{self._mask_for_ip(ip_str, tenant)}"
                             iface = None
                             try:
                                 ifaces = list(self.nb.dcim.interfaces.filter(
@@ -1472,6 +1617,9 @@ class DcimMixin:
                             }
                             if tenant is not None:
                                 ip_kwargs["tenant"] = tenant.id
+                                _vrf = self._vrf_id_for_tenant(tenant)
+                                if _vrf is not None:
+                                    ip_kwargs["vrf"] = _vrf
                             if name:
                                 ip_kwargs["dns_name"] = name
                             ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)

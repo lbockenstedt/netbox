@@ -458,7 +458,7 @@ class VmSyncMixin:
                 if not ip_str:
                     continue
                 try:
-                    mask = self._mask_for_ip(ip_str)
+                    mask = self._mask_for_ip(ip_str, tenant)
                     full = ip_str if "/" in ip_str else f"{ip_str}/{mask}"
                     ip_kwargs: Dict[str, Any] = {
                         "address": full,

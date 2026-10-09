@@ -382,3 +382,7 @@ The resulting `configuration.py` block sets `REMOTE_AUTH_*` +
 by the installer) still logs in via NetBox's local Django auth when Entra is
 unreachable. **Secret rotation** = re-run the installer with a new
 `--netbox-sso-client-secret`.
+
+## Tenant VRFs
+
+Tenants with overlapping address space each own a NetBox VRF (VRF `tenant` field; VRFs are created in NetBox, not by LM). Prefixes (`allocate_prefix`, `claim_prefix`) and IPs (`allocate_ip` and every device/VM/access-tracker sync) created for a tenant are placed in that tenant's VRF, existing-IP reuse and mask derivation are scoped to it, and `find_available_prefixes` honours an optional `tenant` so free space is computed per VRF. A tenant with no VRF keeps global-table behaviour.

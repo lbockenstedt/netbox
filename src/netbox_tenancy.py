@@ -8,6 +8,60 @@ logger = logging.getLogger("NetboxEngine")
 class TenancyMixin:
     """Tenancy + DHCP-prefix read methods for NetboxEngine."""
 
+    # ─── VRF resolution ────────────────────────────────────────────────────────
+    #
+    # Tenants have overlapping address space, so each tenant is bound to a NetBox
+    # VRF (``vrf.tenant``). VRFs are managed in NetBox itself; we only look the
+    # tenant's VRF up so prefixes/IPs we create land in it (and lookups of
+    # existing records are scoped to it). A tenant with no VRF keeps the old
+    # global-table behaviour (vrf_id None).
+
+    def _vrf_id_for_tenant(self, tenant: Any):
+        """Return the id of the VRF owned by ``tenant`` (a pynetbox record, a
+        dict, or a bare id), or None when the tenant has no VRF / no tenant."""
+        if tenant is None or tenant == "":
+            return None
+        tid = tenant if isinstance(tenant, int) else (
+            tenant.get("id") if isinstance(tenant, dict) else getattr(tenant, "id", None))
+        if tid is None:
+            return None
+
+        def _fetch():
+            rows = self._api_get("/api/ipam/vrfs/",
+                                 {"tenant_id": tid, "limit": 50}).get("results", [])
+            if not rows:
+                return None
+            rows = sorted(rows, key=lambda r: r.get("id", 0))
+            if len(rows) > 1:
+                logger.warning("tenant id=%s owns %d VRFs (%s); using '%s'", tid, len(rows),
+                               ", ".join(str(r.get("name")) for r in rows), rows[0].get("name"))
+            return rows[0]["id"]
+
+        return self._cached_ref("vrf_tenant", str(tid), _fetch)
+
+    def _vrf_id_for_tenant_slug(self, tenant_slug: str):
+        """Like ``_vrf_id_for_tenant`` but resolves a tenant slug first."""
+        if not tenant_slug:
+            return None
+        try:
+            t = self.nb.tenancy.tenants.get(slug=tenant_slug)
+        except Exception as e:
+            logger.debug("vrf lookup: tenant %s resolve failed: %s", tenant_slug, e)
+            return None
+        return self._vrf_id_for_tenant(t)
+
+    def _get_prefix_obj(self, prefix: str, vrf_id=None):
+        """Fetch one prefix record. With a ``vrf_id``, prefer the prefix in that
+        VRF, then the global-table one; without it, behave as before. Needed
+        because overlapping prefixes make a bare ``prefixes.get(prefix=...)``
+        raise on multiple matches."""
+        if vrf_id is not None:
+            obj = self.nb.ipam.prefixes.get(prefix=prefix, vrf_id=vrf_id)
+            if obj:
+                return obj
+            return self.nb.ipam.prefixes.get(prefix=prefix, vrf_id="null")
+        return self.nb.ipam.prefixes.get(prefix=prefix)
+
     # ─── Tenancy ───────────────────────────────────────────────────────────────
 
     def get_tenants(self) -> Dict[str, Any]:
