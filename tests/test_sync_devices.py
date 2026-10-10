@@ -786,6 +786,32 @@ def test_sync_devices_mac_only_record_matches_existing_by_mac_no_duplicate():
     assert ipobj.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
 
 
+def test_sync_devices_mac_in_other_tenant_adopted_not_duplicated():
+    # MAC is a GLOBAL identity: tenant LRB pushes a MAC-only record whose device
+    # already exists under tenant RA. The tenant-scoped listing is empty, but
+    # the global MAC index finds RA's row -> no second device-<mac> is created.
+    other = {"id": 810, "name": "device-2cbcbb1ce1bc",
+             "primary_ip4": {"id": 902, "address": "172.16.0.3/16"},
+             "custom_fields": {"discovered_from": "Network Devices",
+                               "mac_address": "2c:bc:bb:1c:e1:bc"}}
+
+    def _get_all(path, params=None):
+        return [] if (params or {}).get("tenant") else [other]
+
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng._api_get_all = MagicMock(side_effect=_get_all)
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=902, custom_fields={})
+    eng.nb.dcim.devices.get.return_value = _Obj(
+        id=810, custom_fields=dict(other["custom_fields"]))
+
+    res = eng.sync_devices(
+        devices=[{"ip": "", "mac": "2C-BC-BB-1C-E1-BC", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
 # ── unified-registry pass: no-MAC/no-IP dedup, duplicate rule, provenance ─────
 
 def test_sync_devices_hostname_only_record_not_skipped_added_by_name():
