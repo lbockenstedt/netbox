@@ -22,9 +22,32 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
     interface), and never overwrites an existing cable to a different far
     end — a human's own cable record always wins.
   - **Payload**: `{"a_device", "a_port", "b_device", "b_port", "status":
-    "connected"}` (`status` optional)
+    "connected"}` (`status` optional). Device names match case-insensitively
+    and ignore a domain suffix (`host.example.com` finds `HOST`).
   - **Response**: `{"status": "SUCCESS"|"UNCHANGED"|"SKIPPED"|"ERROR",
     "message": "<detail>"}`
+- **`NETBOX_SYNC_LLDP`**
+  - **Purpose**: Records the hub's merged LLDP topology in NetBox in one call.
+    Each end is resolved by identity — SERIAL → MAC (`mac_address` cf) →
+    `nw_device_id` → IP → name (case-insensitive, domain stripped). An end
+    NetBox has never seen is created as a `discovered` device with
+    `discovered_from=LLDP`, its MAC and its short UPPER-CASE hostname. IP-,
+    MAC-, truncated (`...`) or junk names are never created. Cabling uses the
+    same rules as `NETBOX_SYNC_CABLE`, so a human's cable always wins. Ends
+    with legacy lower-case names are then upper-cased (see below).
+  - **Payload**: `{"links": [{"a": {"name", "macs", "addresses",
+    "nw_device_id", "serial"}, "a_port", "b": {...}, "b_port"}],
+    "tenant_slug": "", "create_missing": true, "normalize_names": true}`
+  - **Response**: `{"status": "SUCCESS"|"PARTIAL", "message", "cabled",
+    "unchanged", "created", "skipped", "errors", "details": [..20], "names"}`
+- **`NETBOX_NORMALIZE_DEVICE_NAMES`**
+  - **Purpose**: Upper-cases every existing `dcim.device` name (idempotent).
+    Every write path already stores names upper-case; this converts older
+    records. A rename that would collide with an existing upper-case twin is
+    skipped and reported (resolve it with "Merge duplicates").
+  - **Payload**: `{"tenant_slug": ""}` (optional scope)
+  - **Response**: `{"status", "message", "renamed", "collisions", "errors",
+    "details"}`
 - **`NETBOX_UPDATE_IP`**
   - **Purpose**: Updates the primary IP address for a specific device.
   - **Payload**: `{"device": "vm-name", "ip": "10.0.0.x"}`
