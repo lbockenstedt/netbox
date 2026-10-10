@@ -207,3 +207,43 @@ def test_sync_nw_device_writes_serial_on_create():
     assert res["status"] == "SUCCESS", res
     ck = eng.nb.dcim.devices.create.call_args.kwargs
     assert ck.get("serial") == "SN-XYZ-9"
+
+
+def test_sync_nw_device_matches_by_base_mac_when_no_serial():
+    # Ladder SERIAL -> MAC: no serial on the poll, but the switch's base MAC
+    # (device.mac from the nw info command) matches an ARP-created device ->
+    # updated in place, not duplicated under the nw_device_id key.
+    other = {"id": 66, "name": "device-aabbccddeeff", "serial": "",
+             "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:ff"}}
+    eng = _engine(existing_devices=[other])
+    eng.nb.dcim.devices.get = MagicMock(return_value=_Obj(
+        id=66, name="device-aabbccddeeff",
+        custom_fields={"mac_address": "aa:bb:cc:dd:ee:ff"}))
+    dev = dict(_DEV, mac="AA-BB-CC-DD-EE-FF")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    eng.nb.dcim.devices.create.assert_not_called()
+    assert res["device_id"] == 66
+
+
+def test_sync_nw_device_serial_beats_mac():
+    # Both identities present but on DIFFERENT existing rows: serial wins.
+    by_mac = {"id": 70, "name": "a", "serial": "",
+              "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:ff"}}
+    by_serial = {"id": 71, "name": "b", "serial": "SN-1", "custom_fields": {}}
+    eng = _engine(existing_devices=[by_mac, by_serial])
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda i: _Obj(id=i, name="x"))
+    dev = dict(_DEV, mac="aa:bb:cc:dd:ee:ff", serial="SN-1")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults=_DEFAULTS)
+    assert res["device_id"] == 71, res
+
+
+def test_sync_nw_device_stores_base_mac_on_create():
+    eng = _engine(existing_devices=[])
+    created = _Obj(id=88, name="sw1")
+    eng.nb.dcim.devices.create = MagicMock(return_value=created)
+    dev = dict(_DEV, mac="AA:BB:CC:DD:EE:01")
+    eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert created.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:01"

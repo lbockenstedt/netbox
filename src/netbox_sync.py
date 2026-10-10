@@ -740,8 +740,8 @@ class SyncMixin:
                     # spawned a second copy on every sync because the sync could
                     # only compare one property). SERIAL is the strongest key
                     # (globally unique, survives IP/hostname churn) so it is
-                    # tried first; IP next; MAC catches DHCP IP-moves + MAC-only
-                    # records; hostname adopts a same-name device unless the
+                    # tried first; MAC second (the other hardware identity —
+                    # also catches DHCP IP-moves + MAC-only records); IP next; hostname adopts a same-name device unless the
                     # record is PROVABLY a different machine (both MAC and IP
                     # present on both sides AND both differ) — the one case the
                     # registry allows a duplicate. A bare placeholder (no IP/MAC)
@@ -751,10 +751,10 @@ class SyncMixin:
                     row = None
                     if serial:
                         row = existing_by_serial.get(serial.lower())
-                    if row is None and not (is_mac_key or is_host_key or is_serial_key):
-                        row = existing_by_ip.get(ip_str)
                     if row is None and mac:
                         row = existing_by_mac.get(mac)
+                    if row is None and not (is_mac_key or is_host_key or is_serial_key):
+                        row = existing_by_ip.get(ip_str)
                     if row is None and hostname and hostname.lower() != "unknown":
                         cand = existing_by_name.get(hostname.lower())
                         if cand is not None and cand["id"] not in refreshed_ids:
@@ -1221,6 +1221,9 @@ class SyncMixin:
             nw_id = str(dev.get("id") or "").strip()
             name = str(dev.get("name") or "").strip()
             serial = str(dev.get("serial") or "").strip()
+            base_mac = self._norm_mac(dev.get("mac") or dev.get("base_mac") or "")
+            if not re.fullmatch(r"[0-9a-f]{12}", re.sub(r"[:.\-]", "", base_mac)):
+                base_mac = ""
             mgmt_ip = str(dev.get("address") or "").strip().split("/")[0].strip()
             if not name and not nw_id:
                 return {"status": "ERROR", "message": "nw device has no name/id",
@@ -1236,9 +1239,9 @@ class SyncMixin:
                 tenant = self._resolve_tenant_ci(tenant_slug)
 
             # ── Resolve the existing device via the canonical ladder ──────────
-            # SERIAL → MAC → nw_device_id → mgmt-IP → name. A polled switch has
-            # no chassis MAC in this payload, so serial/nw_device_id/IP/name do
-            # the work — but routing through the shared resolver means a device
+            # SERIAL → MAC → nw_device_id → mgmt-IP → name. Serial and the
+            # switch's base MAC (``device.mac`` from the nw info command) are the
+            # hardware identities; routing through the shared resolver means a device
             # another feeder created (console by serial, ARP/fw by IP) is found
             # and updated in place instead of spawning an nw_device_id-keyed
             # duplicate of the same box.
@@ -1256,8 +1259,9 @@ class SyncMixin:
             if tenant:
                 self._add_global_identities(idx["by_mac"], idx["by_serial"])
             existing = self._resolve_existing_device(
-                serial=serial, nw_device_id=nw_id, ip=mgmt_ip, hostname=name,
-                by_serial=idx["by_serial"], by_nw=idx["by_nw"],
+                serial=serial, mac=base_mac, nw_device_id=nw_id, ip=mgmt_ip,
+                hostname=name, by_serial=idx["by_serial"], by_mac=idx["by_mac"],
+                by_nw=idx["by_nw"],
                 by_ip=idx["by_ip"], by_name=idx["by_name"])
 
             # ── Create the device if missing (defaults required) ────────────────
@@ -1327,6 +1331,8 @@ class SyncMixin:
                             "last_seen": datetime.now(timezone.utc).strftime(
                                 "%Y-%m-%dT%H:%M:%SZ"),
                         }
+                        if base_mac:
+                            devobj.custom_fields["mac_address"] = base_mac
                         devobj.save()
                     except Exception as e:
                         logger.warning("sync_nw_device: tag new device %s skipped: %s",
@@ -1354,6 +1360,8 @@ class SyncMixin:
                     cf["discovered_from"] = source_tag
                     if nw_id:
                         cf["nw_device_id"] = nw_id
+                    if base_mac and not str(cf.get("mac_address") or "").strip():
+                        cf["mac_address"] = base_mac
                     if self._last_seen_stale(cf.get("last_seen")):
                         cf["last_seen"] = datetime.now(timezone.utc).strftime(
                             "%Y-%m-%dT%H:%M:%SZ")
