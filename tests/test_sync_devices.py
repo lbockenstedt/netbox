@@ -812,6 +812,40 @@ def test_sync_devices_mac_in_other_tenant_adopted_not_duplicated():
     eng.nb.dcim.devices.create.assert_not_called()
 
 
+def test_sync_devices_mac_beats_ip():
+    # Ladder SERIAL -> MAC -> IP: the incoming MAC belongs to device 41, the
+    # incoming IP is still recorded on device 42 (stale DHCP lease). MAC is the
+    # hardware identity, so device 41 is the match.
+    a = {"id": 41, "name": "a", "primary_ip4": {"id": 1, "address": "10.0.0.9/24"},
+         "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:41"}}
+    b = {"id": 42, "name": "b", "primary_ip4": {"id": 2, "address": "10.0.0.5/24"},
+         "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:42"}}
+    eng = _engine_with(existing_rows=[a, b], tenant_obj=_Obj(id=1))
+    eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=2, custom_fields={})
+    fetched = []
+    eng.nb.dcim.devices.get.side_effect = lambda i: fetched.append(i) or _Obj(id=i)
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "aa:bb:cc:dd:ee:41", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+    eng.nb.dcim.devices.create.assert_not_called()
+    assert 41 in fetched and 42 not in fetched, fetched
+
+
+def test_sync_devices_serial_beats_mac():
+    a = {"id": 51, "name": "a", "serial": "",
+         "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:51"}}
+    b = {"id": 52, "name": "b", "serial": "SN-52", "custom_fields": {}}
+    eng = _engine_with(existing_rows=[a, b], tenant_obj=_Obj(id=1))
+    fetched = []
+    eng.nb.dcim.devices.get.side_effect = lambda i: fetched.append(i) or _Obj(id=i)
+    eng.sync_devices(
+        devices=[{"ip": "", "mac": "aa:bb:cc:dd:ee:51", "serial": "SN-52",
+                  "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+    eng.nb.dcim.devices.create.assert_not_called()
+    assert 52 in fetched and 51 not in fetched, fetched
+
+
 # ── unified-registry pass: no-MAC/no-IP dedup, duplicate rule, provenance ─────
 
 def test_sync_devices_hostname_only_record_not_skipped_added_by_name():
