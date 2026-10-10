@@ -61,8 +61,18 @@ CUSTOM_FIELDS_SPEC = [
     ("nw_managed", "text", "NW managed", "dcim.interface"),
     # MAC-keyed matching shared by the NAC↔IPAM (ClearPass access tracker) and
     # firewall discovery syncs. Attached to both ipam.ipaddress and dcim.device.
+    # NOTE: mac_address is identity data only (ARP/DHCP-lease/CPPM feeds fill
+    # it on any device they see) — it must NOT be treated as "mint a Kea DHCP
+    # reservation for this address". That is a separate, explicit opt-in: see
+    # dhcp_reservation below. lm's dns_dhcp_sync.build_dhcp_payload keys off
+    # dhcp_reservation, never off mac_address presence alone.
     ("mac_address", "text", "MAC address", "ipam.ipaddress"),
     ("mac_address", "text", "MAC address", "dcim.device"),
+    # Explicit "make this a static Kea reservation" opt-in, separate from
+    # mac_address (see note above) — a plain dynamic-lease device that nw/
+    # firewall discovery stamps with mac_address for CPPM/DNS identity must
+    # never silently turn into a DHCP reservation. Default false/unset.
+    ("dhcp_reservation", "boolean", "DHCP reservation", "ipam.ipaddress"),
     # Access-tracker (NAC→IPAM reverse sync) + network-devices (nw) ARP/MAC-table
     # endpoint topology (dcim.device). switch_name is the source switch's name
     # (ClearPass nas_name / nw fleet device name); switch_ip its mgmt IP;
