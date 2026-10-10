@@ -1208,3 +1208,74 @@ def test_external_mode_renames_foreign_placeholder_but_not_foreign_real_name():
             devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": "laptop9"}],
             tenant_slug="lrb", replace=False, defaults={}, source="Kea (LM DHCP)")
         assert dev.name == expect, name
+
+
+def test_operator_named_second_address_joins_the_device_as_a_secondary_interface():
+    # A 2-member stack: in-band 172.21.0.26 and per-member OOBM .27/.35 all carry
+    # the operator's DNS name. One device, more addresses — no TOR-AGG-2A81 copy,
+    # and the device's primary IP / MAC / name are left alone.
+    row = {"id": 1166, "name": "MIPBE-SSPLM-N31-TOR-AGG",
+           "primary_ip4": {"id": 901, "address": "172.21.0.26/24"},
+           "custom_fields": {"discovered_from": "Network Devices",
+                             "mac_address": "ec:eb:b8:f3:2a:e5"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.interfaces.filter.return_value = []
+    eng.nb.dcim.interfaces.create.side_effect = [_Iface(id=201), _Iface(id=202)]
+    eng.nb.ipam.ip_addresses.create.side_effect = [_Obj(id=601), _Obj(id=602)]
+
+    res = eng.sync_devices(
+        devices=[{"ip": "172.21.0.27", "mac": "ec:eb:b8:f3:2a:81",
+                  "hostname": "mipbe-ssplm-n31-tor-agg", "hostname_source": "dns"},
+                 {"ip": "172.21.0.35", "mac": "ec:eb:b8:f3:99:01",
+                  "hostname": "mipbe-ssplm-n31-tor-agg", "hostname_source": "reservation"}],
+        tenant_slug="default", replace=False, defaults={}, source="Network Devices")
+
+    assert res["status"] == "SUCCESS", res
+    assert res["pushed"] == 2
+    eng.nb.dcim.devices.create.assert_not_called()
+    names = [c.kwargs["name"] for c in eng.nb.dcim.interfaces.create.call_args_list]
+    assert names == ["mgmt-2A81", "mgmt-9901"]
+    assert all(c.kwargs["device"] == 1166 for c in eng.nb.dcim.interfaces.create.call_args_list)
+    addrs = [c.kwargs["address"] for c in eng.nb.ipam.ip_addresses.create.call_args_list]
+    assert [a.split("/")[0] for a in addrs] == ["172.21.0.27", "172.21.0.35"]
+    eng.nb.dcim.devices.get.assert_not_called()   # no primary/mac/name rewrite
+
+
+def test_operator_named_addresses_in_one_batch_become_one_device():
+    eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.dcim.devices.get.return_value = _Obj(id=42)
+    eng.nb.dcim.interfaces.filter.return_value = []
+    eng.nb.dcim.interfaces.create.side_effect = [_Iface(id=100), _Iface(id=101)]
+    eng.nb.ipam.ip_addresses.create.side_effect = [_Obj(id=555), _Obj(id=556)]
+
+    res = eng.sync_devices(
+        devices=[{"ip": "10.0.0.26", "mac": "aa:bb:cc:dd:2a:e5", "hostname": "agg",
+                  "hostname_source": "dns"},
+                 {"ip": "10.0.0.27", "mac": "aa:bb:cc:dd:2a:81", "hostname": "agg",
+                  "hostname_source": "dns"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    assert res["status"] == "SUCCESS", res
+    eng.nb.dcim.devices.create.assert_called_once()
+    second = eng.nb.dcim.interfaces.create.call_args_list[1].kwargs
+    assert second["device"] == 42 and second["name"] == "mgmt-2A81"
+
+
+def test_lease_hostname_collision_still_mints_a_separate_device():
+    # Device-chosen DHCP hostnames (sonoszp) are not identity: keep uniquifying.
+    row = {"id": 77, "name": "sonoszp",
+           "primary_ip4": {"id": 901, "address": "10.0.0.5/24"},
+           "custom_fields": {"discovered_from": "opnsense",
+                             "mac_address": "aa:bb:cc:dd:ee:01"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    eng.nb.dcim.devices.create.return_value = _Obj(id=42)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.9", "mac": "aa:bb:cc:dd:ee:09", "hostname": "sonoszp",
+                  "hostname_source": "lease"}],
+        tenant_slug="lrb", replace=False, defaults={})
+
+    eng.nb.dcim.devices.create.assert_called_once()
+    assert eng.nb.dcim.devices.create.call_args.kwargs["name"].startswith("SONOSZP-")

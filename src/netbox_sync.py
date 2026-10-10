@@ -470,6 +470,30 @@ class SyncMixin:
             except Exception as e:
                 logger.debug("sync_devices: fill-gap device %s: %s", row.get("id"), e)
 
+    def _adopt_secondary_ip(self, device_id, real_ip: str, mac: str, hostname: str, tenant, source_tag: str) -> bool:
+        """An operator-assigned name (DNS A record / DHCP reservation) seen on a
+        second MAC+IP is the same device's other port (a stack member's OOBM,
+        in-band vs out-of-band). Attach the address to a secondary interface
+        instead of minting a suffixed copy; never touch the device's primary IP,
+        mac_address or name."""
+        if not real_ip:
+            return False
+        iname = "mgmt-" + mac.replace(":", "")[-4:].upper() if mac else "mgmt-" + real_ip
+        try:
+            existing = list(self.nb.dcim.interfaces.filter(device_id=device_id, name=iname))
+            iface = existing[0] if existing else self.nb.dcim.interfaces.create(device=device_id, name=iname, type="other")
+            mask = self._mask_for_ip(real_ip, tenant)
+            ip_kwargs = {"address": f"{real_ip}/{mask}", "assigned_object_type": "dcim.interface", "assigned_object_id": iface.id}
+            if tenant: ip_kwargs["tenant"] = tenant.id
+            if hostname and hostname.lower() != "unknown": ip_kwargs["dns_name"] = hostname
+            ipobj = self._reuse_or_create_ip(f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id, tenant=tenant, hostname=hostname, mac=mac, source=source_tag)
+            self._journal("ipam.ipaddress", ipobj.id, source_tag, note=f"IP {real_ip}/{mask} → secondary interface {iname} of device {device_id}")
+            self._stamp_last_seen(ipobj)
+            return True
+        except Exception as e:
+            logger.debug("sync_devices: secondary IP %s on device %s failed: %s", real_ip, device_id, e)
+            return False
+
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
                      defaults: Optional[Dict[str, Any]] = None,
@@ -600,6 +624,11 @@ class SyncMixin:
                 rec: Dict[str, Any] = {"mac": mac, "hostname": hostname}
                 if serial:
                     rec["serial"] = serial
+                # Where the hostname came from: "dns"/"reservation" are operator
+                # assertions (one name = one device), "lease" is device-chosen.
+                h_src = str(dev.get("hostname_source") or "").strip().lower()
+                if h_src:
+                    rec["hostname_source"] = h_src
                 if s_swname:
                     rec["switch_name"] = s_swname
                 if s_swip:
@@ -638,6 +667,9 @@ class SyncMixin:
             # so a 2nd create with the same name 400s on (name, site, tenant).
             # used_names tracks every name we create/refresh this batch.
             used_names: set = set()
+            # name.lower() -> device id for devices CREATED this batch, so an
+            # operator-named second address can join one created moments ago.
+            created_by_name: Dict[str, Any] = {}
             # device ids handled via the IP-match refresh path — the create
             # branch must never reclaim/clobber one of these by name (a
             # duplicate-hostname record would otherwise delete a device we just
@@ -731,6 +763,7 @@ class SyncMixin:
                 is_host_key = ip_str.startswith("host:")
                 is_serial_key = ip_str.startswith("serial:")
                 real_ip = "" if (is_mac_key or is_host_key or is_serial_key) else ip_str
+                operator_named = rec.get("hostname_source") in ("dns", "reservation")
                 try:
                     # Resolve the existing NetBox device for this record. A
                     # record is the SAME machine if its SERIAL, IP, MAC, OR
@@ -770,6 +803,18 @@ class SyncMixin:
                             provably_different = mac_differs and ip_differs
                             if (cand_bare or cand_owned) and not provably_different:
                                 row = cand
+                    # Same operator-assigned name, different MAC+IP: the device's
+                    # other port (stack OOBM / in-band). One device, more addresses.
+                    if (row is None and operator_named and real_ip and hostname):
+                        owner = created_by_name.get(hostname.lower())
+                        if owner is None:
+                            cand = existing_by_name.get(hostname.lower())
+                            if cand is not None and _owns(cand.get("custom_fields") or {}):
+                                owner = cand["id"]
+                        if owner is not None and self._adopt_secondary_ip(
+                                owner, real_ip, mac, hostname, tenant, source_tag):
+                            pushed += 1
+                            continue
                     if row:
                         # Existing device matched (by IP / MAC / bare hostname) —
                         # update it in place. Remember its id so the create
@@ -1041,6 +1086,8 @@ class SyncMixin:
                         if tenant:
                             create_kwargs["tenant"] = tenant.id
                         devobj = self.nb.dcim.devices.create(**create_kwargs)
+                        if hostname:
+                            created_by_name.setdefault(hostname.lower(), devobj.id)
                         # Ownership tag + last_seen stamp (best-effort; missing
                         # custom field => no-op). last_seen clocks the staleness
                         # sweep from the moment NetBox first saw this device.
