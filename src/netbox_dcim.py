@@ -464,18 +464,17 @@ class DcimMixin:
 
             row = None
             try:
-                # Try serial and nw_device_id first
+                # Hardware identities first: SERIAL, then MAC, then nw_device_id.
                 row = self._resolve_existing_device(
-                    serial=str(end.get("serial") or ""),
-                    nw_device_id=str(end.get("nw_device_id") or ""),
-                    **{k: v for k, v in idx.items() if k in ["by_serial", "by_nw"]}
-                )
-                # Then try MACs
+                    serial=str(end.get("serial") or ""), by_serial=idx["by_serial"])
                 if not row:
                     for mac in macs:
                         row = self._resolve_existing_device(mac=mac, by_mac=idx["by_mac"])
                         if row:
                             break
+                if not row:
+                    row = self._resolve_existing_device(
+                        nw_device_id=str(end.get("nw_device_id") or ""), by_nw=idx["by_nw"])
                 # Then try IPs
                 if not row:
                     for ip in ips:
