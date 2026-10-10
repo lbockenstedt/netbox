@@ -317,6 +317,29 @@ class SyncMixin:
                            "will 400 on the required site): %s", create_slug, e)
         return None
 
+    def _add_global_identities(self, by_mac: Dict[str, dict],
+                               by_serial: Optional[Dict[str, dict]] = None) -> None:
+        """Fill MAC / serial indexes from EVERY tenant (setdefault: rows already
+        indexed from the caller's tenant-scoped listing win).
+
+        MAC and serial identify a physical device globally. A sync scoped to
+        tenant B could not see tenant A's record of the same MAC and minted a
+        copy every time (the RA/LRB ``device-<mac>`` pairs). Best-effort: a
+        listing failure leaves the scoped indexes as they were."""
+        try:
+            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        except Exception as e:
+            logger.debug("global MAC/serial index: %s", e)
+            return
+        for row in rows or []:
+            cf = row.get("custom_fields") or {}
+            rmac = self._norm_mac(cf.get("mac_address", ""))
+            if rmac:
+                by_mac.setdefault(rmac, row)
+            rserial = str(row.get("serial") or "").strip()
+            if rserial and by_serial is not None:
+                by_serial.setdefault(rserial.lower(), row)
+
     def _index_existing_devices(self, rows) -> Dict[str, Dict[str, dict]]:
         """Index existing NetBox device rows for the canonical reconciliation
         ladder used by ALL device-creating sinks. Returns five dicts keyed by
@@ -658,6 +681,15 @@ class SyncMixin:
                 existing_by_ip[addr] = row
                 if _owns(cf):
                     owned_ips.add(addr)
+
+            # MAC and serial are GLOBAL identities: a device is one device no
+            # matter which tenant first recorded it. A tenant-scoped listing
+            # can't see another tenant's record of the same MAC, so every sync
+            # from a second tenant minted a copy (73 RA/LRB device-<mac> pairs).
+            # Index the rest of NetBox by MAC/serial too; tenant-local rows
+            # still win, and replace-delete stays tenant-scoped (owned_ips).
+            if tenant_slug:
+                self._add_global_identities(existing_by_mac, existing_by_serial)
 
             # Replace-with-delete — only when tenant-scoped, only owned devices.
             if replace and tenant_slug:
@@ -1221,6 +1253,8 @@ class SyncMixin:
                         "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                         "interfaces_total": len(interfaces or []), "device_id": None}
             idx = self._index_existing_devices(rows)
+            if tenant:
+                self._add_global_identities(idx["by_mac"], idx["by_serial"])
             existing = self._resolve_existing_device(
                 serial=serial, nw_device_id=nw_id, ip=mgmt_ip, hostname=name,
                 by_serial=idx["by_serial"], by_nw=idx["by_nw"],
@@ -1593,6 +1627,8 @@ class SyncMixin:
                     addr = (pip.get("address") or "").split("/")[0].strip()
                 if addr:
                     existing_by_ip.setdefault(addr, row)
+            if tenant_slug:
+                self._add_global_identities(existing_by_mac)
 
             # Switch-topology caches (this batch): NAS-IP → switch device,
             # (switch.id, nas_port) → port interface.
