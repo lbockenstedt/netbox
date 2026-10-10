@@ -380,7 +380,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DEDUPE_DEVICES",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
-        "NETBOX_SYNC_CABLE",
+        "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP", "NETBOX_NORMALIZE_DEVICE_NAMES",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -640,6 +640,26 @@ class NetboxSpoke(BaseSpoke):
                 b_port=data.get("b_port", ""),
                 status=data.get("status", "connected"),
             )
+
+        if normalized == "NETBOX_SYNC_LLDP":
+            # The hub's merged topology links (LLDP-confirmed, both ports
+            # known) -> NetBox cables; unknown ends are created as discovered
+            # devices. Then upper-case any legacy lower-case device names.
+            res = await self._run_sync(
+                self.engine.sync_lldp_links,
+                links=list(data.get("links") or []),
+                tenant_slug=data.get("tenant_slug", ""),
+                create_missing=bool(data.get("create_missing", True)),
+            )
+            if data.get("normalize_names", True) and isinstance(res, dict):
+                norm = await self._run_sync(self.engine.normalize_device_names)
+                res["names"] = norm.get("message") if isinstance(norm, dict) else norm
+            return res
+
+        if normalized == "NETBOX_NORMALIZE_DEVICE_NAMES":
+            return await self._run_sync(
+                self.engine.normalize_device_names,
+                tenant_slug=data.get("tenant_slug", ""))
 
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(

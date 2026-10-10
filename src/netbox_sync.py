@@ -24,6 +24,14 @@ class SyncMixin:
     # ---- firewall→NetBox device discovery sync helpers ---------------------
 
     @staticmethod
+    def _nb_name(name) -> str:
+        """Canonical NetBox device name: upper-case. Every sink writes device
+        names through this so a box reported as ``mipbe-ssplm-n31-tor`` by DNS
+        and ``MIPBE-SSPLM-N31-TOR`` by LLDP is one consistently named record;
+        matching stays case-insensitive everywhere."""
+        return str(name or "").strip().upper()
+
+    @staticmethod
     def _norm_mac(mac: str) -> str:
         """Normalize a MAC to lowercase colon form (aa:bb:cc:dd:ee:ff).
 
@@ -882,7 +890,7 @@ class SyncMixin:
                             try:
                                 devobj = self.nb.dcim.devices.get(row["id"])
                                 if devobj:
-                                    devobj.name = (hostname if we_own else
+                                    devobj.name = (self._nb_name(hostname) if we_own else
                                                    self._uniq_device_name(hostname, mac, real_ip,
                                                                           existing_by_name, used_names))
                                     devobj.save()
@@ -977,6 +985,7 @@ class SyncMixin:
                         if _site_required_abort:
                             errors += 1
                             continue
+                        name = self._nb_name(name)
                         create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
                         if serial:
                             create_kwargs["serial"] = serial
@@ -1269,7 +1278,7 @@ class SyncMixin:
                                 "deleted": 0,
                                 "interfaces_total": len(interfaces or []),
                                 "device_id": None}
-                    ck: Dict[str, Any] = {"name": name, "device_type": dt.id,
+                    ck: Dict[str, Any] = {"name": self._nb_name(name), "device_type": dt.id,
                                           "role": role.id, "site": site.id}
                     if serial:
                         ck["serial"] = serial

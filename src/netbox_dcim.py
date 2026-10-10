@@ -209,6 +209,8 @@ class DcimMixin:
                     "device_type": d["device_type"]["display"] if d.get("device_type") else "",
                     "role": d["role"]["name"] if d.get("role") else "",
                     "primary_ip": d["primary_ip"]["address"] if d.get("primary_ip") else "",
+                    "serial": d.get("serial") or "",
+                    "mac": str((d.get("custom_fields") or {}).get("mac_address") or ""),
                 })
             return {"status": "SUCCESS", "devices": devices}
         except Exception as e:
@@ -276,12 +278,44 @@ class DcimMixin:
                 return {"status": "ERROR",
                         "message": "a_device/a_port/b_device/b_port are all required"}
 
-            dev_a = self.nb.dcim.devices.get(name=a_device)
-            dev_b = self.nb.dcim.devices.get(name=b_device)
+            dev_a = self._device_by_name(a_device)
+            dev_b = self._device_by_name(b_device)
             if not dev_a or not dev_b:
                 missing = a_device if not dev_a else b_device
                 return {"status": "SKIPPED",
                         "message": f"device '{missing}' not in NetBox"}
+            return self._cable_devices(dev_a, a_port, dev_b, b_port, status)
+        except Exception as e:
+            logger.error("sync_cable failed: %s", e)
+            return {"status": "ERROR", "message": str(e)}
+
+    def _device_by_name(self, name: str):
+        """A NetBox device by name, ignoring case and the domain suffix:
+        ``mipbe-ssplm-pxmx02.orange-tme.com`` finds ``MIPBE-SSPLM-PXMX02``.
+        A short name matching several devices is ambiguous -> ``None``."""
+        name = str(name or "").strip()
+        if not name:
+            return None
+        dev = self.nb.dcim.devices.get(name=name)
+        if dev:
+            return dev
+        hits = list(self.nb.dcim.devices.filter(name__ie=name))
+        if len(hits) == 1:
+            return hits[0]
+        if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name):
+            short = name.split(".", 1)[0]
+            hits = [d for d in self.nb.dcim.devices.filter(name__isw=short)
+                    if str(d.name or "").split(".", 1)[0].casefold() == short.casefold()]
+            if len(hits) == 1:
+                return hits[0]
+        return None
+
+    def _cable_devices(self, dev_a, a_port: str, dev_b, b_port: str,
+                       status: str = "connected") -> Dict[str, Any]:
+        """Cable two resolved NetBox devices port-to-port (see :meth:`sync_cable`)."""
+        a_device = self._name_of(dev_a)
+        b_device = self._name_of(dev_b)
+        try:
 
             def _find_or_create_iface(dev, port_name):
                 iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
@@ -329,6 +363,239 @@ class DcimMixin:
         except Exception as e:
             logger.error("sync_cable failed: %s", e)
             return {"status": "ERROR", "message": str(e)}
+
+    def normalize_device_names(self, tenant_slug: str = "") -> Dict[str, Any]:
+        """Upper-case every existing device name (``NETBOX_NORMALIZE_DEVICE_NAMES``).
+
+        New writes already go through :meth:`_nb_name`; this brings records
+        created before that rule into line. Idempotent: an already upper-case
+        name is untouched. A rename that collides with an existing upper-case
+        twin (the ``(name, site, tenant)`` unique constraint) is reported and
+        skipped -- the duplicate is left for "Merge duplicates" to resolve.
+        """
+        params: Dict[str, Any] = {}
+        if tenant_slug:
+            params["tenant"] = tenant_slug
+        try:
+            rows = self._api_get_all("/api/dcim/devices/", params)
+        except Exception as e:
+            return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}"}
+        renamed = collisions = errors = 0
+        details: List[str] = []
+        for row in rows:
+            name = str(row.get("name") or "")
+            want = self._nb_name(name)
+            if not name or name == want:
+                continue
+            try:
+                rec = self.nb.dcim.devices.get(row["id"])
+                if not rec:
+                    continue
+                rec.name = want
+                rec.save()
+                renamed += 1
+            except Exception as e:
+                if "unique" in str(e).lower() or "already exists" in str(e).lower():
+                    collisions += 1
+                    if len(details) < 20:
+                        details.append(f"{name}: an upper-case {want} already exists")
+                else:
+                    errors += 1
+                    if len(details) < 20:
+                        details.append(f"{name}: {e}")
+        return {"status": "SUCCESS" if not errors else "PARTIAL",
+                "message": f"{renamed} renamed, {collisions} collisions, {errors} errors",
+                "renamed": renamed, "collisions": collisions, "errors": errors,
+                "details": details}
+
+    def sync_lldp_links(self, links: list, tenant_slug: str = "",
+                        create_missing: bool = True) -> Dict[str, Any]:
+        """Record LLDP-confirmed links as NetBox cables (``NETBOX_SYNC_LLDP``).
+
+        The hub sends the links of its merged topology graph, each end carrying
+        every identity it learned (name, MACs, IPs, fleet id). Each end is
+        resolved with the shared SERIAL -> MAC -> nw_device_id -> IP -> name
+        ladder plus a case-insensitive short-name match (an LLDP FQDN finds the
+        DNS-derived short name). An end NetBox has never seen is created as a
+        ``discovered`` device tagged ``discovered_from=LLDP`` with its short,
+        upper-cased hostname. Cabling goes through :meth:`_cable_devices`, so a
+        human's existing cable on the port is never overwritten.
+        """
+        counters = {"cabled": 0, "unchanged": 0, "skipped": 0, "created": 0, "errors": 0}
+        messages = []
+
+        try:
+            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        except Exception as e:
+            return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}", **counters}
+
+        idx = self._index_existing_devices(rows)
+
+        # Build by_short index
+        by_short = {}
+        short_counts = {}
+        for row in rows:
+            n = str(row.get("name") or "").strip().lower()
+            short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
+            short_counts[short] = short_counts.get(short, 0) + 1
+        for row in rows:
+            n = str(row.get("name") or "").strip().lower()
+            short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
+            if short_counts[short] == 1:
+                by_short[short] = row
+
+        tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
+        role = dtype = site = None
+        created_device = False
+
+        cache = {}
+
+        def resolve(end):
+            nonlocal role, dtype, site, created_device
+            name = str(end.get("name") or "").strip()
+            macs = [self._norm_mac(m) for m in end.get("macs") or []]
+            macs = [m for m in macs if m]
+            ips = [str(a).split("/")[0].strip() for a in end.get("addresses") or []]
+            ips = [ip for ip in ips if ip]
+
+            key = name.lower() or (macs[0] if macs else "")
+            if key in cache:
+                return cache[key]
+
+            row = None
+            try:
+                # Try serial and nw_device_id first
+                row = self._resolve_existing_device(
+                    serial=str(end.get("serial") or ""),
+                    nw_device_id=str(end.get("nw_device_id") or ""),
+                    **{k: v for k, v in idx.items() if k in ["by_serial", "by_nw"]}
+                )
+                # Then try MACs
+                if not row:
+                    for mac in macs:
+                        row = self._resolve_existing_device(mac=mac, by_mac=idx["by_mac"])
+                        if row:
+                            break
+                # Then try IPs
+                if not row:
+                    for ip in ips:
+                        row = self._resolve_existing_device(ip=ip, by_ip=idx["by_ip"])
+                        if row:
+                            break
+                # Then hostname
+                if not row and name:
+                    row = self._resolve_existing_device(hostname=name, by_name=idx["by_name"])
+                # Then short name
+                if not row and name:
+                    short = name.lower().split(".", 1)[0] if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) else name.lower()
+                    row = by_short.get(short)
+            except Exception as e:
+                counters["errors"] += 1
+                messages.append(f"failed to resolve device {name}: {e}")
+                return None
+
+            rec = None
+            if row:
+                try:
+                    rec = self.nb.dcim.devices.get(row["id"])
+                    if rec and macs and not (rec.custom_fields or {}).get("mac_address"):
+                        cf = dict(rec.custom_fields or {})
+                        cf["mac_address"] = macs[0]
+                        rec.custom_fields = cf
+                        rec.save()
+                except Exception as e:
+                    logger.debug(f"failed to update custom fields for device {row['id']}: {e}")
+            elif create_missing and len(name) >= 3 and ".." not in name \
+                    and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name) and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) \
+                    and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())):
+                if not created_device:
+                    try:
+                        self._ensure_custom_fields()
+                    except Exception as e:
+                        logger.debug("sync_lldp_links: ensure custom fields: %s", e)
+                    role = self._ensure_device_role("discovered")
+                    dtype = self._ensure_device_type("discovered")
+                    site = self._resolve_site("", tenant)
+                    created_device = True
+
+                if not role or not dtype or not site:
+                    counters["errors"] += 1
+                    messages.append(f"failed to resolve device role/type/site for {name}")
+                    return None
+
+                new_name = self._nb_name(name.split(".", 1)[0])
+                ck = {
+                    "name": new_name,
+                    "device_type": dtype.id,
+                    "role": role.id,
+                    "site": site.id,
+                    "status": "active"
+                }
+                if tenant:
+                    ck["tenant"] = tenant.id
+
+                try:
+                    rec = self.nb.dcim.devices.create(**ck)
+                    rec.custom_fields = {"discovered_from": "LLDP", **({"mac_address": macs[0]} if macs else {})}
+                    rec.save()
+                    self._journal("dcim.device", rec.id, "lldp", note=f"created from LLDP neighbour {name}")
+                    counters["created"] += 1
+
+                    # Index the new device so a later end carrying the same MAC
+                    # (MAC is the identity) or name reuses it, never re-creates.
+                    new_row = {"id": rec.id, "name": new_name}
+                    idx["by_name"][new_name.lower()] = new_row
+                    for m in macs:
+                        idx["by_mac"].setdefault(m, new_row)
+                    short = new_name.lower().split(".", 1)[0] if "." in new_name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", new_name) else new_name.lower()
+                    by_short[short] = {"id": rec.id, "name": new_name}
+                except Exception as e:
+                    counters["errors"] += 1
+                    messages.append(f"failed to create device {new_name}: {e}")
+                    return None
+            else:
+                rec = None
+
+            if key:
+                cache[key] = rec
+            return rec
+
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            a_port = str(link.get("a_port") or "").strip()
+            b_port = str(link.get("b_port") or "").strip()
+            if not a_port or not b_port:
+                counters["skipped"] += 1
+                continue
+
+            ra = resolve(link.get("a") or {})
+            rb = resolve(link.get("b") or {})
+
+            if not ra or not rb or ra.id == rb.id:
+                counters["skipped"] += 1
+                continue
+
+            res = self._cable_devices(ra, a_port, rb, b_port)
+            st = res.get("status")
+            if st == "SUCCESS":
+                counters["cabled"] += 1
+            elif st == "UNCHANGED":
+                counters["unchanged"] += 1
+            elif st == "SKIPPED":
+                counters["skipped"] += 1
+                messages.append(res.get("message", ""))
+            else:
+                counters["errors"] += 1
+                messages.append(res.get("message", ""))
+
+        status = "SUCCESS" if counters["errors"] == 0 else "PARTIAL"
+        return {
+            "status": status,
+            "message": f"{counters['cabled']} cabled, {counters['unchanged']} unchanged, {counters['created']} created, {counters['skipped']} skipped, {counters['errors']} errors",
+            "details": [m for m in messages if m][:20],
+            **counters
+        }
 
     @staticmethod
     def _first_interface_termination(terminations) -> Optional[Dict[str, str]]:
@@ -511,7 +778,7 @@ class DcimMixin:
                 return {"status": "ERROR", "message": f"Role '{role_slug}' not found"}
 
             device = self.nb.dcim.devices.create(
-                name=name,
+                name=self._nb_name(name),
                 device_type=device_type.id,
                 role=role.id,
                 site=site.id,
@@ -583,6 +850,7 @@ class DcimMixin:
             if mac:
                 desc = f"{desc}\nMAC: {mac}".strip()
 
+            name = self._nb_name(name)
             create_kwargs: Dict[str, Any] = {"name": name, "status": status, "description": desc}
             if device_type:
                 create_kwargs["device_type"] = device_type.id
@@ -760,7 +1028,7 @@ class DcimMixin:
             if not device:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
             if name is not None:
-                device.name = name
+                device.name = self._nb_name(name)
             if status:
                 device.status = status
             if rack_name is not None:
@@ -787,7 +1055,7 @@ class DcimMixin:
     def update_device_ip(self, device_name: str, ip_address: str) -> Dict[str, Any]:
         """Update or assign an IP address to a device's primary interface."""
         try:
-            device = self.nb.dcim.devices.get(name=device_name)
+            device = self._device_by_name(device_name)
             if not device:
                 return {"status": "ERROR", "message": f"Device {device_name} not found"}
             interface = next((i for i in device.interfaces if i.name == 'eth0'), None)
@@ -1572,7 +1840,7 @@ class DcimMixin:
                         if asset_tag:
                             payload["asset_tag"] = asset_tag
                         if name:
-                            payload["name"] = name
+                            payload["name"] = self._nb_name(name)
                         if desc:
                             payload["description"] = desc
 

@@ -86,7 +86,7 @@ def test_sync_devices_creates_new_owned_device():
     assert ck["status"] == "active"
     assert ck["tenant"] == 1
     assert ck["role"] is not None and ck["device_type"] is not None
-    assert ck["name"] == "ws-05"
+    assert ck["name"] == "WS-05"
     # Ownership tag applied to the device.
     assert dev.custom_fields.get("discovered_from") == "opnsense"
     # MAC stamped on the DEVICE (not just the IP) so a recurrence MAC-matches
@@ -215,7 +215,7 @@ def test_sync_devices_updates_existing_by_ip_no_duplicate():
     assert ip.dns_name == "ws-renamed"
     ip.save.assert_called()
     # Owned → renamed.
-    assert dev.name == "ws-renamed"
+    assert dev.name == "WS-RENAMED"
     dev.save.assert_called()
 
 
@@ -318,7 +318,7 @@ def test_sync_devices_owned_name_collision_deletes_stale_then_creates():
     # same name (now freed) + the new IP — no 400.
     stale.delete.assert_called_once()
     ck = eng.nb.dcim.devices.create.call_args.kwargs
-    assert ck["name"] == "device-aabbccddeeff"
+    assert ck["name"] == "DEVICE-AABBCCDDEEFF"
     assert ck["tenant"] == 1
     # New IP created against the new device.
     ik = eng.nb.ipam.ip_addresses.create.call_args.kwargs
@@ -348,9 +348,9 @@ def test_sync_devices_unowned_name_collision_uniquifies_does_not_clobber():
     eng.nb.dcim.devices.delete.assert_not_called()
     # We created under a uniquified name (mac suffix), not the colliding one.
     ck = eng.nb.dcim.devices.create.call_args.kwargs
-    assert ck["name"] != "device-aabbccddeeff"
-    assert ck["name"].startswith("device-aabbccddeeff-")
-    assert ck["name"].endswith("eeff")  # last 4 of normalized mac
+    assert ck["name"] != "DEVICE-AABBCCDDEEFF"
+    assert ck["name"].startswith("DEVICE-AABBCCDDEEFF-")
+    assert ck["name"].endswith("EEFF")  # last 4 of normalized mac
 
 
 def test_sync_devices_no_ip_owned_device_indexed_by_name():
@@ -399,9 +399,9 @@ def test_sync_devices_intra_batch_duplicate_hostnames_get_unique_names():
     assert res["errors"] == 0
     names = [c.kwargs["name"] for c in eng.nb.dcim.devices.create.call_args_list]
     assert len(names) == len(set(names))   # all unique → no constraint 400
-    assert names[0] == "ks205"
-    assert names[1].startswith("ks205-") and names[1].endswith("ee02")
-    assert names[2].startswith("ks205-") and names[2].endswith("ee03")
+    assert names[0] == "KS205"
+    assert names[1].startswith("KS205-") and names[1].endswith("EE02")
+    assert names[2].startswith("KS205-") and names[2].endswith("EE03")
 
 
 def test_sync_devices_duplicate_hostname_does_not_clobber_refreshed_device():
@@ -431,8 +431,8 @@ def test_sync_devices_duplicate_hostname_does_not_clobber_refreshed_device():
     assert res["errors"] == 0
     refreshed_dev.delete.assert_not_called()   # never clobber the refreshed device
     ck = eng.nb.dcim.devices.create.call_args.kwargs
-    assert ck["name"] != "ks205"
-    assert ck["name"].startswith("ks205-") and ck["name"].endswith("ee09")
+    assert ck["name"] != "KS205"
+    assert ck["name"].startswith("KS205-") and ck["name"].endswith("EE09")
 
 
 # ── _ensure_custom_fields (spoke-side self-heal) ────────────────────────────
@@ -754,8 +754,8 @@ def test_sync_devices_hostname_match_against_non_bare_device_uniquifies():
     # clobbering device 77's "ks205".
     eng.nb.dcim.devices.create.assert_called_once()
     ck = eng.nb.dcim.devices.create.call_args.kwargs
-    assert ck["name"] != "ks205"
-    assert ck["name"].startswith("ks205-")
+    assert ck["name"] != "KS205"
+    assert ck["name"].startswith("KS205-")
     # The human device 77 was NOT deleted (no reclaim of an unowned name).
     eng.nb.dcim.devices.delete.assert_not_called()
 
@@ -807,7 +807,7 @@ def test_sync_devices_hostname_only_record_not_skipped_added_by_name():
     assert res["pushed"] == 1
     assert res["skipped"] == 0
     eng.nb.dcim.devices.create.assert_called_once()
-    assert eng.nb.dcim.devices.create.call_args.kwargs["name"] == "printer-x"
+    assert eng.nb.dcim.devices.create.call_args.kwargs["name"] == "PRINTER-X"
     # Bare owned device: ownership tag set, no mac_address (none supplied).
     assert bare.custom_fields.get("discovered_from") == "opnsense"
     assert not bare.custom_fields.get("mac_address")
@@ -854,8 +854,8 @@ def test_sync_devices_duplicate_allowed_when_hostname_same_and_mac_ip_both_diffe
     # uniquified name — not "ks205" (which the existing machine keeps).
     eng.nb.dcim.devices.create.assert_called_once()
     ck = eng.nb.dcim.devices.create.call_args.kwargs
-    assert ck["name"] != "ks205"
-    assert ck["name"].startswith("ks205-")
+    assert ck["name"] != "KS205"
+    assert ck["name"].startswith("KS205-")
     # The existing owned device 77 was NOT deleted (different machine, not a
     # reclaimable orphan) — no delete. NB: the create branch's fresh primary_ip4
     # fetch now calls devices.get, so get IS called here.
@@ -1042,7 +1042,7 @@ def test_sync_devices_serial_only_record_creates():
     assert res["pushed"] == 1
     ck = eng.nb.dcim.devices.create.call_args.kwargs
     assert ck["serial"] == "SN-ONLY-7"
-    assert ck["name"] == "device-SN-ONLY-7"
+    assert ck["name"] == "DEVICE-SN-ONLY-7"
 
 
 def test_sync_devices_places_device_under_discovered_model_type():
@@ -1100,7 +1100,7 @@ def test_netbox_sot_fills_empty_dns_name_and_renames_placeholder():
     assert res["status"] == "SUCCESS"
     assert ip.dns_name == "printer1"
     assert ip.custom_fields["mac_address"] == "aa:bb:cc:dd:ee:ff"
-    assert dev.name == "printer1"
+    assert dev.name == "PRINTER1"
     assert dev.custom_fields["mac_address"] == "aa:bb:cc:dd:ee:ff"
     eng.nb.dcim.devices.create.assert_not_called()
 
@@ -1137,7 +1137,7 @@ def test_netbox_sot_skips_invalid_dns_name_but_still_fills_mac():
 
 
 def test_external_mode_renames_foreign_placeholder_but_not_foreign_real_name():
-    for name, expect in (("device-aabbccddeeff", "laptop9"), ("bobs-pc", "bobs-pc")):
+    for name, expect in (("device-aabbccddeeff", "LAPTOP9"), ("bobs-pc", "bobs-pc")):
         row = _existing_placeholder_row(name=name, owner="Network Devices", ip_id=55)
         eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
         ip = _Obj(id=55); ip.dns_name = ""

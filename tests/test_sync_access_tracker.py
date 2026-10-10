@@ -127,7 +127,7 @@ def test_sync_access_tracker_creates_missing_endpoint_with_tag_and_nic_ip():
     ck = eng.nb.dcim.devices.create.call_args.kwargs
     assert ck["status"] == "active"
     assert ck["tenant"] == 1
-    assert ck["name"] == "alice"
+    assert ck["name"] == "ALICE"
     # Ownership tag + topology custom fields on the device.
     assert dev.custom_fields.get("discovered_from") == "cppm-access-tracker"
     assert dev.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
@@ -169,10 +169,10 @@ def test_sync_access_tracker_builds_switch_topology_and_cable():
     assert res["pushed"] == 1
     # Two devices created: the endpoint + the switch (named from nas_name).
     created = [c.kwargs["name"] for c in eng.nb.dcim.devices.create.call_args_list]
-    assert "alice" in created
-    assert "sw-core" in created
+    assert "ALICE" in created
+    assert "SW-CORE" in created
     sw_call = next(c for c in eng.nb.dcim.devices.create.call_args_list
-                   if c.kwargs["name"] == "sw-core")
+                   if c.kwargs["name"] == "SW-CORE")
     assert sw_call.kwargs["role"] is not None
     # One cable, endpoint NIC (100) ↔ switch port (300).
     eng.nb.dcim.cables.create.assert_called_once()
@@ -256,8 +256,8 @@ def test_sync_access_tracker_intra_batch_duplicate_usernames_get_unique_names():
     assert res["errors"] == 0
     names = [c.kwargs["name"] for c in eng.nb.dcim.devices.create.call_args_list]
     assert len(names) == len(set(names))   # all unique → no constraint 400
-    assert names[0] == "alice"
-    assert names[1].startswith("alice-") and names[1].endswith("ee02")
+    assert names[0] == "ALICE"
+    assert names[1].startswith("ALICE-") and names[1].endswith("EE02")
 
 
 def test_sync_access_tracker_refuses_unknown_tenant():
