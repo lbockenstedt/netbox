@@ -19,7 +19,7 @@ class VmSyncMixin:
             role = self.nb.dcim.device_roles.get(name="Virtual Machine")
             dev_type = self.nb.dcim.device_types.get(model="Virtual Machine")
             vm = self.nb.dcim.devices.create(
-                name=name,
+                name=name.strip().upper(),
                 device_type=dev_type.id if dev_type else None,
                 role=role.id if role else None,
                 site=site.id,
@@ -260,10 +260,11 @@ class VmSyncMixin:
         counter guarantees uniqueness. Returns ``base`` unchanged when it
         doesn't collide with either set.
         """
+        base = str(base or "").strip().upper()
         key = base.lower()
         if key not in existing_by_name and key not in used_names:
             return base
-        suffix = (mac.replace(":", "")[-4:] if mac else (real_ip or "x"))
+        suffix = (mac.replace(":", "")[-4:] if mac else (real_ip or "x")).upper()
         cand = f"{base}-{suffix}"
         i = 2
         while cand.lower() in existing_by_name or cand.lower() in used_names:
