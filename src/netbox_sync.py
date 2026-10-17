@@ -14,6 +14,19 @@ logger = logging.getLogger("NetboxEngine")
 # later learns its real hostname (DHCP/DNS) may rename it.
 _PLACEHOLDER_NAME_RE = re.compile(
     r"^device-(?:[0-9a-f]{12}|\d{1,3}(?:\.\d{1,3}){3}|unknown)(?:-[0-9a-z]+)*$", re.I)
+
+
+def _is_auto_name(name) -> bool:
+    """True for a name no human chose: empty, the device-<mac>/<ip>
+    placeholder, a bare IPv4 address, or a bare 12-hex-digit MAC."""
+    s = str(name or "").strip()
+    if not s or _PLACEHOLDER_NAME_RE.match(s):
+        return True
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", s):
+        return True
+    return bool(re.fullmatch(r"[0-9a-fA-F]{12}", re.sub(r"[:.\-]", "", s)))
+
+
 # NetBox's own ipaddress.dns_name validator; anything else 400s the save.
 _DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
 
@@ -377,6 +390,39 @@ class SyncMixin:
                 by_ip.setdefault(addr, row)
         return {"by_serial": by_serial, "by_mac": by_mac, "by_nw": by_nw,
                 "by_ip": by_ip, "by_name": by_name}
+
+    def _adopt_real_name(self, devobj, hostname: str, by_name: dict,
+                         source: str = "sync") -> bool:
+        """Rename a device still carrying an auto name (see ``_is_auto_name``)
+        to a real hostname learned by another feeder (LLDP system name, polled
+        hostname). Never renames a human-chosen name and never takes a name
+        another device already holds. Returns True iff renamed."""
+        cur = str(getattr(devobj, "name", "") or "").strip()
+        host = str(hostname or "").strip()
+        if not host or host.lower() == "unknown" or _is_auto_name(host) \
+                or not _is_auto_name(cur):
+            return False
+        new = self._nb_name(host.split(".", 1)[0])
+        if not new or new == cur:
+            return False
+        holder = (by_name or {}).get(new.lower())
+        if holder and holder.get("id") != getattr(devobj, "id", None):
+            logger.info("netbox: keep %s - name %s already held by device %s",
+                        cur or "(unnamed)", new, holder.get("id"))
+            return False
+        try:
+            devobj.name = new
+            devobj.save()
+        except Exception as e:
+            logger.warning("netbox: rename %s -> %s failed: %s", cur, new, e)
+            return False
+        if by_name is not None:
+            row = by_name.pop(cur.lower(), None) or {}
+            by_name[new.lower()] = {**row, "id": getattr(devobj, "id", None), "name": new}
+        self._journal("dcim.device", getattr(devobj, "id", None), source,
+                      note=f"renamed auto name {cur or '(unnamed)'} -> {new}")
+        logger.info("netbox: renamed auto-named device %s -> %s", cur or "(unnamed)", new)
+        return True
 
     @staticmethod
     def _resolve_existing_device(serial: str = "", mac: str = "",
@@ -1421,6 +1467,14 @@ class SyncMixin:
                     devobj.save()
                 except Exception as e:
                     logger.debug("sync_nw_device: refresh device cf skipped: %s", e)
+                # Matched a device another feeder auto-named (DEVICE-<mac> from
+                # ARP, or a bare IP): the polled hostname is the real name. Only
+                # the fleet's own name counts, never the nw-<id> fallback.
+                try:
+                    self._adopt_real_name(devobj, str(dev.get("name") or ""),
+                                          idx["by_name"], source="nw-poll")
+                except Exception as e:
+                    logger.debug("sync_nw_device: adopt name skipped: %s", e)
 
             dev_id = devobj.id
 
@@ -1778,7 +1832,7 @@ class SyncMixin:
                 (switch_ip/switch_port on the device). Never raises."""
                 try:
                     nic_obj = self.nb.dcim.interfaces.get(nic.id)
-                    if nic_obj and getattr(nic_obj, "connected_endpoint", None):
+                    if nic_obj and self._iface_cable_peer(nic_obj) is not None:
                         return  # already cabled — don't create a second link
                 except Exception as e:
                     logger.debug("sync_access_tracker: nic connected_endpoint check: %s", e)
