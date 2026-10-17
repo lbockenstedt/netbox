@@ -16,10 +16,11 @@ from netbox_engine import NetboxEngine  # noqa: E402
 
 
 class _Iface:
-    """Minimal interface stand-in (needs .id; optionally a connected_endpoint)."""
-    def __init__(self, id=100, connected_endpoint=None):
+    """Minimal interface stand-in (needs .id; optionally a cable + link peers)."""
+    def __init__(self, id=100, cable=None, link_peers=None):
         self.id = id
-        self.connected_endpoint = connected_endpoint
+        self.cable = cable
+        self.link_peers = list(link_peers or [])
 
 
 class _Obj:
@@ -185,15 +186,16 @@ def test_sync_access_tracker_builds_switch_topology_and_cable():
 
 
 def test_sync_access_tracker_cable_not_recreated_when_already_connected():
-    # The NIC already has a connected_endpoint → don't create a second cable.
+    # The NIC already has a cable → don't create a second cable.
     eng = _engine_with(existing_rows=[], tenant_obj=_Obj(id=1))
     eng.nb.dcim.devices.create.side_effect = [_Obj(id=42), _Obj(id=50)]
     eng.nb.dcim.interfaces.create.side_effect = [_Iface(100), _Iface(200)]  # NIC, switch mgmt
     eng.nb.ipam.ip_addresses.create.side_effect = [_Obj(id=555), _Obj(id=556)]
     # interfaces.get returns a connected iface for BOTH the port-find (port
-    # exists → reuse) and the nic connected_endpoint check (already cabled).
-    eng.nb.dcim.interfaces.get.return_value = _Iface(id=300,
-                                                     connected_endpoint={"id": 999})
+    # exists → reuse) and the nic cable check (already cabled).
+    eng.nb.dcim.interfaces.get.return_value = _Iface(
+        id=300, cable={"id": 7},
+        link_peers=[{"device": {"name": "SW"}, "name": "1/1/1"}])
 
     res = eng.sync_access_tracker(
         sessions=[{"mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.5",

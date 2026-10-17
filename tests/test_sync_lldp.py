@@ -139,3 +139,47 @@ def test_truncated_or_junk_lldp_names_are_never_created():
     ])
     eng.nb.dcim.devices.create.assert_not_called()
     assert res["skipped"] == 1
+
+
+def test_lldp_renames_placeholder_device_matched_by_mac():
+    # DEVICE-001A1E042F00 was minted from ARP; LLDP now advertises its real
+    # system name with the same chassis MAC -> adopt the hostname.
+    rows = [{"id": 10, "name": "mipbe-ssplm-n31-crsw1",
+             "custom_fields": {"mac_address": "ec:50:aa:f4:5a:00"}},
+            {"id": 20, "name": "DEVICE-001A1E042F00",
+             "custom_fields": {"mac_address": "00:1a:1e:04:2f:00"}}]
+    vpnc = _rec(20, "DEVICE-001A1E042F00", {"mac_address": "00:1a:1e:04:2f:00"})
+    recs = {10: _rec(10, "MIPBE-SSPLM-N31-CRSW1", {"mac_address": "ec:50:aa:f4:5a:00"}),
+            20: vpnc}
+    eng = _engine(rows, recs)
+    res = eng.sync_lldp_links(links=[
+        {"a": {"name": "mipbe-ssplm-n31-crsw1", "macs": ["ec:50:aa:f4:5a:00"]},
+         "a_port": "1/1/7",
+         "b": {"name": "MIPBE-SSPLM-N31-VPNC1.orange-tme.com",
+               "macs": ["00:1A:1E:04:2F:00"], "addresses": ["172.21.2.3"]},
+         "b_port": "GE0/0/0"},
+    ], tenant_slug="default")
+    assert res["status"] == "SUCCESS", res
+    assert vpnc.name == "MIPBE-SSPLM-N31-VPNC1"
+    vpnc.save.assert_called()
+    assert res["renamed"] == 1 and res["created"] == 0 and res["cabled"] == 1
+    # CRSW1 has a human name -> untouched.
+    assert recs[10].name == "MIPBE-SSPLM-N31-CRSW1"
+
+
+def test_adopt_real_name_rules():
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._journal = MagicMock()
+    by_name = {"taken": {"id": 7, "name": "TAKEN"}}
+    # Human-chosen names are never replaced.
+    d = _rec(1, "core-sw")
+    assert not eng._adopt_real_name(d, "other", by_name)
+    # An IP or MAC is not a hostname to adopt.
+    d = _rec(2, "172.21.2.3")
+    assert not eng._adopt_real_name(d, "172.21.2.4", by_name)
+    assert not eng._adopt_real_name(d, "00:1a:1e:04:2f:00", by_name)
+    # A name another device already holds is not stolen.
+    assert not eng._adopt_real_name(d, "taken", by_name)
+    # A bare-IP name takes the short real hostname; the index follows.
+    assert eng._adopt_real_name(d, "vpnc1.example.com", by_name)
+    assert d.name == "VPNC1" and by_name["vpnc1"]["id"] == 2
