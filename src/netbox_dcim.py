@@ -310,6 +310,21 @@ class DcimMixin:
                 return hits[0]
         return None
 
+    @staticmethod
+    def _iface_cable_peer(iface):
+        """Return (device_name, port_name) of the far end of a cable, or None."""
+        if not getattr(iface, "cable", None):
+            return None
+        peers = getattr(iface, "link_peers", None) or getattr(iface, "connected_endpoints", None) or getattr(iface, "connected_endpoint", None)
+        if peers and not isinstance(peers, (list, tuple)):
+            peers = [peers]
+        if not peers:
+            return ("(unknown)", "")
+        p = peers[0]
+        device = p.get("device") if isinstance(p, dict) else getattr(p, "device", None)
+        port = p.get("name") if isinstance(p, dict) else getattr(p, "name", "")
+        return (DcimMixin._name_of(device), port or "")
+
     def _cable_devices(self, dev_a, a_port: str, dev_b, b_port: str,
                        status: str = "connected") -> Dict[str, Any]:
         """Cable two resolved NetBox devices port-to-port (see :meth:`sync_cable`)."""
@@ -332,12 +347,7 @@ class DcimMixin:
                 already cabled to, or ``None`` if it's unconnected."""
                 try:
                     fresh = self.nb.dcim.interfaces.get(iface.id)
-                    endpoint = getattr(fresh, "connected_endpoint", None) \
-                        if fresh else None
-                    if not endpoint:
-                        return None
-                    dev = getattr(endpoint, "device", None)
-                    return (self._name_of(dev), getattr(endpoint, "name", "") or "")
+                    return self._iface_cable_peer(fresh) if fresh else None
                 except Exception as e:
                     logger.debug("sync_cable: connected-endpoint check failed: %s", e)
                     return None
@@ -351,6 +361,16 @@ class DcimMixin:
                 return {"status": "SKIPPED",
                         "message": f"{a_device}:{a_port} already cabled to "
                                    f"{existing[0]}:{existing[1]} — not overwriting"}
+
+            existing_b = _connected_device_port(iface_b)
+            if existing_b is not None:
+                if existing_b[0].casefold() == a_device.casefold():
+                    return {"status": "UNCHANGED",
+                            "message": f"{b_device}:{b_port} already cabled to "
+                                       f"{a_device}:{a_port}"}
+                return {"status": "SKIPPED",
+                        "message": f"{b_device}:{b_port} already cabled to "
+                                   f"{existing_b[0]}:{existing_b[1]} — not overwriting"}
 
             self.nb.dcim.cables.create(
                 a_terminations=[{"object_type": "dcim.interface",
@@ -421,7 +441,8 @@ class DcimMixin:
         upper-cased hostname. Cabling goes through :meth:`_cable_devices`, so a
         human's existing cable on the port is never overwritten.
         """
-        counters = {"cabled": 0, "unchanged": 0, "skipped": 0, "created": 0, "errors": 0}
+        counters = {"cabled": 0, "unchanged": 0, "skipped": 0, "created": 0,
+                    "renamed": 0, "errors": 0}
         messages = []
 
         try:
@@ -502,6 +523,11 @@ class DcimMixin:
                         cf["mac_address"] = macs[0]
                         rec.custom_fields = cf
                         rec.save()
+                    # Matched by MAC/IP onto a device still named DEVICE-<mac>
+                    # or a bare IP: the LLDP system name is the real hostname.
+                    if rec and name and self._adopt_real_name(
+                            rec, name, idx["by_name"], source="lldp"):
+                        counters["renamed"] += 1
                 except Exception as e:
                     logger.debug(f"failed to update custom fields for device {row['id']}: {e}")
             elif create_missing and len(name) >= 3 and ".." not in name \
@@ -591,7 +617,7 @@ class DcimMixin:
         status = "SUCCESS" if counters["errors"] == 0 else "PARTIAL"
         return {
             "status": status,
-            "message": f"{counters['cabled']} cabled, {counters['unchanged']} unchanged, {counters['created']} created, {counters['skipped']} skipped, {counters['errors']} errors",
+            "message": f"{counters['cabled']} cabled, {counters['unchanged']} unchanged, {counters['created']} created, {counters['skipped']} skipped, {counters['renamed']} renamed, {counters['errors']} errors",
             "details": [m for m in messages if m][:20],
             **counters
         }
