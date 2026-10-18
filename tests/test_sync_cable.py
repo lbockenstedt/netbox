@@ -26,15 +26,20 @@ def _iface(iface_id, connected_to=None):
     """``connected_to`` is (device_name, port_name) or None (unconnected)."""
     iface = MagicMock()
     iface.id = iface_id
+    # NetBox >= 3.3 shape: ``cable`` + ``link_peers`` (``connected_endpoint``
+    # singular no longer exists, so it must not be what the check relies on).
+    iface.connected_endpoint = None
     if connected_to is None:
-        iface.connected_endpoint = None
+        iface.cable = None
+        iface.link_peers = []
     else:
         remote_dev = MagicMock()
         remote_dev.name = connected_to[0]
         endpoint = MagicMock()
         endpoint.device = remote_dev
         endpoint.name = connected_to[1]
-        iface.connected_endpoint = endpoint
+        iface.cable = MagicMock(id=17)
+        iface.link_peers = [endpoint]
     return iface
 
 
@@ -150,3 +155,33 @@ def test_missing_port_arguments_is_an_error():
     eng = _engine(devices={}, interfaces={})
     res = eng.sync_cable("SW1", "", "SW2", "1/1/48")
     assert res["status"] == "ERROR"
+
+
+def test_far_end_already_cabled_is_not_recreated():
+    # The LLDP link arrives from the other switch's view: our A port looks
+    # free but the B port already carries the cable back to A. Creating it
+    # again 400s ("Duplicate termination found"), so it must read UNCHANGED.
+    sw1 = _device("SW1", 1)
+    sw2 = _device("SW2", 2)
+    iface_a = _iface(101, connected_to=None)
+    iface_b = _iface(102, connected_to=("SW1", "1/1/1"))
+    eng = _engine(
+        devices={"SW1": sw1, "SW2": sw2},
+        interfaces={(1, "1/1/1"): iface_a, (2, "1/1/48"): iface_b},
+        fresh_interfaces={101: iface_a, 102: iface_b},
+    )
+    res = eng.sync_cable("SW1", "1/1/1", "SW2", "1/1/48")
+    assert res["status"] == "UNCHANGED"
+    assert eng.cable_calls == []
+
+
+def test_cable_without_peer_detail_still_counts_as_cabled():
+    # A cabled interface whose peers weren't expanded must not be re-cabled.
+    iface = MagicMock()
+    iface.cable = MagicMock(id=5)
+    iface.link_peers = []
+    iface.connected_endpoints = None
+    iface.connected_endpoint = None
+    assert NetboxEngine._iface_cable_peer(iface) == ("(unknown)", "")
+    iface.cable = None
+    assert NetboxEngine._iface_cable_peer(iface) is None
