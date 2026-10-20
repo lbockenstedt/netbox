@@ -302,13 +302,16 @@ membership). Two pieces ship in the installer:
   (`/opt/netbox-app/netbox/lm_sso_pipeline.py`, on `sys.path`, alongside
   `lm_custom_validators.py`). It exports one social-auth pipeline step,
   `sync_entra_groups`, which maps Entra group object IDs → NetBox groups via the
-  `NETBOX_SSO_GROUP_MAP` setting and sets the NetBox user's groups to exactly
+  `SOCIAL_AUTH_LM_GROUP_MAP` setting and sets the NetBox user's groups to exactly
   that set on every login — so a dropped Entra group drops the NetBox group
   next login. It also handles the Entra **>200-groups overflow** (when the
   `groups` claim is omitted) by falling back to Microsoft Graph
   `/me/transitiveMemberOf` (ported from the LM hub's
   `security.oidc.fetch_member_groups_via_graph`), and an optional
-  `NETBOX_SSO_ALLOWED_GROUP` login gate.
+  `SOCIAL_AUTH_LM_ALLOWED_GROUP` login gate. (Settings use `SOCIAL_AUTH_*`
+  names because NetBox only forwards those from `configuration.py` into Django
+  settings; the older `NETBOX_SSO_*` names never reached the pipeline and are
+  read only as a fallback.)
 
 MFA is enforced by **Entra conditional access at the IdP** — NetBox trusts the
 IdP (social-auth doesn't expose the `amr` claim for a hub-side hard-check the
@@ -320,9 +323,18 @@ The pipeline module is written on every run but is only imported once
 
 ### Entra setup
 
-SSO is applied by **re-running `install.sh` with the `--netbox-sso-*` flags**
-(or the `LM_NETBOX_SSO_*` env equivalents). There is no live WebUI push and no
-sudoers grant — the installer writes a guarded, sentinel-delimited block into
+> **Preferred: turn it on from Lab Manager.** LM → Settings → Azure → NetBox
+> SSO → *Enable* pushes the hub's own Entra connection (tenant, client id,
+> **client certificate** — no secret — allowed group, Permission Group map,
+> Global Admin groups → NetBox superuser) to the netbox-server host's agent,
+> which installs its `lm_sso_backend.py` and writes this same sentinel block
+> with a **Sign in with Microsoft** button. The only Entra step is adding
+> `https://<netbox-host>/oauth/complete/oidc/` as a redirect URI on the LM app.
+> See `lm/docs/netbox.md`. The installer flags below are the secret-based
+> alternative for a NetBox not managed by LM.
+
+SSO can also be applied by **re-running `install.sh` with the `--netbox-sso-*` flags**
+(or the `LM_NETBOX_SSO_*` env equivalents) — the installer writes a guarded, sentinel-delimited block into
 `configuration.py` and restarts `netbox`/`netbox-rq`. Re-running with the same
 flags is a no-op (the block matches → unchanged → no restart); re-running with
 changed flags replaces the block in place (idempotent, never clobbers the rest
@@ -377,8 +389,9 @@ SSO):
 
 The resulting `configuration.py` block sets `REMOTE_AUTH_*` +
 `SOCIAL_AUTH_OIDC_*` + a `SOCIAL_AUTH_PIPELINE` extended with
-`lm_sso_pipeline.sync_entra_groups`, plus `NETBOX_SSO_GROUP_MAP` and
-`NETBOX_SSO_ALLOWED_GROUP`. **Break-glass:** a local NetBox superuser (created
+`lm_sso_pipeline.sync_entra_groups`, plus `SOCIAL_AUTH_LM_GROUP_MAP`,
+`SOCIAL_AUTH_LM_ALLOWED_GROUP` and `SOCIAL_AUTH_BACKEND_ATTRS` (labels the login
+button **Sign in with Microsoft** with the Microsoft icon). **Break-glass:** a local NetBox superuser (created
 by the installer) still logs in via NetBox's local Django auth when Entra is
 unreachable. **Secret rotation** = re-run the installer with a new
 `--netbox-sso-client-secret`.
