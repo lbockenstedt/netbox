@@ -894,11 +894,11 @@ the end of the pipeline:
 
   * Maps the user's Entra group object IDs (the id-token ``groups`` claim, or
     Microsoft Graph ``/me/transitiveMemberOf`` when the claim overflows >200
-    groups) to NetBox group names via the ``NETBOX_SSO_GROUP_MAP`` setting, and
+    groups) to NetBox group names via the ``SOCIAL_AUTH_LM_GROUP_MAP`` setting, and
     sets the NetBox user's groups to EXACTLY that mapped set — so Entra is the
     source of truth for group membership (a dropped Entra group drops the NetBox
     group on the next login).
-  * Optional ``NETBOX_SSO_ALLOWED_GROUP`` gate: when set, a user who is not a
+  * Optional ``SOCIAL_AUTH_LM_ALLOWED_GROUP`` gate: when set, a user who is not a
     member of that Entra group is refused (``AuthForbidden``) before any NetBox
     user record is provisioned.
 
@@ -981,9 +981,9 @@ def sync_entra_groups(backend, user, response, *args, **kwargs):
     """social-auth pipeline step (appended to ``SOCIAL_AUTH_PIPELINE``).
 
     Maps the user's Entra group object IDs -> NetBox groups via
-    ``NETBOX_SSO_GROUP_MAP`` and sets the NetBox user's groups to exactly that
+    ``SOCIAL_AUTH_LM_GROUP_MAP`` and sets the NetBox user's groups to exactly that
     set (Entra is the source of truth). Refuses login (``AuthForbidden``) when
-    ``NETBOX_SSO_ALLOWED_GROUP`` is set and the user is not a member of that
+    ``SOCIAL_AUTH_LM_ALLOWED_GROUP`` is set and the user is not a member of that
     Entra group. NetBox groups are get-or-created when
     ``REMOTE_AUTH_AUTO_CREATE_GROUPS`` is on; otherwise only pre-existing groups
     are assigned (unmapped / missing groups are skipped with a debug log).
@@ -994,8 +994,15 @@ def sync_entra_groups(backend, user, response, *args, **kwargs):
     except Exception:  # noqa: BLE001 — keep the gate working if social_core moved it
         AuthForbidden = Exception
 
-    group_map = getattr(settings, "NETBOX_SSO_GROUP_MAP", {}) or {}
-    allowed_group = (getattr(settings, "NETBOX_SSO_ALLOWED_GROUP", "") or "").strip()
+    # SOCIAL_AUTH_* names: NetBox only forwards SOCIAL_AUTH_* (and its own
+    # parameters) from configuration.py into Django settings. The legacy
+    # NETBOX_SSO_* names never arrived — kept only as a harmless fallback.
+    group_map = getattr(settings, "SOCIAL_AUTH_LM_GROUP_MAP", None)
+    if group_map is None:
+        group_map = getattr(settings, "NETBOX_SSO_GROUP_MAP", {})
+    group_map = group_map or {}
+    allowed_group = (getattr(settings, "SOCIAL_AUTH_LM_ALLOWED_GROUP", "")
+                     or getattr(settings, "NETBOX_SSO_ALLOWED_GROUP", "") or "").strip()
     auto_create = bool(getattr(settings, "REMOTE_AUTH_AUTO_CREATE_GROUPS", False))
 
     # The token response carries access_token + id_token; some social-auth
@@ -1139,11 +1146,16 @@ lines = [
     "SOCIAL_AUTH_OIDC_SECRET = %s" % repr(client_secret),
     "SOCIAL_AUTH_OIDC_SCOPE = ['openid', 'profile', 'email', 'offline_access']",
     "SOCIAL_AUTH_OIDC_USERNAME_KEY = 'preferred_username'",
-    "NETBOX_SSO_GROUP_MAP = %s" % json.dumps(group_map),
-    "NETBOX_SSO_ALLOWED_GROUP = %s" % repr(allowed_group),
+    "SOCIAL_AUTH_BACKEND_ATTRS = {'oidc': ('Sign in with Microsoft', 'microsoft')}",
+    "SOCIAL_AUTH_LM_GROUP_MAP = %s" % json.dumps(group_map),
+    "SOCIAL_AUTH_LM_ALLOWED_GROUP = %s" % repr(allowed_group),
 ]
 if redirect_uri:
     lines.append("# Redirect URI registered in Entra: %s" % redirect_uri)
+    if redirect_uri.lower().startswith("https://"):
+        # NetBox sits behind nginx TLS; build https:// redirect URIs so they
+        # match the one registered in Entra.
+        lines.append("SOCIAL_AUTH_REDIRECT_IS_HTTPS = True")
 lines += [
     "SOCIAL_AUTH_PIPELINE = (",
     "    'social_core.pipeline.social_auth.social_details',",
@@ -1154,7 +1166,7 @@ lines += [
     "    'social_core.pipeline.user.create_user',",
     "    'social_core.pipeline.social_auth.associate_user',",
     "    'social_core.pipeline.social_auth.load_extra_data',",
-    "    'social_core.pipeline.user_details',",
+    "    'social_core.pipeline.user.user_details',",
     "    'lm_sso_pipeline.sync_entra_groups',",
     ")",
     END,
