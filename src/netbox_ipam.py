@@ -85,6 +85,12 @@ class IpamMixin:
                 return {"status": "ERROR", "message": f"Parent prefix '{parent_prefix}' not found"}
 
             payload: Dict[str, Any] = {"description": description, "status": status}
+            if vrf_id is None:
+                # No tenant VRF: the child inherits the parent's VRF. NetBox's
+                # available-prefixes allocator does this itself, but a direct
+                # prefixes.create (exact "Subnet" typed) would otherwise land
+                # in the global table.
+                vrf_id = self._obj_vrf_id(parent)
             if vrf_id is not None:
                 payload["vrf"] = vrf_id
             if custom_fields:

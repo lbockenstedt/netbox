@@ -247,3 +247,32 @@ def test_sync_nw_device_stores_base_mac_on_create():
     dev = dict(_DEV, mac="AA:BB:CC:DD:EE:01")
     eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
     assert created.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:01"
+
+
+def test_sync_nw_device_renames_auto_named_match_to_polled_hostname():
+    # ARP minted DEVICE-<mac>; the poll now knows the real hostname -> adopt it.
+    other = {"id": 66, "name": "DEVICE-001A1E042F00", "serial": "",
+             "custom_fields": {"mac_address": "00:1a:1e:04:2f:00"}}
+    eng = _engine(existing_devices=[other])
+    rec = _Obj(id=66, name="DEVICE-001A1E042F00",
+               custom_fields={"mac_address": "00:1a:1e:04:2f:00"})
+    eng.nb.dcim.devices.get = MagicMock(return_value=rec)
+    dev = dict(_DEV, name="mipbe-ssplm-n31-vpnc1", mac="00:1a:1e:04:2f:00")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert rec.name == "MIPBE-SSPLM-N31-VPNC1"
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_sync_nw_device_keeps_auto_name_when_poll_has_only_ip_name():
+    other = {"id": 66, "name": "DEVICE-001A1E042F00", "serial": "",
+             "custom_fields": {"mac_address": "00:1a:1e:04:2f:00"}}
+    eng = _engine(existing_devices=[other])
+    rec = _Obj(id=66, name="DEVICE-001A1E042F00",
+               custom_fields={"mac_address": "00:1a:1e:04:2f:00"})
+    eng.nb.dcim.devices.get = MagicMock(return_value=rec)
+    dev = dict(_DEV, name="172.21.2.3", mac="00:1a:1e:04:2f:00")
+    eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                       defaults=_DEFAULTS)
+    assert rec.name == "DEVICE-001A1E042F00"

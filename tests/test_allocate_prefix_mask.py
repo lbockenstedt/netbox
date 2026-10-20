@@ -101,3 +101,30 @@ def test_bare_address_outside_parent_still_rejected():
                             requested_prefix="10.0.0.0")
     assert r["status"] == "ERROR"
     assert eng._created == []
+
+
+def test_exact_subnet_inherits_parent_vrf():
+    """Regression: with no tenant VRF, an exact subnet typed under a parent
+    that lives in a VRF must be created in that VRF, not the global table."""
+    eng = _engine()
+    eng.nb.ipam.prefixes.get.return_value.vrf = _Rec(id=42, name="LAB")
+    r = eng.allocate_prefix("172.17.0.0/17", prefix_length=24,
+                            requested_prefix="172.17.5.0/24")
+    assert r["status"] == "SUCCESS"
+    assert eng._created[0]["vrf"] == 42
+
+
+def test_auto_allocate_carries_parent_vrf():
+    eng = _engine()
+    eng.nb.ipam.prefixes.get.return_value.vrf = _Rec(id=42, name="LAB")
+    r = eng.allocate_prefix("172.17.0.0/17", prefix_length=24)
+    assert r["status"] == "SUCCESS"
+    assert eng._created[0]["vrf"] == 42
+
+
+def test_global_parent_stays_global():
+    eng = _engine()
+    r = eng.allocate_prefix("172.17.0.0/17", prefix_length=24,
+                            requested_prefix="172.17.5.0/24")
+    assert r["status"] == "SUCCESS"
+    assert "vrf" not in eng._created[0]
