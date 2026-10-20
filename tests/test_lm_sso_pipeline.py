@@ -146,6 +146,72 @@ class PipelineWiredInInstallShTest(unittest.TestCase):
         # The configuration.py writer embeds the pipeline path.
         self.assertIn("lm_sso_pipeline.sync_entra_groups", src)
 
+    def test_config_block_uses_settings_netbox_forwards(self):
+        """NetBox copies only SOCIAL_AUTH_* from configuration.py into Django
+        settings, so the group map / allowed group must use those names, and
+        the stock user_details step lives at social_core.pipeline.user."""
+        with open(INSTALL_SH) as f:
+            src = f.read()
+        self.assertIn('"SOCIAL_AUTH_LM_GROUP_MAP = %s"', src)
+        self.assertIn('"SOCIAL_AUTH_LM_ALLOWED_GROUP = %s"', src)
+        self.assertNotIn('"NETBOX_SSO_GROUP_MAP = %s"', src)
+        self.assertIn("'social_core.pipeline.user.user_details'", src)
+        self.assertNotIn("'social_core.pipeline.user_details'", src)
+
+    def test_config_block_brands_the_login_button(self):
+        with open(INSTALL_SH) as f:
+            src = f.read()
+        self.assertIn("SOCIAL_AUTH_BACKEND_ATTRS = {'oidc': ('Sign in with Microsoft', 'microsoft')}", src)
+
+
+class SyncEntraGroupsSettingsTest(unittest.TestCase):
+    """sync_entra_groups reads SOCIAL_AUTH_LM_* (falls back to legacy names)."""
+
+    def _run(self, settings, groups):
+        import types
+        conf = types.ModuleType("django.conf")
+        conf.settings = settings
+        store = {}
+
+        class _Mgr:
+            def filter(self, name):
+                return types.SimpleNamespace(first=lambda: store.get(name))
+
+            def get_or_create(self, name):
+                store.setdefault(name, types.SimpleNamespace(name=name))
+                return store[name], True
+
+        assigned = {}
+        user = types.SimpleNamespace(
+            username="alice",
+            groups=types.SimpleNamespace(model=types.SimpleNamespace(objects=_Mgr()),
+                                         set=lambda g: assigned.setdefault("g", list(g))))
+        with patch.dict(sys.modules, {"django": types.ModuleType("django"), "django.conf": conf}):
+            LmSsoPipelineTests.mod["sync_entra_groups"](
+                object(), user, {"id_token": _make_id_token({"groups": groups})})
+        return [g.name for g in assigned.get("g", [])]
+
+    def test_social_auth_lm_names(self):
+        import types
+        s = types.SimpleNamespace(SOCIAL_AUTH_LM_GROUP_MAP={"a": "NB A"},
+                                  SOCIAL_AUTH_LM_ALLOWED_GROUP="a",
+                                  REMOTE_AUTH_AUTO_CREATE_GROUPS=True)
+        self.assertEqual(self._run(s, ["a", "b"]), ["NB A"])
+
+    def test_allowed_group_gate_enforced(self):
+        import types
+        s = types.SimpleNamespace(SOCIAL_AUTH_LM_GROUP_MAP={},
+                                  SOCIAL_AUTH_LM_ALLOWED_GROUP="must",
+                                  REMOTE_AUTH_AUTO_CREATE_GROUPS=True)
+        with self.assertRaises(Exception):
+            self._run(s, ["other"])
+
+    def test_legacy_names_fallback(self):
+        import types
+        s = types.SimpleNamespace(NETBOX_SSO_GROUP_MAP={"a": "NB A"},
+                                  REMOTE_AUTH_AUTO_CREATE_GROUPS=True)
+        self.assertEqual(self._run(s, ["a"]), ["NB A"])
+
 
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(__file__))
