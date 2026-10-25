@@ -2,8 +2,11 @@
 import ipaddress
 import re
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
+
+import pynetbox
 
 logger = logging.getLogger("NetboxEngine")
 
@@ -29,6 +32,154 @@ def _is_auto_name(name) -> bool:
 
 # NetBox's own ipaddress.dns_name validator; anything else 400s the save.
 _DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
+
+
+# Device custom fields that carry a MAC sighting ("last seen on switch X port
+# Y"). The incoming record uses the same names (``_incoming_device_record``).
+_SWITCH_CF_KEYS = ("switch_name", "switch_ip", "switch_port")
+
+
+def _normalize_source_tag(source: Any) -> str:
+    """The ``discovered_from`` ownership tag for a sync ``source``: the
+    firewall synonyms collapse to the legacy ``"opnsense"`` tag (existing
+    firewall deployments stay byte-identical); anything else (nw's
+    ``"Network Devices"``) is used verbatim."""
+    tag = str(source or "opnsense").strip()
+    return "opnsense" if tag.lower() in ("opnsense", "fw", "firewall") else tag
+
+
+def _primary_addr(row: dict) -> str:
+    """Bare primary IPv4 (no mask) of a listed device row, or ''."""
+    pip = row.get("primary_ip4")
+    if not isinstance(pip, dict):
+        return ""
+    return (pip.get("address") or "").split("/")[0].strip()
+
+
+@dataclass
+class _DeviceSyncRun:
+    """Everything ONE ``sync_devices`` call shares between its steps.
+
+    The indexes are a snapshot of NetBox taken once at the start of the batch
+    (one paginated listing) — they do NOT see devices created later in the
+    batch. The ``used_names`` / ``created_by_name`` / ``refreshed_ids`` sets
+    cover that gap; see the field comments.
+    """
+    tenant_slug: str
+    source_tag: str                      # discovered_from value we own
+    source_of_truth: str                 # "external" | "netbox"
+    defaults: Dict[str, Any]
+    tenant: Any = None
+    # result counters
+    pushed: int = 0
+    errors: int = 0
+    skipped: int = 0
+    deleted: int = 0
+    first_err: Optional[str] = None      # first failure text, shown in the result
+    # pre-batch indexes of existing device rows
+    by_ip: Dict[str, dict] = field(default_factory=dict)      # primary IPv4 → row (last wins)
+    by_name: Dict[str, dict] = field(default_factory=dict)    # name.lower() → row
+    by_mac: Dict[str, dict] = field(default_factory=dict)     # cf.mac_address → row
+    by_serial: Dict[str, dict] = field(default_factory=dict)  # serial.lower() → row
+    owned_ips: set = field(default_factory=set)  # primary IPs of devices we own
+    # Names created/refreshed THIS batch: a 2nd create with the same name would
+    # 400 on (name, site, tenant), and by_name can't see these.
+    used_names: set = field(default_factory=set)
+    # hostname.lower() → id of a device CREATED this batch, so an
+    # operator-named second address can join it.
+    created_by_name: Dict[str, Any] = field(default_factory=dict)
+    # Device ids already updated this batch: the hostname tier never re-adopts
+    # them and the create branch never reclaims (deletes) them by name.
+    refreshed_ids: set = field(default_factory=set)
+    # batch-wide create refs (``_resolve_create_defaults``)
+    role: Any = None
+    dtype: Any = None
+    site: Any = None
+    cf_whitelist: set = field(default_factory=set)
+    # set after the first "site required" create failure (ccb5034)
+    site_required_abort: bool = False
+    # ── live pynetbox Records for this batch (perf, B3) ──
+    # Rows waiting to be turned into Records on first use (id → listed row).
+    # Built from the ONE device listing / the IP prefetch, so an unchanged
+    # device costs no GET at all. See ``SyncMixin._device_record``.
+    device_rows: Dict[Any, dict] = field(default_factory=dict)
+    ip_rows: Dict[Any, dict] = field(default_factory=dict)
+    # id → the ONE live Record every write to that object goes through this
+    # batch (``save()`` re-reads the PATCH response into it, so a device
+    # matched by two records sees the first record's writes).
+    device_objs: Dict[Any, Any] = field(default_factory=dict)
+    ip_objs: Dict[Any, Any] = field(default_factory=dict)
+    deleted_ids: set = field(default_factory=set)  # devices deleted this batch
+
+    def forget_device(self, dev_id: Any) -> None:
+        """A write to this device FAILED (or may have): drop its Record so the
+        next use re-reads NetBox. A failed ``save()`` keeps the unsent change
+        on the Record — e.g. a rename that 400s on the (name, site, tenant)
+        constraint — and every later save would re-send it and fail too. The
+        per-write GET this cache replaced naturally discarded it."""
+        self.device_objs.pop(dev_id, None)
+
+    def forget_ip(self, ip_id: Any) -> None:
+        """An IP was written OUTSIDE its cached Record (``_reuse_or_create_ip``
+        reassigns/tags by its own lookup, a device delete cascades to its
+        IPs): drop what we hold so the next use re-reads it (GET), exactly
+        like the per-write GET this cache replaced."""
+        self.ip_rows.pop(ip_id, None)
+        self.ip_objs.pop(ip_id, None)
+
+    def owns(self, cf: Optional[dict]) -> bool:
+        """True iff a device's custom fields carry OUR ``discovered_from`` tag
+        (case-insensitive)."""
+        return str((cf or {}).get("discovered_from") or "").lower() == self.source_tag.lower()
+
+    def note_error(self, text: str) -> None:
+        """Count one error; keep the first one's text for the result message."""
+        self.errors += 1
+        if self.first_err is None:
+            self.first_err = text
+
+
+class _IncomingDevice:
+    """Read-only view of one normalized incoming record (see
+    ``SyncMixin._incoming_device_record``) plus the facts every step asks."""
+
+    __slots__ = ("key", "rec", "mac", "hostname", "serial", "real_ip")
+
+    def __init__(self, key: str, rec: Dict[str, Any]):
+        self.key = key                     # incoming-set key: IP or mac:/host:/serial:
+        self.rec = rec
+        self.mac = rec["mac"]
+        self.hostname = rec["hostname"]
+        self.serial = rec.get("serial") or ""
+        # A synthetic key carries no address to assign.
+        self.real_ip = "" if key.startswith(("mac:", "host:", "serial:")) else key
+
+    @property
+    def keyed_by_ip(self) -> bool:
+        return bool(self.real_ip)
+
+    @property
+    def has_hostname(self) -> bool:
+        """A usable hostname ('unknown' is what DHCP reports for none)."""
+        return bool(self.hostname) and self.hostname.lower() != "unknown"
+
+    @property
+    def operator_named(self) -> bool:
+        """The hostname is an operator assertion (DNS A record / DHCP
+        reservation): one name = one device."""
+        return self.rec.get("hostname_source") in ("dns", "reservation")
+
+    @property
+    def default_name(self) -> str:
+        """Name for a new device: the hostname, else an auto placeholder
+        ``device-<mac12>`` / ``device-<serial>`` / ``device-<ip>``."""
+        if self.has_hostname:
+            return self.hostname
+        if self.mac:
+            return f"device-{self.mac.replace(':', '')}"
+        if self.serial:
+            return f"device-{self.serial}"
+        return f"device-{self.real_ip or 'unknown'}"
 
 
 class SyncMixin:
@@ -199,8 +350,16 @@ class SyncMixin:
             return set()
 
     def _ensure_device_role(self, slug: str = "discovered"):
-        """Return the device role (auto-creating 'discovered' if missing). Best-effort."""
+        """Return the device role (auto-creating 'discovered' if missing). Best-effort.
+
+        TTL-cached per engine (``_cached_ref``): every sync_devices call — and
+        every record carrying its own role — used to re-GET the same role.
+        A failure returns None, cached only for the short negative TTL."""
         slug = (slug or "discovered").strip().lower() or "discovered"
+        return self._cached_ref("ensure_device_role", slug,
+                                lambda: self._get_or_create_device_role(slug))
+
+    def _get_or_create_device_role(self, slug: str):
         try:
             r = self.nb.dcim.device_roles.get(slug=slug)
             if r:
@@ -215,8 +374,13 @@ class SyncMixin:
 
     def _ensure_device_type(self, slug: str = "discovered"):
         """Return the device type (auto-creating 'Discovered Device' under an
-        'Unknown' manufacturer if missing). Best-effort."""
+        'Unknown' manufacturer if missing). Best-effort; TTL-cached like
+        ``_ensure_device_role``."""
         slug = (slug or "discovered").strip().lower() or "discovered"
+        return self._cached_ref("ensure_device_type", slug,
+                                lambda: self._get_or_create_device_type(slug))
+
+    def _get_or_create_device_type(self, slug: str):
         try:
             dt = self.nb.dcim.device_types.get(slug=slug)
             if dt:
@@ -331,19 +495,23 @@ class SyncMixin:
         return None
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
-                               by_serial: Optional[Dict[str, dict]] = None) -> None:
+                               by_serial: Optional[Dict[str, dict]] = None,
+                               rows: Optional[list] = None) -> None:
         """Fill MAC / serial indexes from EVERY tenant (setdefault: rows already
         indexed from the caller's tenant-scoped listing win).
 
         MAC and serial identify a physical device globally. A sync scoped to
         tenant B could not see tenant A's record of the same MAC and minted a
-        copy every time (the RA/LRB ``device-<mac>`` pairs). Best-effort: a
+        copy every time (the RA/LRB ``device-<mac>`` pairs). ``rows`` is an
+        already-fetched global device listing (sync_devices pages it once and
+        reuses it); without it the listing is fetched here. Best-effort: a
         listing failure leaves the scoped indexes as they were."""
-        try:
-            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-        except Exception as e:
-            logger.debug("global MAC/serial index: %s", e)
-            return
+        if rows is None:
+            try:
+                rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+            except Exception as e:
+                logger.debug("global MAC/serial index: %s", e)
+                return
         for row in rows or []:
             cf = row.get("custom_fields") or {}
             rmac = self._norm_mac(cf.get("mac_address", ""))
@@ -468,10 +636,12 @@ class SyncMixin:
                 return r
         return None
 
-    def _fill_device_gaps(self, row: dict, hostname: str, mac: str,
-                          existing_by_name: dict, used_names: set) -> None:
+    def _fill_device_gaps(self, run: "_DeviceSyncRun", row: dict, hostname: str,
+                          mac: str) -> None:
         """Fill-gap update for an existing device when NetBox is the source of
-        truth: never overwrite a populated value, only fill EMPTY ones."""
+        truth: never overwrite a populated value, only fill EMPTY ones.
+        Reads/writes go through the batch's live Records (``_ip_record`` /
+        ``_device_record``); custom fields are PATCHed delta-only."""
         good_host = bool(hostname) and hostname.lower() != "unknown"
         ip_id = None
         pip = row.get("primary_ip4")
@@ -479,19 +649,17 @@ class SyncMixin:
             ip_id = pip.get("id")
         if ip_id and (mac or good_host):
             try:
-                ipobj = self.nb.ipam.ip_addresses.get(ip_id)
+                ipobj = self._ip_record(run, ip_id)
                 changed = False
                 if ipobj and good_host and _DNS_NAME_RE.match(hostname) and not str(getattr(ipobj, "dns_name", "") or "").strip():
                     ipobj.dns_name = hostname
                     changed = True
-                cfs = dict((ipobj.custom_fields if ipobj else None) or {})
-                if ipobj and mac and not cfs.get("mac_address"):
-                    cfs["mac_address"] = mac
-                    ipobj.custom_fields = cfs
-                    changed = True
-                if changed:
+                if ipobj and mac and not (ipobj.custom_fields or {}).get("mac_address"):
+                    self._save_cf_delta(ipobj, {"mac_address": mac})  # also sends dns_name
+                elif changed:
                     ipobj.save()
             except Exception as e:
+                run.forget_ip(ip_id)
                 logger.debug("sync_devices: fill-gap IP %s: %s", ip_id, e)
         cf = row.get("custom_fields") or {}
         cur_name = str(row.get("name") or "").strip()
@@ -499,29 +667,31 @@ class SyncMixin:
         need_name = good_host and bool(_PLACEHOLDER_NAME_RE.match(cur_name))
         if need_mac or need_name:
             try:
-                devobj = self.nb.dcim.devices.get(row["id"])
+                devobj = self._device_record(run, row["id"])
                 if devobj is None:
                     raise LookupError("device vanished")
-                if need_mac:
-                    merged = dict(devobj.custom_fields or {})
-                    merged["mac_address"] = mac
-                    devobj.custom_fields = merged
                 if need_name:
-                    new_name = self._uniq_device_name(hostname, mac, "", existing_by_name, used_names)
+                    new_name = self._uniq_device_name(hostname, mac, "", run.by_name, run.used_names)
                     devobj.name = new_name
-                    used_names.add(new_name.lower())
-                devobj.save()
+                    run.used_names.add(new_name.lower())
+                if need_mac:
+                    self._save_cf_delta(devobj, {"mac_address": mac})  # also sends the name
+                else:
+                    devobj.save()
                 if need_name:
                     logger.info("sync_devices: renamed placeholder %s -> %s", cur_name, devobj.name)
             except Exception as e:
+                run.forget_device(row["id"])
                 logger.debug("sync_devices: fill-gap device %s: %s", row.get("id"), e)
 
-    def _adopt_secondary_ip(self, device_id, real_ip: str, mac: str, hostname: str, tenant, source_tag: str) -> bool:
+    def _adopt_secondary_ip(self, device_id, real_ip: str, mac: str, hostname: str, tenant, source_tag: str,
+                            touched_ips: Optional[set] = None) -> bool:
         """An operator-assigned name (DNS A record / DHCP reservation) seen on a
         second MAC+IP is the same device's other port (a stack member's OOBM,
         in-band vs out-of-band). Attach the address to a secondary interface
         instead of minting a suffixed copy; never touch the device's primary IP,
-        mac_address or name."""
+        mac_address or name. The id of the IP written is added to
+        ``touched_ips`` when given (sync_devices drops its cached copy)."""
         if not real_ip:
             return False
         iname = "mgmt-" + mac.replace(":", "")[-4:].upper() if mac else "mgmt-" + real_ip
@@ -533,12 +703,50 @@ class SyncMixin:
             if tenant: ip_kwargs["tenant"] = tenant.id
             if hostname and hostname.lower() != "unknown": ip_kwargs["dns_name"] = hostname
             ipobj = self._reuse_or_create_ip(f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id, tenant=tenant, hostname=hostname, mac=mac, source=source_tag)
+            if touched_ips is not None:
+                touched_ips.add(ipobj.id)
             self._journal("ipam.ipaddress", ipobj.id, source_tag, note=f"IP {real_ip}/{mask} → secondary interface {iname} of device {device_id}")
             self._stamp_last_seen(ipobj)
             return True
         except Exception as e:
             logger.debug("sync_devices: secondary IP %s on device %s failed: %s", real_ip, device_id, e)
             return False
+
+    # ══════════════════════════════════════════════════════════════════════
+    # sync_devices — discovery feed → NetBox DCIM
+    #
+    # Layout (read top-down; each step is one method below):
+    #
+    #   sync_devices                      entry point + result envelope
+    #   ├─ _normalize_incoming_devices    raw feed rows → {key: record}
+    #   ├─ _list_devices_for_sync         ONE paginated device listing
+    #   ├─ _index_sync_rows               existing devices → lookup indexes
+    #   ├─ _add_global_identities         + other tenants' MAC/serial (2d95909)
+    #   ├─ _delete_vanished_owned_devices replace=True housekeeping
+    #   ├─ _prefetch_primary_ips          batch-read the IPs we may touch
+    #   ├─ _resolve_create_defaults       role / device type / site / cf list
+    #   └─ per record: _sync_one_device
+    #        ├─ _match_existing_device    SERIAL → MAC → IP → hostname
+    #        ├─ _join_operator_named_device   second port of a named device
+    #        ├─ _refresh_matched_device   update an existing device
+    #        └─ _create_discovered_device create a device we own
+    #
+    # Behaviour is pinned by tests/test_sync_devices.py (unit, per rule) and
+    # tests/test_sync_devices_fake_netbox.py (real pynetbox against an
+    # in-memory NetBox). The 2026-10 readability refactor that produced this
+    # layout was proven request-for-request identical to the previous single
+    # 700-line function by a differential fuzz (20k random batches incl.
+    # injected API failures) — keep that bar for any change here.
+    #
+    # Performance (B3): reads are batched, writes are not. Every device / IP
+    # this batch writes goes through ONE live pynetbox Record per id
+    # (``_device_record`` / ``_ip_record``), built from the listing rows — an
+    # unchanged device costs zero requests instead of 3 GETs. Custom fields
+    # are PATCHed delta-only (``_save_cf_delta``) so a Record read at batch
+    # start can't revert another sync's newer value. Proven against the
+    # previous version by the same fuzz: identical return value and final
+    # NetBox state for 20k batches.
+    # ══════════════════════════════════════════════════════════════════════
 
     def sync_devices(self, devices: list, tenant_slug: str = "",
                      replace: bool = False,
@@ -550,8 +758,8 @@ class SyncMixin:
         Source = a discovery feed relayed by the hub (OPNsense DHCP leases +
         ARP for the firewall sync; switch/gateway ARP tables for the nw sync).
         Each incoming record ``{ip, mac, hostname, serial}`` is matched to an
-        existing device by serial (strongest), then primary IPv4, then MAC, then
-        bare hostname; missing devices are created (mirroring
+        existing device by serial (strongest), then MAC, then primary IPv4,
+        then bare hostname; missing devices are created (mirroring
         ``claim_device``: tenant-owned device + ``mgmt`` interface + IP with
         ``custom_fields.mac_address`` + ``primary_ip4``). Writing the MAC onto
         the IP record feeds the NetBox→CPPM endpoint sync (which keys on
@@ -578,30 +786,25 @@ class SyncMixin:
         ``discovered_from`` custom field isn't configured in NetBox the tag
         write is silently skipped and replace-delete becomes a safe no-op.
 
+        ``source_of_truth="netbox"`` makes NetBox authoritative for devices
+        that already exist: only EMPTY values are filled (c245c7e) — see
+        ``_refresh_matched_device``.
+
         Returns ``{status, pushed, errors, skipped, deleted, devices_total, message}``.
         """
-        pushed = 0; errors = 0; skipped = 0; deleted = 0
-        first_err: Optional[str] = None   # first per-record failure text (diagnosability)
-        defaults = defaults or {}
-        # Normalize the ownership tag: firewall synonyms collapse to the legacy
-        # "opnsense" tag (so existing firewall deployments are byte-identical);
-        # anything else (nw's "Network Devices") is used verbatim. Comparison +
-        # replace-delete scoping are case-insensitive against this tag.
-        source_tag = str(source or "opnsense").strip()
-        if source_tag.lower() in ("opnsense", "fw", "firewall"):
-            source_tag = "opnsense"
-        source_tag_l = source_tag.lower()
-        def _owns(cf: dict) -> bool:
-            return str(((cf or {}).get("discovered_from") or "")).lower() == source_tag_l
+        run = _DeviceSyncRun(tenant_slug=tenant_slug,
+                             source_tag=_normalize_source_tag(source),
+                             source_of_truth=source_of_truth,
+                             defaults=defaults or {})
         try:
             # Self-heal custom fields (discovered_from on dcim.device,
             # mac_address on ipam.ipaddress) so the ownership tag + MAC writes
             # below land. Cached per-process; no-op once provisioned.
             self._ensure_custom_fields()
-            tenant = None
             if tenant_slug:
-                tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
-                if not tenant:
+                run.tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
+                if not run.tenant:
+                    # Refuse rather than create unattributed records.
                     return {"status": "ERROR",
                             "message": f"NetBox tenant '{tenant_slug}' not found — "
                                        f"firewall-discovered devices not attributed. "
@@ -609,664 +812,783 @@ class SyncMixin:
                             "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                             "devices_total": len(devices or [])}
 
-            # Normalize incoming: ip (mask stripped) -> {mac, hostname}.
-            incoming: Dict[str, Dict[str, str]] = {}
-            for dev in (devices or []):
-                if not isinstance(dev, dict):
-                    continue
-                ip = str(dev.get("ip") or "").strip().split("/")[0].strip()
-                mac = self._norm_mac(dev.get("mac", ""))
-                hostname = str(dev.get("hostname") or "").strip()
-                # Serial number (console-identified devices carry one even when
-                # they have no IP): the strongest, globally-unique match key —
-                # tried FIRST below so a device is recognised across DHCP IP
-                # moves / hostname changes.
-                serial = str(dev.get("serial") or "").strip()
-                # MAC-sighting enrichment: a feed (nw ARP/MAC table, ClearPass)
-                # may attach the source switch identity + port to a record so the
-                # device in NetBox answers "where is this MAC?" — last seen on
-                # switch X, port Y, mgmt IP Z.
-                s_swname = str(dev.get("source_switch_name") or "").strip()
-                s_swip = str(dev.get("source_switch_ip") or "").strip()
-                s_swport = str(dev.get("source_switch_port") or "").strip()
-                # Discovered hardware model + manufacturer (console identify, nw
-                # poll, ClearPass profile). Used to place the device under its
-                # REAL device_type instead of the generic 'discovered' default.
-                model = str(dev.get("model") or "").strip()
-                manufacturer = str(dev.get("manufacturer") or dev.get("vendor") or "").strip()
-                # Per-record device role (e.g. TrueNAS→"storage", console→"router")
-                # so a feed can place its device under the right dcim.device_role
-                # instead of the generic 'discovered' default. Applied on CREATE
-                # only (see below) — never re-roles a human/existing device.
-                rec_role = str(dev.get("role") or "").strip()
-                # Free-form per-record custom fields (TrueNAS product/version/
-                # health/pool_count, etc). Only names PROVISIONED on dcim.device
-                # are written (see _device_cf_whitelist) — an unprovisioned field
-                # would 400 the whole device write; unknown keys are dropped.
-                rec_cfs = dev.get("custom_fields")
-                if not isinstance(rec_cfs, dict):
-                    rec_cfs = {}
-                if not ip and not mac:
-                    if hostname and hostname.lower() != "unknown":
-                        # Hostname-only record (no IP, no MAC): key by hostname so
-                        # the hostname-match tier adopts any same-name device
-                        # instead of duplicate-creating. The firewall path drops
-                        # no-IP records upstream, so this is defensive; the active
-                        # case is a no-MAC/no-IP discovery row that carries a name.
-                        ip = f"host:{hostname.lower()}"
-                    elif serial:
-                        # Serial-only record (a console-identified device with no
-                        # IP/MAC/hostname): key by serial so the serial-match tier
-                        # adopts an existing device instead of creating a phantom.
-                        ip = f"serial:{serial.lower()}"
-                    else:
-                        # Nothing identifiable at all — don't add a phantom row.
-                        skipped += 1
-                        continue
-                elif not ip:
-                    # MAC-only: index by mac-key so it's at least created, but
-                    # replace-delete (which keys on IP) won't track it.
-                    ip = f"mac:{mac}"
-                rec: Dict[str, Any] = {"mac": mac, "hostname": hostname}
-                if serial:
-                    rec["serial"] = serial
-                # Where the hostname came from: "dns"/"reservation" are operator
-                # assertions (one name = one device), "lease" is device-chosen.
-                h_src = str(dev.get("hostname_source") or "").strip().lower()
-                if h_src:
-                    rec["hostname_source"] = h_src
-                if s_swname:
-                    rec["switch_name"] = s_swname
-                if s_swip:
-                    rec["switch_ip"] = s_swip
-                if s_swport:
-                    rec["switch_port"] = s_swport
-                if model:
-                    rec["model"] = model
-                if manufacturer:
-                    rec["manufacturer"] = manufacturer
-                if rec_role:
-                    rec["role"] = rec_role
-                if rec_cfs:
-                    # Keep only string-able values; drop None. Whitelisting to
-                    # provisioned fields happens at write time.
-                    rec["custom_fields"] = {
-                        str(k): ("" if v is None else str(v))
-                        for k, v in rec_cfs.items() if k
-                    }
-                incoming[ip] = rec
+            incoming, run.skipped = self._normalize_incoming_devices(devices)
 
-            # Index existing tenant devices by primary IPv4 (all) + track which
-            # of those we own (discovered_from tag) for replace-delete. Also
-            # index by name (lowercased) for ALL rows — including devices with
-            # no primary_ip4, which the IP index skips below but whose name can
-            # still collide on the (name, site, tenant) unique constraint when
-            # the create branch re-uses device-<mac> after a DHCP IP move.
-            existing_by_ip: Dict[str, dict] = {}   # ip_str -> raw device row
-            existing_by_name: Dict[str, dict] = {}  # name.lower() -> raw device row
-            existing_by_mac: Dict[str, dict] = {}   # norm_mac(cf.mac_address) -> row
-            existing_by_serial: Dict[str, dict] = {}  # serial.lower() -> row
-            owned_ips: set = set()                   # primary IPs of tagged devices
-            # Intra-batch dedup: many discovery records share a hostname across
-            # distinct MACs (ks205, sonoszp, iphone…). existing_by_name is a
-            # pre-batch snapshot and can't see names created earlier THIS batch,
-            # so a 2nd create with the same name 400s on (name, site, tenant).
-            # used_names tracks every name we create/refresh this batch.
-            used_names: set = set()
-            # name.lower() -> device id for devices CREATED this batch, so an
-            # operator-named second address can join one created moments ago.
-            created_by_name: Dict[str, Any] = {}
-            # device ids handled via the IP-match refresh path — the create
-            # branch must never reclaim/clobber one of these by name (a
-            # duplicate-hostname record would otherwise delete a device we just
-            # refreshed for a different IP).
-            refreshed_ids: set = set()
-            list_params: Dict[str, Any] = {"limit": 500}
-            if tenant_slug:
-                list_params["tenant"] = tenant_slug
             try:
-                rows = self._api_get_all("/api/dcim/devices/", list_params)
+                rows, all_rows = self._list_devices_for_sync(run)
             except Exception as e:
                 return {"status": "ERROR",
                         "message": f"failed to list NetBox devices: {e}",
-                        "pushed": 0, "errors": 0, "skipped": skipped, "deleted": 0,
+                        "pushed": 0, "errors": 0, "skipped": run.skipped, "deleted": 0,
                         "devices_total": len(incoming)}
-            for row in rows:
-                rname = str(row.get("name") or "").strip().lower()
-                if rname:
-                    existing_by_name.setdefault(rname, row)  # first row wins
-                cf = row.get("custom_fields") or {}
-                # Index by the device's mac_address custom field (normalized) so
-                # a record can match an existing device by MAC — catches DHCP
-                # IP-moves + MAC-only records and (with the bare-hostname adopt
-                # below) stops the duplicate a no-MAC/no-IP device spawned on
-                # every sync. first row wins per MAC.
-                rmac = self._norm_mac(cf.get("mac_address", ""))
-                if rmac:
-                    existing_by_mac.setdefault(rmac, row)
-                # Index by serial (native dcim.device field) so a record can
-                # match an existing device by its serial number regardless of
-                # IP/hostname churn. first row wins per serial.
-                rserial = str(row.get("serial") or "").strip()
-                if rserial:
-                    existing_by_serial.setdefault(rserial.lower(), row)
-                pip = row.get("primary_ip4")
-                addr = ""
-                if isinstance(pip, dict):
-                    addr = (pip.get("address") or "").split("/")[0].strip()
-                if not addr:
-                    continue
-                existing_by_ip[addr] = row
-                if _owns(cf):
-                    owned_ips.add(addr)
+            self._index_sync_rows(run, rows)
+            run.device_rows = {r["id"]: r for r in (all_rows or rows) if r.get("id") is not None}
 
             # MAC and serial are GLOBAL identities: a device is one device no
             # matter which tenant first recorded it. A tenant-scoped listing
             # can't see another tenant's record of the same MAC, so every sync
-            # from a second tenant minted a copy (73 RA/LRB device-<mac> pairs).
-            # Index the rest of NetBox by MAC/serial too; tenant-local rows
-            # still win, and replace-delete stays tenant-scoped (owned_ips).
-            if tenant_slug:
-                self._add_global_identities(existing_by_mac, existing_by_serial)
+            # from a second tenant minted a copy (73 RA/LRB device-<mac> pairs,
+            # 2d95909). Index the rest of NetBox by MAC/serial too; tenant-local
+            # rows still win, and replace-delete stays tenant-scoped (owned_ips).
+            if all_rows is not None:
+                self._add_global_identities(run.by_mac, run.by_serial, rows=all_rows)
 
-            # Replace-with-delete — only when tenant-scoped, only owned devices.
             if replace and tenant_slug:
-                for ip_str in list(owned_ips - set(incoming.keys())):
-                    row = existing_by_ip.get(ip_str)
-                    if not row:
-                        continue
-                    try:
-                        obj = self.nb.dcim.devices.get(row["id"])
-                        if obj:
-                            obj.delete()
-                            deleted += 1
-                    except Exception as e:
-                        errors += 1
-                        if first_err is None:
-                            first_err = f"delete {ip_str}: {e}"
-                        logger.debug("sync_devices: delete stale %s failed: %s", ip_str, e)
+                self._delete_vanished_owned_devices(run, incoming)
 
-            role = self._ensure_device_role(defaults.get("role") or "discovered")
-            # Names of custom fields provisioned on dcim.device — the only ones a
-            # per-record custom_fields map may write (unknown keys would 400 the
-            # whole device upsert). Computed once per batch.
-            cf_whitelist = self._device_cf_whitelist()
-            dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
-            site = self._resolve_site(defaults.get("site") or "", tenant)
-            # When a create fails because NetBox requires a site (no site
-            # resolvable), the SAME 400 hits every record — previously ~one error
-            # per device (185 in a batch). Detect that on the first create and
-            # stop attempting further creates, aggregating the rest into one clear
-            # message, instead of spamming an identical 400 for every record. Set
-            # from the create handler below.
-            _site_required_abort = False
+            self._prefetch_primary_ips(run, incoming)
+            self._resolve_create_defaults(run)
 
-            for ip_str, rec in incoming.items():
-                mac = rec["mac"]
-                hostname = rec["hostname"]
-                serial = rec.get("serial") or ""
-                is_mac_key = ip_str.startswith("mac:")
-                is_host_key = ip_str.startswith("host:")
-                is_serial_key = ip_str.startswith("serial:")
-                real_ip = "" if (is_mac_key or is_host_key or is_serial_key) else ip_str
-                operator_named = rec.get("hostname_source") in ("dns", "reservation")
+            for key, rec in incoming.items():
                 try:
-                    # Resolve the existing NetBox device for this record. A
-                    # record is the SAME machine if its SERIAL, IP, MAC, OR
-                    # hostname matches an existing device — matching any one
-                    # updates that device in place instead of creating a
-                    # duplicate (the bug where a device added with no MAC/IP
-                    # spawned a second copy on every sync because the sync could
-                    # only compare one property). SERIAL is the strongest key
-                    # (globally unique, survives IP/hostname churn) so it is
-                    # tried first; MAC second (the other hardware identity —
-                    # also catches DHCP IP-moves + MAC-only records); IP next; hostname adopts a same-name device unless the
-                    # record is PROVABLY a different machine (both MAC and IP
-                    # present on both sides AND both differ) — the one case the
-                    # registry allows a duplicate. A bare placeholder (no IP/MAC)
-                    # is always adopted; an unowned non-bare (human) device is
-                    # never adopted (don't clobber human data). A device
-                    # refreshed this batch (refreshed_ids) is never re-adopted.
-                    row = None
-                    if serial:
-                        row = existing_by_serial.get(serial.lower())
-                    if row is None and mac:
-                        row = existing_by_mac.get(mac)
-                    if row is None and not (is_mac_key or is_host_key or is_serial_key):
-                        row = existing_by_ip.get(ip_str)
-                    if row is None and hostname and hostname.lower() != "unknown":
-                        cand = existing_by_name.get(hostname.lower())
-                        if cand is not None and cand["id"] not in refreshed_ids:
-                            ecf = cand.get("custom_fields") or {}
-                            emac = self._norm_mac(ecf.get("mac_address", ""))
-                            epip = cand.get("primary_ip4") or {}
-                            eaddr = ((epip.get("address") or "").split("/")[0].strip()
-                                      if isinstance(epip, dict) else "")
-                            cand_bare = not emac and not eaddr
-                            cand_owned = _owns(ecf)
-                            mac_differs = bool(mac) and bool(emac) and emac != mac
-                            ip_differs = bool(real_ip) and bool(eaddr) and eaddr != real_ip
-                            provably_different = mac_differs and ip_differs
-                            if (cand_bare or cand_owned) and not provably_different:
-                                row = cand
-                    # Same operator-assigned name, different MAC+IP: the device's
-                    # other port (stack OOBM / in-band). One device, more addresses.
-                    if (row is None and operator_named and real_ip and hostname):
-                        owner = created_by_name.get(hostname.lower())
-                        if owner is None:
-                            cand = existing_by_name.get(hostname.lower())
-                            if cand is not None and _owns(cand.get("custom_fields") or {}):
-                                owner = cand["id"]
-                        if owner is not None and self._adopt_secondary_ip(
-                                owner, real_ip, mac, hostname, tenant, source_tag):
-                            pushed += 1
-                            continue
-                    if row:
-                        # Existing device matched (by IP / MAC / bare hostname) —
-                        # update it in place. Remember its id so the create
-                        # branch never reclaims/clobbers a device we just updated
-                        # when a duplicate hostname shows up.
-                        refreshed_ids.add(row["id"])
-                        rname = str(row.get("name") or "").strip().lower()
-                        if rname:
-                            used_names.add(rname)
-                        pip = row.get("primary_ip4") or {}
-                        ip_id = pip.get("id") if isinstance(pip, dict) else None
-                        match_addr = ((pip.get("address") or "").split("/")[0].strip()
-                                      if isinstance(pip, dict) else "")
-                        cf = row.get("custom_fields") or {}
-                        we_own = _owns(cf)
-                        # source_of_truth=="netbox" → NetBox is the source of truth
-                        # for this device: only-add-missing. The device already
-                        # exists, so do NOT overwrite its IP's mac_address/dns_name,
-                        # assign it a primary IP, or rename it — only refresh
-                        # last_seen (a staleness signal, not a truth field).
-                        # "external" (the discovery feed is the source of truth)
-                        # updates as below.
-                        if source_of_truth == "netbox":
-                            # Only-add-missing still means ADD what's missing:
-                            # a DHCP/DNS-learned hostname fills an empty
-                            # dns_name / mac and replaces a device-<mac>
-                            # placeholder, so names reach NetBox and DNS.
-                            self._fill_device_gaps(row, hostname, mac,
-                                                   existing_by_name, used_names)
-                            try:
-                                # perf FIX A: the listed row already carries the
-                                # stored last_seen — skip the per-device GET +
-                                # PATCH entirely while the stamp is fresh (<1h).
-                                if self._last_seen_stale(cf.get("last_seen")):
-                                    devobj = self.nb.dcim.devices.get(row["id"])
-                                    if devobj:
-                                        self._stamp_last_seen(devobj)
-                            except Exception as e:
-                                logger.debug("sync_devices: last_seen refresh %s: %s",
-                                              ip_str, e)
-                            pushed += 1
-                            continue
-                        # Primary IP: refresh the existing IP when it already
-                        # equals the incoming IP (or the record is MAC-only with
-                        # no IP to assign); otherwise ASSIGN the incoming IP as
-                        # primary_ip4 (bare-device adoption, or a DHCP IP-move
-                        # caught by MAC match) — creating the mgmt interface + IP
-                        # the create branch uses, via _reuse_or_create_ip.
-                        if ip_id and (not real_ip or match_addr == real_ip):
-                            try:
-                                ipobj = self.nb.ipam.ip_addresses.get(ip_id)
-                                if ipobj:
-                                    if mac:
-                                        merged = dict(ipobj.custom_fields or {})
-                                        merged["mac_address"] = mac
-                                        ipobj.custom_fields = merged
-                                    if hostname and hostname.lower() != "unknown":
-                                        ipobj.dns_name = hostname
-                                    ipobj.save()
-                                    self._stamp_last_seen(ipobj)
-                            except Exception as e:
-                                logger.debug("sync_devices: refresh IP %s failed: %s", ip_str, e)
-                        elif real_ip:
-                            try:
-                                iface = self.nb.dcim.interfaces.create(
-                                    device=row["id"], name="mgmt", type="other")
-                                mask = self._mask_for_ip(real_ip, tenant)
-                                ip_kwargs: Dict[str, Any] = {
-                                    "address": f"{real_ip}/{mask}",
-                                    "assigned_object_type": "dcim.interface",
-                                    "assigned_object_id": iface.id,
-                                }
-                                if tenant:
-                                    ip_kwargs["tenant"] = tenant.id
-                                if hostname and hostname.lower() != "unknown":
-                                    ip_kwargs["dns_name"] = hostname
-                                ipobj = self._reuse_or_create_ip(
-                                    f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id,
-                                    tenant=tenant, hostname=hostname, mac=mac,
-                                    source=source_tag)
-                                devobj = self.nb.dcim.devices.get(row["id"])
-                                if devobj:
-                                    devobj.primary_ip4 = ipobj.id
-                                    devobj.save()
-                                self._journal("ipam.ipaddress", ipobj.id,
-                                              source_tag,
-                                              note=f"IP {real_ip}/{mask} → adopted")
-                                self._stamp_last_seen(ipobj)
-                                # We moved/assigned the device's primary IP away
-                                # from match_addr — stop replace-delete from
-                                # reaping this device because its OLD primary IP
-                                # isn't in the incoming set (same device, now at a
-                                # new address, not a stale one).
-                                if match_addr and match_addr != real_ip and match_addr in owned_ips:
-                                    owned_ips.discard(match_addr)
-                            except Exception as e:
-                                logger.debug("sync_devices: assign IP %s failed: %s", real_ip, e)
-                        # Stamp the device's mac_address custom field (best-effort)
-                        # so a future MAC-match finds this device even after a DHCP
-                        # IP move, and the endpoint sync can match it by MAC. Also
-                        # stamp the source-switch cfs (switch_name/ip/port) when
-                        # the feed attached them — the "where is this MAC" answer
-                        # lives on the device itself. One save when anything moved.
-                        try:
-                            devobj = self.nb.dcim.devices.get(row["id"])
-                            if devobj:
-                                merged = dict(devobj.custom_fields or {})
-                                changed = False
-                                if mac and merged.get("mac_address") != mac:
-                                    merged["mac_address"] = mac
-                                    changed = True
-                                for cf_key, rec_key in (("switch_name", "switch_name"),
-                                                        ("switch_ip", "switch_ip"),
-                                                        ("switch_port", "switch_port")):
-                                    val = rec.get(rec_key)
-                                    if val and merged.get(cf_key) != val:
-                                        merged[cf_key] = val
-                                        changed = True
-                                # Per-record custom fields (TrueNAS product/
-                                # version/health/pool_count, etc). Refresh live
-                                # status onto a device WE own — never a human's —
-                                # and only whitelisted (provisioned) names so an
-                                # unknown key can't 400 the whole save.
-                                if we_own:
-                                    for ck, cv in (rec.get("custom_fields") or {}).items():
-                                        if (ck in cf_whitelist
-                                                and ck not in self._SINK_MANAGED_DEVICE_CFS
-                                                and merged.get(ck) != cv):
-                                            merged[ck] = cv
-                                            changed = True
-                                # Backfill the serial when the device has none —
-                                # fill-gap only, never clobber a serial already on
-                                # the record (a human-entered or previously
-                                # discovered value stays authoritative).
-                                ser_changed = False
-                                if serial and not str(getattr(devobj, "serial", "") or "").strip():
-                                    devobj.serial = serial
-                                    ser_changed = True
-                                if changed:
-                                    devobj.custom_fields = merged
-                                if changed or ser_changed:
-                                    devobj.save()
-                        except Exception as e:
-                            logger.debug("sync_devices: device cf stamp %s: %s", ip_str, e)
-                        # Rename only if we own it (don't clobber a human device's
-                        # name) or it still has an auto placeholder name another
-                        # feed minted (nw's device-<mac>); then mark it seen.
-                        placeholder = bool(_PLACEHOLDER_NAME_RE.match(str(row.get("name") or "").strip()))
-                        if (we_own or placeholder) and hostname and hostname.lower() != "unknown":
-                            try:
-                                devobj = self.nb.dcim.devices.get(row["id"])
-                                if devobj:
-                                    devobj.name = (self._nb_name(hostname) if we_own else
-                                                   self._uniq_device_name(hostname, mac, real_ip,
-                                                                          existing_by_name, used_names))
-                                    devobj.save()
-                                    used_names.add(str(devobj.name).strip().lower())
-                                    self._stamp_last_seen(devobj)
-                            except Exception as e:
-                                logger.debug("sync_devices: rename %s failed: %s", ip_str, e)
-                        else:
-                            try:
-                                # perf FIX A: skip the per-device GET + PATCH
-                                # while the listed row's stamp is fresh (<1h).
-                                if self._last_seen_stale(cf.get("last_seen")):
-                                    devobj = self.nb.dcim.devices.get(row["id"])
-                                    if devobj:
-                                        self._stamp_last_seen(devobj)
-                            except Exception as e:
-                                logger.debug("sync_devices: last_seen %s: %s", ip_str, e)
-                        pushed += 1
-                    else:
-                        # No existing device for this IP — create one we own.
-                        name = (hostname if hostname and hostname.lower() != "unknown"
-                                else (f"device-{mac.replace(':', '')}" if mac
-                                      else (f"device-{serial}" if serial
-                                            else f"device-{real_ip or 'unknown'}")))
-                        # The (name, site, tenant) unique constraint. Two hazards:
-                        # (1) the name matches a PRE-existing device (snapshot in
-                        # existing_by_name); (2) INTRA-batch duplicates — many
-                        # discovery records share a hostname (ks205, sonoszp,
-                        # iphone…) across distinct MACs, and existing_by_name
-                        # (a pre-batch snapshot) can't see names created earlier
-                        # this batch, so a 2nd create with the same name 400s.
-                        # used_names tracks every name we create/refresh this
-                        # batch; _uniq_device_name uniquifies against both sets.
-                        # Never reclaim a name held by a device we just refreshed
-                        # via IP-match (refreshed_ids) — that's a different IP's
-                        # real device, not a stale orphan.
-                        byname = existing_by_name.get(name.lower())
-                        if byname and byname["id"] not in refreshed_ids:
-                            bcf = byname.get("custom_fields") or {}
-                            b_own = _owns(bcf)
-                            bmac = self._norm_mac(bcf.get("mac_address", ""))
-                            bpip = byname.get("primary_ip4") or {}
-                            baddr = ((bpip.get("address") or "").split("/")[0].strip()
-                                      if isinstance(bpip, dict) else "")
-                            # Reclaim the name (delete the colliding device and
-                            # recreate ours) ONLY when the colliding device is the
-                            # SAME machine: incoming MAC matches its mac_address
-                            # cf, OR incoming IP matches its primary_ip4, OR the
-                            # name is the mac-derived form device-<incomingmac>
-                            # (a no-hostname DHCP IP-move of one of our orphans).
-                            # Otherwise the colliding device is a DIFFERENT machine
-                            # sharing the hostname (the one case the registry allows
-                            # a duplicate) → uniquify our new name and leave the
-                            # other device in place. refreshed_ids + used_names
-                            # guarantee we never delete a device we just refreshed
-                            # or created this batch; an UNOWNED (human) collision
-                            # never reclaims either (b_own False → uniquify).
-                            same_device = (
-                                (bool(mac) and bool(bmac) and bmac == mac)
-                                or (bool(real_ip) and bool(baddr) and baddr == real_ip)
-                                or (bool(mac) and name.lower() == f"device-{mac.replace(':', '')}")
-                            )
-                            if b_own and same_device and name.lower() not in used_names:
-                                try:
-                                    old = self.nb.dcim.devices.get(byname["id"])
-                                    if old:
-                                        old.delete()
-                                        deleted += 1
-                                except Exception as e:
-                                    errors += 1
-                                    if first_err is None:
-                                        first_err = f"delete-stale {name}: {e}"
-                                    logger.debug("sync_devices: delete stale by-name %s failed: %s", name, e)
-                            else:
-                                orig = name
-                                name = self._uniq_device_name(name, mac, real_ip,
-                                                              existing_by_name, used_names)
-                                logger.debug("sync_devices: name %s taken; creating as %s", orig, name)
-                        elif name.lower() in used_names:
-                            # Intra-batch duplicate hostname: no pre-existing
-                            # device by that name, but an earlier record this
-                            # batch already created it.
-                            orig = name
-                            name = self._uniq_device_name(name, mac, real_ip,
-                                                          existing_by_name, used_names)
-                            logger.debug("sync_devices: hostname %s already used this batch; "
-                                         "creating as %s", orig, name)
-                        used_names.add(name.lower())
-                        # A prior create already 400'd on a missing site — the same
-                        # 400 hits every record, so stop attempting creates (count
-                        # once, aggregate) instead of spamming an identical error.
-                        if _site_required_abort:
-                            errors += 1
-                            continue
-                        name = self._nb_name(name)
-                        create_kwargs: Dict[str, Any] = {"name": name, "status": "active"}
-                        if serial:
-                            create_kwargs["serial"] = serial
-                        # Prefer a per-record role (e.g. TrueNAS→"storage") over
-                        # the batch-default role, so a feed places its device
-                        # under the right dcim.device_role. Role is set on CREATE
-                        # only — an existing device's role is never overwritten.
-                        rec_role = rec.get("role")
-                        create_role = (self._ensure_device_role(rec_role)
-                                       if rec_role else role)
-                        if create_role:
-                            create_kwargs["role"] = create_role.id
-                        # Prefer a device_type resolved from the DISCOVERED model
-                        # (real hardware type) over the generic default dtype.
-                        rec_dtype = self._device_type_for_model(
-                            rec.get("model", ""), rec.get("manufacturer", "")) or dtype
-                        if rec_dtype:
-                            create_kwargs["device_type"] = rec_dtype.id
-                        if site:
-                            create_kwargs["site"] = site.id
-                        if tenant:
-                            create_kwargs["tenant"] = tenant.id
-                        devobj = self.nb.dcim.devices.create(**create_kwargs)
-                        if hostname:
-                            created_by_name.setdefault(hostname.lower(), devobj.id)
-                        # Ownership tag + last_seen stamp (best-effort; missing
-                        # custom field => no-op). last_seen clocks the staleness
-                        # sweep from the moment NetBox first saw this device.
-                        # Also stamp mac_address + the source-switch cfs here so a
-                        # recurrence MAC-matches this device (no duplicate) and a
-                        # MAC sighting carries "last seen on switch X port Y" on
-                        # the device itself — the linchpin of the registry dedup.
-                        try:
-                            merged = dict(devobj.custom_fields or {})
-                            merged["discovered_from"] = source_tag
-                            merged["last_seen"] = datetime.now(timezone.utc).strftime(
-                                "%Y-%m-%dT%H:%M:%SZ")
-                            if mac:
-                                merged["mac_address"] = mac
-                            for cf_key, rec_key in (("switch_name", "switch_name"),
-                                                    ("switch_ip", "switch_ip"),
-                                                    ("switch_port", "switch_port")):
-                                val = rec.get(rec_key)
-                                if val:
-                                    merged[cf_key] = val
-                            # Per-record custom fields (TrueNAS product/version/
-                            # health/pool_count, etc) — only whitelisted
-                            # (provisioned) names so an unknown key can't 400 the
-                            # create's cf stamp.
-                            for ck, cv in (rec.get("custom_fields") or {}).items():
-                                if (ck in cf_whitelist
-                                        and ck not in self._SINK_MANAGED_DEVICE_CFS):
-                                    merged[ck] = cv
-                            devobj.custom_fields = merged
-                            devobj.save()
-                        except Exception as e:
-                            logger.debug("sync_devices: discovered_from tag skipped: %s", e)
-                        self._journal("dcim.device", devobj.id, source_tag,
-                                      note=f"device {name}")
-                        # mgmt interface + IP (mac on the IP) + primary_ip4.
-                        if real_ip:
-                            # Use the top-level dcim.interfaces endpoint with
-                            # device=<id> rather than devobj.interfaces.create
-                            # — the nested accessor isn't supported on every
-                            # pynetbox version (AttributeError "object has no
-                            # attribute 'interfaces'"), and it's what unblocked
-                            # the create branch once the name-collision 400s were
-                            # resolved.
-                            iface = self.nb.dcim.interfaces.create(
-                                device=devobj.id, name="mgmt", type="other")
-                            mask = self._mask_for_ip(real_ip, tenant)
-                            ip_kwargs: Dict[str, Any] = {
-                                "address": f"{real_ip}/{mask}",
-                                "assigned_object_type": "dcim.interface",
-                                "assigned_object_id": iface.id,
-                            }
-                            if tenant:
-                                ip_kwargs["tenant"] = tenant.id
-                            if hostname and hostname.lower() != "unknown":
-                                ip_kwargs["dns_name"] = hostname
-                            # Reuse an existing global IP record (NetBox enforces
-                            # global uniqueness — creating a duplicate 400s with
-                            # "Duplicate IP address found in global table", which
-                            # was failing ~every record because the IPAM already
-                            # held most of these addresses) and reassign it to
-                            # this mgmt interface instead of creating a new one.
-                            ipobj = self._reuse_or_create_ip(
-                                f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id,
-                                tenant=tenant, hostname=hostname, mac=mac,
-                                source=source_tag)
-                            # Set primary_ip4 on a FRESH fetch so the save does
-                            # not re-send the best-effort custom_fields merged onto
-                            # ``devobj`` above (the discovered_from/last_seen/
-                            # mac_address stamp). When the deployed NetBox hasn't
-                            # attached those custom fields to dcim.device yet (a
-                            # provisioning gap — _ensure_custom_fields self-heals
-                            # it, but there's a first-sync window + a restricted
-                            # token can't create them), re-sending them 400s
-                            # ("Custom field 'X' does not exist for this object
-                            # type") and used to kill the whole upsert: the device
-                            # was created but primary_ip4 was never set, so the
-                            # next sync couldn't match it (no primary_ip4, no
-                            # mac_address cf) → re-create + 400 every cycle (the
-                            # persistent 100+ errors/tenant in the hub log). A fresh
-                            # get carries only NetBox's actually-provisioned cfs,
-                            # so the save sends only valid fields. Best-effort: a
-                            # failure here is logged DEBUG and the device still
-                            # counts as pushed (it was created above).
-                            try:
-                                fresh = self.nb.dcim.devices.get(devobj.id)
-                                if fresh:
-                                    fresh.primary_ip4 = ipobj.id
-                                    fresh.save()
-                            except Exception as e:
-                                logger.debug("sync_devices: set primary_ip4 %s on %s failed: %s",
-                                              real_ip, name, e)
-                            self._journal("ipam.ipaddress", ipobj.id,
-                                          source_tag,
-                                          note=f"IP {real_ip}/{mask} → {name}")
-                            self._stamp_last_seen(ipobj)
-                        pushed += 1
+                    self._sync_one_device(run, _IncomingDevice(key, rec))
                 except Exception as e:
-                    errors += 1
-                    if first_err is None:
-                        first_err = f"upsert {ip_str}: {e}"
-                    # If a create failed because NetBox requires a site (none
-                    # resolvable), the same 400 will hit every remaining record —
-                    # flip the abort flag so the create guard above skips the rest
-                    # and log ONE clear, actionable message instead of 185 dupes.
-                    _es = str(e).lower()
-                    if not _site_required_abort and "site" in _es and "required" in _es:
-                        _site_required_abort = True
-                        logger.warning(
-                            "[sync-error] sync_devices tenant=%s: NetBox requires a "
-                            "site for device creation but none resolved (defaults.site="
-                            "%r) — set a valid 'site' slug for this sync or create a "
-                            "site in NetBox; skipping remaining creates.",
-                            tenant_slug or "—", defaults.get("site"))
-                    logger.debug("sync_devices: upsert %s failed: %s", ip_str, e)
+                    self._note_upsert_failure(run, key, e)
 
-            msg = (f"{pushed} device(s) upserted, {deleted} deleted, "
-                   f"{skipped} skipped, {errors} errors")
-            if errors and first_err:
-                # Surface the first failure in the returned message (the hub
-                # status UI shows it) + a WARNING, so the cause is visible
-                # without digging through DEBUG logs.
-                msg += f" — first error: {first_err}"
-                logger.warning("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
-            else:
-                logger.info("sync_devices tenant=%s: %s", tenant_slug or "<global>", msg)
-            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
-                    "skipped": skipped, "deleted": deleted,
-                    "devices_total": len(incoming), "message": msg}
+            return self._sync_devices_result(run, len(incoming))
         except Exception as e:
             logger.error("sync_devices failed: %s", e)
-            return {"status": "ERROR", "message": str(e), "pushed": pushed,
-                    "errors": errors, "skipped": skipped, "deleted": deleted,
+            return {"status": "ERROR", "message": str(e), "pushed": run.pushed,
+                    "errors": run.errors, "skipped": run.skipped, "deleted": run.deleted,
                     "devices_total": len(devices or [])}
+
+    # ── step 1: normalize the feed ───────────────────────────────────────────
+
+    def _normalize_incoming_devices(self, devices) -> Tuple[Dict[str, Dict[str, Any]], int]:
+        """Turn raw feed rows into ``({key: record}, skipped)``.
+
+        ``key`` is the record's IPv4 (mask stripped) when it has one, else a
+        synthetic key — ``mac:<mac>``, ``host:<hostname>`` or
+        ``serial:<serial>`` — so IP-less records still flow through. A later
+        row with the same key replaces an earlier one (dict semantics).
+        Non-dict rows are ignored; rows with nothing identifiable (no IP, MAC,
+        usable hostname or serial) are counted as ``skipped``."""
+        incoming: Dict[str, Dict[str, Any]] = {}
+        skipped = 0
+        for dev in (devices or []):
+            if not isinstance(dev, dict):
+                continue
+            key = self._incoming_device_key(dev)
+            if key is None:
+                skipped += 1  # nothing identifiable — don't add a phantom row
+                continue
+            incoming[key] = self._incoming_device_record(dev)
+        return incoming, skipped
+
+    def _incoming_device_key(self, dev: dict) -> Optional[str]:
+        """The incoming-set key for one feed row (see ``_normalize_incoming_devices``)."""
+        ip = str(dev.get("ip") or "").strip().split("/")[0].strip()
+        if ip:
+            return ip
+        mac = self._norm_mac(dev.get("mac", ""))
+        if mac:
+            # MAC-only: created like any other record, but replace-delete
+            # (which keys on IP) won't track it.
+            return f"mac:{mac}"
+        hostname = str(dev.get("hostname") or "").strip()
+        if hostname and hostname.lower() != "unknown":
+            # Hostname-only (no IP, no MAC): the hostname tier can adopt a
+            # same-name device instead of duplicate-creating. The firewall path
+            # drops no-IP records upstream, so this is mostly the nw/console case.
+            return f"host:{hostname.lower()}"
+        serial = str(dev.get("serial") or "").strip()
+        if serial:
+            # Serial-only (console-identified, nothing else): the serial tier
+            # adopts an existing device instead of creating a phantom.
+            return f"serial:{serial.lower()}"
+        return None
+
+    def _incoming_device_record(self, dev: dict) -> Dict[str, Any]:
+        """The normalized record for one feed row. Optional fields are present
+        only when the feed supplied a non-empty value:
+
+        * ``serial`` — strongest, globally-unique match key (tried first).
+        * ``hostname_source`` — ``dns``/``reservation`` are operator assertions
+          (one name = one device); ``lease`` is device-chosen.
+        * ``switch_name``/``switch_ip``/``switch_port`` — MAC-sighting
+          enrichment ("last seen on switch X port Y"), from ``source_switch_*``.
+        * ``model``/``manufacturer`` — discovered hardware, used to place a NEW
+          device under its real device_type instead of 'discovered'.
+        * ``role`` — per-record device role, applied on CREATE only.
+        * ``custom_fields`` — free-form per-record fields (TrueNAS product/
+          version/…), stringified; only provisioned names are written later
+          (``_device_cf_whitelist``)."""
+        rec: Dict[str, Any] = {"mac": self._norm_mac(dev.get("mac", "")),
+                               "hostname": str(dev.get("hostname") or "").strip()}
+        serial = str(dev.get("serial") or "").strip()
+        if serial:
+            rec["serial"] = serial
+        h_src = str(dev.get("hostname_source") or "").strip().lower()
+        if h_src:
+            rec["hostname_source"] = h_src
+        for rec_key, feed_key in (("switch_name", "source_switch_name"),
+                                  ("switch_ip", "source_switch_ip"),
+                                  ("switch_port", "source_switch_port")):
+            val = str(dev.get(feed_key) or "").strip()
+            if val:
+                rec[rec_key] = val
+        model = str(dev.get("model") or "").strip()
+        if model:
+            rec["model"] = model
+        manufacturer = str(dev.get("manufacturer") or dev.get("vendor") or "").strip()
+        if manufacturer:
+            rec["manufacturer"] = manufacturer
+        role = str(dev.get("role") or "").strip()
+        if role:
+            rec["role"] = role
+        rec_cfs = dev.get("custom_fields")
+        if isinstance(rec_cfs, dict) and rec_cfs:
+            rec["custom_fields"] = {str(k): ("" if v is None else str(v))
+                                    for k, v in rec_cfs.items() if k}
+        return rec
+
+    # ── step 2: index what NetBox already has ────────────────────────────────
+
+    def _index_sync_rows(self, run: "_DeviceSyncRun", rows: list) -> None:
+        """Build the pre-batch lookup indexes from the device listing.
+
+        ``by_name``/``by_mac``/``by_serial``: first row wins. ``by_name``
+        includes devices WITHOUT a primary IP — their name can still collide on
+        the (name, site, tenant) unique constraint. ``by_ip``: LAST row wins
+        (historical behaviour, kept). ``owned_ips``: primary IPs of devices
+        tagged with this sync's ``discovered_from`` — the only candidates
+        replace-delete may remove."""
+        for row in rows:
+            rname = str(row.get("name") or "").strip().lower()
+            if rname:
+                run.by_name.setdefault(rname, row)
+            cf = row.get("custom_fields") or {}
+            # MAC index: catches DHCP IP-moves + MAC-only records.
+            rmac = self._norm_mac(cf.get("mac_address", ""))
+            if rmac:
+                run.by_mac.setdefault(rmac, row)
+            # Serial index: survives IP/hostname churn.
+            rserial = str(row.get("serial") or "").strip()
+            if rserial:
+                run.by_serial.setdefault(rserial.lower(), row)
+            addr = _primary_addr(row)
+            if not addr:
+                continue
+            run.by_ip[addr] = row
+            if run.owns(cf):
+                run.owned_ips.add(addr)
+
+    def _list_devices_for_sync(self, run: "_DeviceSyncRun") -> Tuple[list, Optional[list]]:
+        """Return ``(rows, all_rows)``: the devices this sync indexes, and the
+        global listing for ``_add_global_identities`` (None when not needed or
+        unavailable). Raises when no listing can be read.
+
+        A tenant-scoped sync used to page NetBox twice — the tenant's devices,
+        then EVERY device for the global MAC/serial index (2d95909). Now it
+        pages everything once and keeps the tenant's rows in listing order
+        (same order NetBox's ``?tenant=`` filter returns, so first-row-wins
+        indexing is unchanged). If the global listing fails it falls back to
+        the old tenant-scoped listing without global identities — exactly what
+        the old code ended up with when its global listing failed."""
+        if not run.tenant_slug:
+            return self._api_get_all("/api/dcim/devices/", {"limit": 500}), None
+        try:
+            all_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        except Exception as e:
+            logger.debug("global MAC/serial index: %s", e)
+            return self._api_get_all("/api/dcim/devices/",
+                                     {"limit": 500, "tenant": run.tenant_slug}), None
+        rows = [r for r in all_rows
+                if isinstance(r.get("tenant"), dict)
+                and r["tenant"].get("slug") == run.tenant_slug]
+        return rows, all_rows
+
+    def _prefetch_primary_ips(self, run: "_DeviceSyncRun", incoming: dict) -> None:
+        """Batch-read the primary IPs of every device a record COULD match
+        (its serial / MAC / IP / name index hits), ~100 ids per request, into
+        ``run.ip_rows``. Replaces one ``ip_addresses.get`` per matched device
+        (``_refresh_primary_ip`` / ``_fill_device_gaps``). A superset is fine:
+        unused rows are never written. Runs AFTER replace-delete so deleted
+        devices' IPs (cascade-deleted by NetBox) aren't prefetched.
+        Best-effort: a failed chunk just leaves those ids to the per-id GET."""
+        ids: list = []
+        for key, rec in incoming.items():
+            d = _IncomingDevice(key, rec)
+            for row in (run.by_serial.get(d.serial.lower()) if d.serial else None,
+                        run.by_mac.get(d.mac) if d.mac else None,
+                        run.by_ip.get(d.key) if d.keyed_by_ip else None,
+                        run.by_name.get(d.hostname.lower()) if d.hostname else None):
+                pip = (row or {}).get("primary_ip4")
+                if (isinstance(pip, dict) and pip.get("id") is not None
+                        and row["id"] not in run.deleted_ids):
+                    ids.append(pip["id"])
+        ids = list(dict.fromkeys(ids))
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            try:
+                for row in self._api_get_all("/api/ipam/ip-addresses/",
+                                             {"id": chunk, "limit": 500}):
+                    run.ip_rows[row["id"]] = row
+            except Exception as e:
+                logger.debug("sync_devices: IP prefetch of %d ids failed: %s", len(chunk), e)
+
+    def _device_record(self, run: "_DeviceSyncRun", dev_id: Any):
+        """The batch's live pynetbox Record for device ``dev_id``; None when it
+        was deleted this batch or NetBox no longer has it.
+
+        First use builds it from the listing row (``_hydrate_record``, no
+        GET); a device that wasn't listed is fetched once. Later uses return
+        the SAME Record — its ``save()`` folds the PATCH response back in, so
+        it always reflects this batch's writes. Stands in for the
+        ``devices.get(id)`` that used to precede every write."""
+        if dev_id in run.deleted_ids:
+            return None
+        obj = run.device_objs.get(dev_id)
+        if obj is None:
+            row = run.device_rows.pop(dev_id, None)
+            obj = (self._hydrate_record(row, self.nb.dcim.devices) if row is not None
+                   else self.nb.dcim.devices.get(dev_id))
+            if obj is not None:
+                run.device_objs[dev_id] = obj
+        return obj
+
+    def _ip_record(self, run: "_DeviceSyncRun", ip_id: Any):
+        """Same as ``_device_record`` for an IP address: built from the
+        prefetched row, else fetched once; None when NetBox has no such IP."""
+        obj = run.ip_objs.get(ip_id)
+        if obj is None:
+            row = run.ip_rows.pop(ip_id, None)
+            obj = (self._hydrate_record(row, self.nb.ipam.ip_addresses) if row is not None
+                   else self.nb.ipam.ip_addresses.get(ip_id))
+            if obj is not None:
+                run.ip_objs[ip_id] = obj
+        return obj
+
+    def _delete_device(self, run: "_DeviceSyncRun", row: dict) -> bool:
+        """Delete a listed device; True iff this call deleted it. Raises on a
+        failed delete.
+
+        A device that is already gone (deleted earlier this batch, or by
+        someone else since the listing → 404) is a silent no-op, matching the
+        old ``get() → None → skip``. NetBox cascades the delete to the
+        device's interfaces and their IPs, so its primary IP is forgotten."""
+        obj = self._device_record(run, row["id"])
+        if obj is None:
+            return False
+        try:
+            obj.delete()
+            deleted_now = True
+        except pynetbox.RequestError as e:
+            if getattr(getattr(e, "req", None), "status_code", None) != 404:
+                raise
+            deleted_now = False  # someone else already deleted it
+        run.deleted_ids.add(row["id"])
+        run.device_objs.pop(row["id"], None)
+        pip = row.get("primary_ip4")
+        if isinstance(pip, dict):
+            run.forget_ip(pip.get("id"))
+        return deleted_now
+
+    # ── step 3: replace-delete ───────────────────────────────────────────────
+
+    def _delete_vanished_owned_devices(self, run: "_DeviceSyncRun", incoming: dict) -> None:
+        """``replace=True`` (tenant-scoped only — the caller checks): delete
+        devices THIS source created (``owned_ips``) whose primary IP is absent
+        from the incoming set. Human / other-source devices are never touched.
+        A failed delete is counted as an error, not raised."""
+        for ip_str in list(run.owned_ips - set(incoming.keys())):
+            row = run.by_ip.get(ip_str)
+            if not row:
+                continue
+            try:
+                if self._delete_device(run, row):
+                    run.deleted += 1
+            except Exception as e:
+                run.note_error(f"delete {ip_str}: {e}")
+                logger.debug("sync_devices: delete stale %s failed: %s", ip_str, e)
+
+    # ── step 4: what a CREATE needs ──────────────────────────────────────────
+
+    def _resolve_create_defaults(self, run: "_DeviceSyncRun") -> None:
+        """Resolve the batch-wide refs a device CREATE needs (each
+        auto-provisions when missing — 406ffd0) and the custom-field
+        whitelist. Order matters only for request order: role, device type,
+        site."""
+        run.role = self._ensure_device_role(run.defaults.get("role") or "discovered")
+        # Names of custom fields provisioned on dcim.device — the only ones a
+        # per-record custom_fields map may write (an unknown key would 400 the
+        # whole device upsert — 268f7ed).
+        run.cf_whitelist = self._device_cf_whitelist()
+        run.dtype = self._ensure_device_type(run.defaults.get("device_type") or "discovered")
+        run.site = self._resolve_site(run.defaults.get("site") or "", run.tenant)
+
+    # ── step 5: one record ───────────────────────────────────────────────────
+
+    def _sync_one_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice") -> None:
+        """Reconcile one incoming record: update the device it matches, else
+        attach it to an operator-named device as a second port, else create a
+        device we own. Exceptions propagate to ``sync_devices``, which counts
+        them (``_note_upsert_failure``)."""
+        row = self._match_existing_device(run, d)
+        if row is None and self._join_operator_named_device(run, d):
+            run.pushed += 1
+            return
+        if row:
+            self._refresh_matched_device(run, d, row)
+        else:
+            self._create_discovered_device(run, d)
+
+    def _match_existing_device(self, run: "_DeviceSyncRun",
+                               d: "_IncomingDevice") -> Optional[dict]:
+        """Find the existing device this record IS (f5a57b9 / 228c875).
+
+        A record is the same machine if its SERIAL, MAC, IP or hostname
+        matches — matching any one updates that device in place instead of
+        creating a duplicate (the bug where a device added with no MAC/IP
+        spawned a copy on every sync). Tiers, strongest first:
+
+        1. serial — globally unique, survives IP/hostname churn;
+        2. MAC — the other hardware identity (catches DHCP IP-moves and
+           MAC-only records);
+        3. primary IP — only for records keyed by a real IP;
+        4. hostname — see ``_adoptable_by_name``.
+        """
+        row = None
+        if d.serial:
+            row = run.by_serial.get(d.serial.lower())
+        if row is None and d.mac:
+            row = run.by_mac.get(d.mac)
+        if row is None and d.keyed_by_ip:
+            row = run.by_ip.get(d.key)
+        if row is None and d.has_hostname:
+            row = self._adoptable_by_name(run, d)
+        return row
+
+    def _adoptable_by_name(self, run: "_DeviceSyncRun",
+                           d: "_IncomingDevice") -> Optional[dict]:
+        """Hostname tier: adopt the same-name device unless the record is
+        PROVABLY a different machine (MAC and IP present on both sides and
+        both differ — the one case the registry allows a duplicate). Only a
+        bare placeholder (no IP, no MAC) or a device THIS source owns is
+        adopted — a human's device is never clobbered — and never one already
+        refreshed this batch (``refreshed_ids``)."""
+        cand = run.by_name.get(d.hostname.lower())
+        if cand is None or cand["id"] in run.refreshed_ids:
+            return None
+        ecf = cand.get("custom_fields") or {}
+        emac = self._norm_mac(ecf.get("mac_address", ""))
+        eaddr = _primary_addr(cand)
+        cand_bare = not emac and not eaddr
+        mac_differs = bool(d.mac) and bool(emac) and emac != d.mac
+        ip_differs = bool(d.real_ip) and bool(eaddr) and eaddr != d.real_ip
+        if (cand_bare or run.owns(ecf)) and not (mac_differs and ip_differs):
+            return cand
+        return None
+
+    def _join_operator_named_device(self, run: "_DeviceSyncRun",
+                                    d: "_IncomingDevice") -> bool:
+        """An operator-assigned name (DNS A record / DHCP reservation) on a
+        new MAC+IP is the SAME device's other port (stack OOBM / in-band —
+        bc7575a). Attach the address to that device — one created earlier this
+        batch, else an existing device this source owns — instead of minting
+        a suffixed copy. True iff attached."""
+        if not (d.operator_named and d.real_ip and d.hostname):
+            return False
+        owner = run.created_by_name.get(d.hostname.lower())
+        if owner is None:
+            cand = run.by_name.get(d.hostname.lower())
+            if cand is not None and run.owns(cand.get("custom_fields") or {}):
+                owner = cand["id"]
+        if owner is None:
+            return False
+        touched: set = set()
+        try:
+            return self._adopt_secondary_ip(owner, d.real_ip, d.mac, d.hostname,
+                                            run.tenant, run.source_tag, touched_ips=touched)
+        finally:
+            for ip_id in touched:
+                run.forget_ip(ip_id)
+
+    # ── step 5a: update an existing device ───────────────────────────────────
+
+    def _refresh_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                                row: dict) -> None:
+        """Update a matched device in place, then count it as pushed.
+
+        Its id joins ``refreshed_ids`` and its name ``used_names`` so the
+        create branch never reclaims/clobbers it when a duplicate hostname
+        shows up later in the batch.
+
+        * ``source_of_truth == "netbox"`` (c245c7e): NetBox owns the data —
+          only fill EMPTY dns_name / mac / placeholder name, then refresh
+          ``last_seen`` (a staleness signal, not a truth field).
+        * ``"external"`` (the feed is the truth): refresh/assign the primary
+          IP, stamp device custom fields, rename when allowed, mark seen.
+        """
+        run.refreshed_ids.add(row["id"])
+        rname = str(row.get("name") or "").strip().lower()
+        if rname:
+            run.used_names.add(rname)
+        if run.source_of_truth == "netbox":
+            self._fill_device_gaps(run, row, d.hostname, d.mac)
+            self._touch_last_seen_if_stale(run, row, d.key, "last_seen refresh")
+        else:
+            self._sync_matched_primary_ip(run, d, row)
+            self._stamp_matched_device_fields(run, d, row)
+            self._rename_or_touch_matched_device(run, d, row)
+        run.pushed += 1
+
+    def _touch_last_seen_if_stale(self, run: "_DeviceSyncRun", row: dict, key: str,
+                                  what: str) -> None:
+        """Refresh the device's ``last_seen`` — but only when the LISTED row's
+        stamp is ≥1h old (8095627 / perf FIX A): a fresh stamp skips the
+        per-device GET + PATCH entirely. Best-effort."""
+        try:
+            if self._last_seen_stale((row.get("custom_fields") or {}).get("last_seen")):
+                devobj = self._device_record(run, row["id"])
+                if devobj:
+                    self._stamp_last_seen(devobj)
+        except Exception as e:
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: %s %s: %s", what, key, e)
+
+    def _sync_matched_primary_ip(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                                 row: dict) -> None:
+        """Refresh the existing primary IP when it already equals the incoming
+        IP (or the record has no IP to assign); otherwise ASSIGN the incoming
+        IP as primary_ip4 (bare-device adoption, or a DHCP IP-move caught by
+        MAC match)."""
+        pip = row.get("primary_ip4") or {}
+        ip_id = pip.get("id") if isinstance(pip, dict) else None
+        match_addr = _primary_addr(row)
+        if ip_id and (not d.real_ip or match_addr == d.real_ip):
+            self._refresh_primary_ip(run, d, ip_id)
+        elif d.real_ip:
+            self._assign_primary_ip(run, d, row, match_addr)
+
+    def _refresh_primary_ip(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                            ip_id: Any) -> None:
+        """Write the record's MAC (``custom_fields.mac_address`` — what the
+        NetBox→CPPM endpoint sync keys on) and hostname (``dns_name``) onto
+        the device's existing primary IP, then mark it seen. Only changed
+        values are sent; an unchanged IP costs no request. Best-effort."""
+        try:
+            ipobj = self._ip_record(run, ip_id)
+            if ipobj:
+                if d.has_hostname:
+                    ipobj.dns_name = d.hostname
+                if d.mac and (ipobj.custom_fields or {}).get("mac_address") != d.mac:
+                    self._save_cf_delta(ipobj, {"mac_address": d.mac})
+                else:
+                    ipobj.save()  # no-op unless dns_name changed
+                self._stamp_last_seen(ipobj)
+        except Exception as e:
+            run.forget_ip(ip_id)
+            logger.debug("sync_devices: refresh IP %s failed: %s", d.key, e)
+
+    def _assign_primary_ip(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                           row: dict, match_addr: str) -> None:
+        """Give a matched device the incoming IP as its primary_ip4 (new
+        ``mgmt`` interface + reused-or-created IP). Best-effort."""
+        try:
+            ipobj, mask = self._attach_mgmt_ip(run, d, row["id"])
+            devobj = self._device_record(run, row["id"])
+            if devobj:
+                devobj.primary_ip4 = ipobj.id
+                devobj.save()
+            self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
+                          note=f"IP {d.real_ip}/{mask} → adopted")
+            self._stamp_last_seen(ipobj)
+            # The device moved to a new address — it is NOT stale. Stop
+            # replace-delete from reaping it for its OLD primary IP.
+            if match_addr and match_addr != d.real_ip and match_addr in run.owned_ips:
+                run.owned_ips.discard(match_addr)
+        except Exception as e:
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: assign IP %s failed: %s", d.real_ip, e)
+
+    def _attach_mgmt_ip(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                        device_id: Any) -> Tuple[Any, str]:
+        """Create a ``mgmt`` interface on ``device_id`` and put the record's IP
+        on it; returns ``(ipobj, mask)``. Raises on failure.
+
+        Uses the top-level ``dcim.interfaces`` endpoint (``device=<id>``), not
+        ``devobj.interfaces.create`` — the nested accessor isn't supported on
+        every pynetbox version. The IP goes through ``_reuse_or_create_ip``:
+        NetBox enforces global IP uniqueness, so an address the IPAM already
+        holds is REUSED and reassigned instead of 400ing "Duplicate IP address
+        found in global table" (which used to fail ~every record)."""
+        iface = self.nb.dcim.interfaces.create(device=device_id, name="mgmt", type="other")
+        mask = self._mask_for_ip(d.real_ip, run.tenant)
+        ip_kwargs: Dict[str, Any] = {
+            "address": f"{d.real_ip}/{mask}",
+            "assigned_object_type": "dcim.interface",
+            "assigned_object_id": iface.id,
+        }
+        if run.tenant:
+            ip_kwargs["tenant"] = run.tenant.id
+        if d.has_hostname:
+            ip_kwargs["dns_name"] = d.hostname
+        ipobj = self._reuse_or_create_ip(
+            f"{d.real_ip}/{mask}", ip_kwargs, d.real_ip, iface.id,
+            tenant=run.tenant, hostname=d.hostname, mac=d.mac, source=run.source_tag)
+        # A REUSED address was reassigned/tagged by its own lookup — drop any
+        # cached copy (it may be another listed device's primary IP).
+        run.forget_ip(ipobj.id)
+        return ipobj, mask
+
+    def _stamp_matched_device_fields(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                                     row: dict) -> None:
+        """Stamp the matched device's custom fields; one save when anything
+        changed. Best-effort.
+
+        * ``mac_address`` — so a future MAC-match finds it after a DHCP IP
+          move, and the endpoint sync can match it by MAC.
+        * ``switch_name/ip/port`` — "where is this MAC" lives on the device.
+        * per-record custom fields — only on a device THIS source owns (never a
+          human's), only whitelisted names, never a sink-managed field
+          (268f7ed).
+        * ``serial`` — fill-gap only; an existing serial stays authoritative.
+        """
+        we_own = run.owns(row.get("custom_fields") or {})
+        try:
+            devobj = self._device_record(run, row["id"])
+            if devobj:
+                current = devobj.custom_fields or {}
+                wanted: Dict[str, Any] = {}
+                if d.mac:
+                    wanted["mac_address"] = d.mac
+                for cf_key in _SWITCH_CF_KEYS:
+                    if d.rec.get(cf_key):
+                        wanted[cf_key] = d.rec[cf_key]
+                if we_own:
+                    for ck, cv in (d.rec.get("custom_fields") or {}).items():
+                        if ck in run.cf_whitelist and ck not in self._SINK_MANAGED_DEVICE_CFS:
+                            wanted[ck] = cv
+                delta = {k: v for k, v in wanted.items() if current.get(k) != v}
+                ser_changed = False
+                if d.serial and not str(getattr(devobj, "serial", "") or "").strip():
+                    devobj.serial = d.serial
+                    ser_changed = True
+                if delta:
+                    self._save_cf_delta(devobj, delta)  # also sends the serial
+                elif ser_changed:
+                    devobj.save()
+        except Exception as e:
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: device cf stamp %s: %s", d.key, e)
+
+    def _rename_or_touch_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                                        row: dict) -> None:
+        """Rename the matched device to the record's hostname and mark it seen
+        — but only when we OWN it, or it still has an auto placeholder name
+        another feed minted (nw's ``device-<mac>``); a human's name is never
+        clobbered (c245c7e). An owned device takes the hostname as-is
+        (upper-cased, f15f672); a placeholder takes a uniquified name.
+        Otherwise just refresh ``last_seen`` when stale."""
+        we_own = run.owns(row.get("custom_fields") or {})
+        placeholder = bool(_PLACEHOLDER_NAME_RE.match(str(row.get("name") or "").strip()))
+        if not ((we_own or placeholder) and d.has_hostname):
+            self._touch_last_seen_if_stale(run, row, d.key, "last_seen")
+            return
+        try:
+            devobj = self._device_record(run, row["id"])
+            if devobj:
+                devobj.name = (self._nb_name(d.hostname) if we_own else
+                               self._uniq_device_name(d.hostname, d.mac, d.real_ip,
+                                                      run.by_name, run.used_names))
+                devobj.save()
+                run.used_names.add(str(devobj.name).strip().lower())
+                self._stamp_last_seen(devobj)
+        except Exception as e:
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: rename %s failed: %s", d.key, e)
+
+    # ── step 5b: create a device we own ──────────────────────────────────────
+
+    def _create_discovered_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice") -> None:
+        """Create a device for a record nothing matched, tagged as ours.
+
+        Raises on a failed create (the caller counts it). Steps:
+        1. pick a free name (``_claim_create_name``);
+        2. create the device (role / device_type / site / tenant / serial);
+        3. stamp ownership + ``last_seen`` + MAC + switch + per-record cfs;
+        4. with a real IP: ``mgmt`` interface + IP + ``primary_ip4``.
+        """
+        name = self._claim_create_name(run, d, d.default_name)
+        # A prior create already 400'd on a missing site — the same 400 hits
+        # every record, so stop attempting creates (count once each, one
+        # warning) instead of spamming an identical error (ccb5034).
+        if run.site_required_abort:
+            run.errors += 1
+            return
+        name = self._nb_name(name)
+        devobj = self.nb.dcim.devices.create(**self._device_create_kwargs(run, d, name))
+        if d.hostname:
+            run.created_by_name.setdefault(d.hostname.lower(), devobj.id)
+        self._stamp_created_device(run, d, devobj)
+        self._journal("dcim.device", devobj.id, run.source_tag, note=f"device {name}")
+        if d.real_ip:
+            ipobj, mask = self._attach_mgmt_ip(run, d, devobj.id)
+            # Set primary_ip4 on a FRESH fetch so the save does not re-send the
+            # best-effort custom_fields merged onto ``devobj`` above. When the
+            # deployed NetBox hasn't attached those custom fields to
+            # dcim.device yet (a provisioning gap — _ensure_custom_fields
+            # self-heals it, but there's a first-sync window + a restricted
+            # token can't create them), re-sending them 400s ("Custom field 'X'
+            # does not exist for this object type") and used to kill the whole
+            # upsert: the device was created but primary_ip4 was never set, so
+            # the next sync couldn't match it → re-create + 400 every cycle
+            # (the persistent 100+ errors/tenant in the hub log). A fresh get
+            # carries only NetBox's actually-provisioned cfs. Best-effort: the
+            # device still counts as pushed.
+            try:
+                fresh = self.nb.dcim.devices.get(devobj.id)
+                if fresh:
+                    fresh.primary_ip4 = ipobj.id
+                    fresh.save()
+            except Exception as e:
+                logger.debug("sync_devices: set primary_ip4 %s on %s failed: %s",
+                             d.real_ip, name, e)
+            self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
+                          note=f"IP {d.real_ip}/{mask} → {name}")
+            self._stamp_last_seen(ipobj)
+        run.pushed += 1
+
+    def _claim_create_name(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                           name: str) -> str:
+        """Return a name the new device can take without tripping NetBox's
+        (name, site, tenant) unique constraint, and reserve it in
+        ``used_names``.
+
+        Two hazards: (1) a PRE-existing device already holds the name
+        (``by_name`` snapshot); (2) an earlier record THIS batch took it — many
+        discovery records share a hostname (ks205, sonoszp, iphone…) across
+        distinct MACs, and the pre-batch snapshot can't see those.
+
+        For (1): when the holder is OUR orphan of the same machine
+        (``_is_reclaimable``) and the name isn't already used this batch, the
+        holder is deleted and the name reclaimed; otherwise the new name is
+        uniquified and the holder left alone. A device refreshed this batch
+        (``refreshed_ids``) is never reclaimed — that is a different IP's
+        real device, not a stale orphan."""
+        byname = run.by_name.get(name.lower())
+        if byname and byname["id"] not in run.refreshed_ids:
+            if (self._is_reclaimable(run, d, byname, name)
+                    and name.lower() not in run.used_names):
+                try:
+                    if self._delete_device(run, byname):
+                        run.deleted += 1
+                except Exception as e:
+                    run.note_error(f"delete-stale {name}: {e}")
+                    logger.debug("sync_devices: delete stale by-name %s failed: %s", name, e)
+            else:
+                orig = name
+                name = self._uniq_device_name(name, d.mac, d.real_ip,
+                                              run.by_name, run.used_names)
+                logger.debug("sync_devices: name %s taken; creating as %s", orig, name)
+        elif name.lower() in run.used_names:
+            orig = name
+            name = self._uniq_device_name(name, d.mac, d.real_ip,
+                                          run.by_name, run.used_names)
+            logger.debug("sync_devices: hostname %s already used this batch; "
+                         "creating as %s", orig, name)
+        run.used_names.add(name.lower())
+        return name
+
+    def _is_reclaimable(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                        holder: dict, name: str) -> bool:
+        """True when the device holding ``name`` is OUR stale copy of the same
+        machine: we own it (an unowned/human device never qualifies) AND its
+        MAC cf equals the record's MAC, OR its primary IP equals the record's
+        IP, OR the name is the MAC-derived ``device-<mac>`` form (a no-hostname
+        DHCP IP-move of one of our orphans)."""
+        hcf = holder.get("custom_fields") or {}
+        if not run.owns(hcf):
+            return False
+        hmac = self._norm_mac(hcf.get("mac_address", ""))
+        haddr = _primary_addr(holder)
+        return ((bool(d.mac) and bool(hmac) and hmac == d.mac)
+                or (bool(d.real_ip) and bool(haddr) and haddr == d.real_ip)
+                or (bool(d.mac) and name.lower() == f"device-{d.mac.replace(':', '')}"))
+
+    def _device_create_kwargs(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                              name: str) -> Dict[str, Any]:
+        """``dcim.devices.create`` kwargs for a new device. A per-record role
+        (e.g. TrueNAS→"storage") beats the batch default — role is set on
+        CREATE only, never on an existing device (268f7ed). A device_type
+        resolved from the DISCOVERED model beats the generic default."""
+        kwargs: Dict[str, Any] = {"name": name, "status": "active"}
+        if d.serial:
+            kwargs["serial"] = d.serial
+        rec_role = d.rec.get("role")
+        create_role = self._ensure_device_role(rec_role) if rec_role else run.role
+        if create_role:
+            kwargs["role"] = create_role.id
+        rec_dtype = self._device_type_for_model(
+            d.rec.get("model", ""), d.rec.get("manufacturer", "")) or run.dtype
+        if rec_dtype:
+            kwargs["device_type"] = rec_dtype.id
+        if run.site:
+            kwargs["site"] = run.site.id
+        if run.tenant:
+            kwargs["tenant"] = run.tenant.id
+        return kwargs
+
+    def _stamp_created_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                              devobj: Any) -> None:
+        """Stamp a NEW device: ownership tag (``discovered_from``), ``last_seen``
+        (starts the staleness clock), ``mac_address`` + switch cfs (so a
+        recurrence MAC-matches this device instead of duplicating — the
+        linchpin of the registry dedup) and whitelisted per-record cfs.
+        Best-effort: a missing custom field just skips the stamp."""
+        try:
+            merged = dict(devobj.custom_fields or {})
+            merged["discovered_from"] = run.source_tag
+            merged["last_seen"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if d.mac:
+                merged["mac_address"] = d.mac
+            for cf_key in _SWITCH_CF_KEYS:
+                val = d.rec.get(cf_key)
+                if val:
+                    merged[cf_key] = val
+            for ck, cv in (d.rec.get("custom_fields") or {}).items():
+                if ck in run.cf_whitelist and ck not in self._SINK_MANAGED_DEVICE_CFS:
+                    merged[ck] = cv
+            devobj.custom_fields = merged
+            devobj.save()
+        except Exception as e:
+            logger.debug("sync_devices: discovered_from tag skipped: %s", e)
+
+    # ── step 6: errors + result ──────────────────────────────────────────────
+
+    def _note_upsert_failure(self, run: "_DeviceSyncRun", key: str, e: Exception) -> None:
+        """Count a failed record. If it failed because NetBox requires a site
+        (none resolvable), the same 400 will hit every remaining create — set
+        ``site_required_abort`` so later creates are skipped, and log ONE
+        actionable warning instead of 185 identical errors (ccb5034)."""
+        run.note_error(f"upsert {key}: {e}")
+        es = str(e).lower()
+        if not run.site_required_abort and "site" in es and "required" in es:
+            run.site_required_abort = True
+            logger.warning(
+                "[sync-error] sync_devices tenant=%s: NetBox requires a "
+                "site for device creation but none resolved (defaults.site="
+                "%r) — set a valid 'site' slug for this sync or create a "
+                "site in NetBox; skipping remaining creates.",
+                run.tenant_slug or "—", run.defaults.get("site"))
+        logger.debug("sync_devices: upsert %s failed: %s", key, e)
+
+    @staticmethod
+    def _sync_devices_result(run: "_DeviceSyncRun", devices_total: int) -> Dict[str, Any]:
+        """The SUCCESS envelope. The first per-record failure is appended to
+        the message (the hub status UI shows it) and logged at WARNING, so the
+        cause is visible without DEBUG logs."""
+        msg = (f"{run.pushed} device(s) upserted, {run.deleted} deleted, "
+               f"{run.skipped} skipped, {run.errors} errors")
+        if run.errors and run.first_err:
+            msg += f" — first error: {run.first_err}"
+            logger.warning("sync_devices tenant=%s: %s", run.tenant_slug or "<global>", msg)
+        else:
+            logger.info("sync_devices tenant=%s: %s", run.tenant_slug or "<global>", msg)
+        return {"status": "SUCCESS", "pushed": run.pushed, "errors": run.errors,
+                "skipped": run.skipped, "deleted": run.deleted,
+                "devices_total": devices_total, "message": msg}
 
     def sync_nw_device(self, device: dict, interfaces: list,
                        tenant_slug: str = "",
