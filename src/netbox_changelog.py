@@ -230,6 +230,37 @@ class ChangelogMixin:
         except Exception as e:
             logger.debug("%s: mac_address on IP %s skipped: %s", source, addr, e)
 
+    @staticmethod
+    def _save_cf_delta(obj: Any, delta: Dict[str, Any]) -> None:
+        """Save ``obj`` sending ONLY the custom-field keys in ``delta`` (plus
+        any other attribute the caller already changed on ``obj``).
+
+        Why: pynetbox's ``save()`` PATCHes the WHOLE ``custom_fields`` dict as
+        soon as one key differs. If ``obj`` was read a while ago (sync_devices
+        now reuses one Record per device for the whole batch), the whole-dict
+        PATCH would write back the old value of every OTHER key, silently
+        reverting a concurrent sync's change (e.g. a cppm sync that set
+        ``switch_port`` meanwhile). NetBox MERGES the ``custom_fields`` of a
+        PATCH, so sending just the changed keys is exact. pynetbox >= 7.5
+        compares only the assigned keys (issue #748); older versions send the
+        assigned subset as-is — both send exactly ``delta``.
+
+        Afterwards ``obj.custom_fields`` is the full merged view again (the
+        PATCH response normally provides it; restored by hand when the save
+        raised or the pynetbox version doesn't re-parse the response), so code
+        reading ``obj.custom_fields`` later never sees a partial dict.
+        Raises whatever ``save()`` raises."""
+        before = dict(obj.custom_fields or {})
+        obj.custom_fields = dict(delta)
+        try:
+            obj.save()
+        except Exception:
+            obj.custom_fields = before  # nothing landed
+            raise
+        after = obj.custom_fields
+        if not isinstance(after, dict) or set(before) - set(after):
+            obj.custom_fields = {**before, **delta}
+
     # Quantization window for last_seen rewrites. The staleness sweep's
     # thresholds are DAYS (7d offline / 30d delete — netbox_staleness.py), so a
     # second-resolution ``now()`` stamp was pure churn: every sync tick produced
@@ -275,8 +306,6 @@ class ChangelogMixin:
                 return  # fresh within the hour — skip the no-op-diff PATCH
             ts = when or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             if m.get("last_seen") != ts:
-                m["last_seen"] = ts
-                obj.custom_fields = m
-                obj.save()
+                self._save_cf_delta(obj, {"last_seen": ts})
         except Exception as e:
             logger.debug("stamp_last_seen on %r failed: %s", obj, e)

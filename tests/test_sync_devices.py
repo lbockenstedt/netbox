@@ -40,11 +40,30 @@ def _engine_with(existing_rows, tenant_obj=None):
     existing device rows; _api_get (prefix lookup) returns empty (→ /32)."""
     eng = NetboxEngine("http://localhost", "tok")
     eng.nb = MagicMock()
-    eng.nb.tenancy.tenants.get.return_value = tenant_obj  # _Obj(id=1) or None
+    synced = {}
+
+    def _tenant_get(slug=None, **_):
+        synced["slug"] = slug
+        return tenant_obj  # _Obj(id=1) or None
+
+    eng.nb.tenancy.tenants.get.side_effect = _tenant_get
     # Default: no pre-existing global IP → _reuse_or_create_ip creates. Tests
     # that need the reuse/refresh path override ip_addresses.get.return_value.
     eng.nb.ipam.ip_addresses.get.return_value = None
-    eng._api_get_all = MagicMock(return_value=existing_rows)
+
+    def _list(path, params=None):
+        # Real device rows carry their nested tenant; sync_devices pages ALL
+        # devices once and keeps the synced tenant's rows by tenant.slug. The
+        # rows given here belong to the synced tenant unless they say otherwise.
+        if path == "/api/dcim/devices/" and synced.get("slug"):
+            for r in existing_rows:
+                if isinstance(r, dict):
+                    r.setdefault("tenant", {"id": 1, "slug": synced["slug"]})
+        if path == "/api/ipam/ip-addresses/":
+            return []  # no IP prefetch rows → per-id ip_addresses.get (mocked)
+        return existing_rows
+
+    eng._api_get_all = MagicMock(side_effect=_list)
     eng._api_get = MagicMock(return_value={"results": []})  # no containing prefix → /32
     return eng
 
@@ -651,11 +670,12 @@ def test_sync_devices_nw_replace_delete_skips_opnsense_owned():
     dev22.delete.assert_called_once()
     # The firewall-owned device 11 (10.0.0.5, opnsense) is present in the
     # incoming set so it's refreshed, NOT deleted. devices.get is fetched for:
-    # the replace-delete of 22, then the refresh of 11 — which now stamps the
-    # device's mac_address custom field (so future MAC-matching works) AND
-    # last_seens it so the staleness sweep sees it as recently active. The only
-    # DELETE is on dev22; device 11 is only ever fetched, never deleted.
-    assert eng.nb.dcim.devices.get.call_count == 3
+    # the replace-delete of 22, then ONCE for 11 (these mock rows have no
+    # ``url`` so they can't be hydrated) — that one live Record serves both
+    # the mac_address cf stamp and the last_seen stamp (B3: it used to be
+    # fetched once per write). The only DELETE is on dev22; device 11 is only
+    # ever fetched, never deleted.
+    assert eng.nb.dcim.devices.get.call_count == 2
     # No second delete call — device 11 was not reaped.
     assert dev22.delete.call_count == 1
 
