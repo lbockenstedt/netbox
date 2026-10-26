@@ -6,6 +6,14 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("NetboxEngine")
 
 
+def _ref_id(ref: Any) -> Any:
+    """Id of a pynetbox reference: a Record, a nested dict, or a bare id.
+    (A Record never equals an int, so compare ids, not objects.)"""
+    if isinstance(ref, dict):
+        return ref.get("id")
+    return getattr(ref, "id", ref)
+
+
 class ChangelogMixin:
     """Change-log journaling + IP-reuse/reassign helpers for NetboxEngine."""
 
@@ -135,10 +143,12 @@ class ChangelogMixin:
         ``[sync-error]`` (reaches the spoke log + GET_ERROR_LOGS) and returned
         False; the old silent DEBUG swallow is gone.
 
-        When the IP is moved OFF a ``dcim.interface`` that was a device's
-        ``primary_ip4``, that stale device ``primary_ip4`` is cleared
-        best-effort so the device doesn't keep displaying an IP it no longer
-        owns. Never raises.
+        When the IP is moved onto a VM interface, the old parent (a device or
+        a stale duplicate VM) loses it as its primary IP FIRST — NetBox refuses
+        to move an IP that is still its parent's primary ("Cannot reassign IP
+        address while it is designated as the primary IP for the parent
+        object"). If the move then fails, that primary IP is put back.
+        Never raises.
         """
         updates: Dict[str, Any] = {}
         if getattr(ipobj, "assigned_object_id", None) != iface_id:
@@ -149,13 +159,9 @@ class ChangelogMixin:
         if hostname and hostname.lower() != "unknown" and \
                 (getattr(ipobj, "dns_name", "") or "") != hostname:
             updates["dns_name"] = hostname
-        # Capture the OLD assignment BEFORE we mutate the local object, so the
-        # stale-device-primary_ip4 clear below can detect a dcim.interface we
-        # are moving the IP off of.
-        old_aot = getattr(ipobj, "assigned_object_type", None)
-        old_iface_id = getattr(ipobj, "assigned_object_id", None)
-        moved_off_device = ("assigned_object_id" in updates
-                             and iface_type != "dcim.interface")
+        released = []
+        if "assigned_object_id" in updates and iface_type != "dcim.interface":
+            released = self._release_old_parent_primary(ipobj, source, addr)
         if updates:
             try:
                 # pynetbox >=7's Endpoint.update() is a BULK op: it takes a LIST
@@ -167,6 +173,7 @@ class ChangelogMixin:
             except Exception as e:
                 logger.warning("[sync-error] %s: reuse-IP %s reassign failed: %s",
                                source, addr, e)
+                self._restore_parent_primary(released, ipobj.id, source, addr)
                 return False
             # Reflect the change on the local object so a later .save() (MAC
             # tag / last_seen stamp) sends the new assignment, not the old one.
@@ -177,44 +184,60 @@ class ChangelogMixin:
                 ipobj.tenant = updates["tenant"]
             if "dns_name" in updates:
                 ipobj.dns_name = updates["dns_name"]
-        if moved_off_device:
-            self._clear_stale_device_primary_ip(
-                ipobj.id, old_aot, old_iface_id, source, addr)
         self._tag_ip_mac(ipobj, mac, source, addr)
         return True
 
-    def _clear_stale_device_primary_ip(self, ip_id: Any, old_aot: Any,
-                                       old_iface_id: Any, source: str,
-                                       addr: str) -> None:
-        """Best-effort: when an IP is moved OFF a ``dcim.interface`` that was a
-        device's ``primary_ip4``, clear that device's ``primary_ip4`` so it
-        doesn't keep pointing at an IP now assigned to a VM. ``old_aot`` /
-        ``old_iface_id`` are the IP's assignment BEFORE the reassign (captured
-        by the caller, since the local object has already been mutated to the
-        new assignment by the time this runs). Never raises — a stale
-        primary_ip4 is hygiene, not a sync blocker."""
+    def _release_old_parent_primary(self, ipobj: Any, source: str,
+                                    addr: str) -> List[tuple]:
+        """Clear the IP as primary_ip4/primary_ip6 of the object it is assigned
+        to now (a device or a VM), so NetBox lets it move. Returns the
+        ``(record, field)`` pairs cleared, for :meth:`_restore_parent_primary`.
+        Never raises — on any error the move is simply attempted as-is."""
+        released: List[tuple] = []
         try:
-            aot = old_aot
+            aot = getattr(ipobj, "assigned_object_type", None)
             if isinstance(aot, dict):
                 aot = f"{aot.get('app_label', '')}.{aot.get('model', '')}"
-            if aot != "dcim.interface" or not old_iface_id:
-                return
-            iface = self.nb.dcim.interfaces.get(old_iface_id)
-            if not iface:
-                return
-            dev_ref = getattr(iface, "device", None)
-            dev_id = dev_ref.get("id") if isinstance(dev_ref, dict) else dev_ref
-            if not dev_id:
-                return
-            dev = self.nb.dcim.devices.get(dev_id)
-            if dev and getattr(dev, "primary_ip4", None) == ip_id:
-                dev.primary_ip4 = None
-                dev.save()
-                logger.info("%s: cleared stale device primary_ip4 for IP %s "
-                            "(now on a VM interface)", source, addr)
+            iface_id = _ref_id(getattr(ipobj, "assigned_object_id", None))
+            if aot == "dcim.interface":
+                ifaces, parent_key, parents = (self.nb.dcim.interfaces, "device",
+                                               self.nb.dcim.devices)
+            elif aot == "virtualization.vminterface":
+                ifaces, parent_key, parents = (self.nb.virtualization.interfaces,
+                                               "virtual_machine",
+                                               self.nb.virtualization.virtual_machines)
+            else:
+                return released
+            iface = ifaces.get(iface_id) if iface_id else None
+            parent_id = _ref_id(getattr(iface, parent_key, None)) if iface else None
+            parent = parents.get(parent_id) if parent_id else None
+            if not parent:
+                return released
+            for field in ("primary_ip4", "primary_ip6"):
+                if _ref_id(getattr(parent, field, None)) == ipobj.id:
+                    setattr(parent, field, None)
+                    released.append((parent, field))
+            if released:
+                parent.save()
+                logger.info("%s: released IP %s as primary of %s %s so it can "
+                            "move to the VM", source, addr, parent_key,
+                            getattr(parent, "name", parent_id))
         except Exception as e:
-            logger.debug("%s: stale device primary_ip4 clear for IP %s skipped: %s",
+            logger.debug("%s: releasing old primary for IP %s skipped: %s",
                          source, addr, e)
+            return []
+        return released
+
+    def _restore_parent_primary(self, released: List[tuple], ip_id: Any,
+                                source: str, addr: str) -> None:
+        """Undo :meth:`_release_old_parent_primary` after a failed move."""
+        for parent, field in released:
+            try:
+                setattr(parent, field, ip_id)
+                parent.save()
+            except Exception as e:
+                logger.warning("[sync-error] %s: could not restore %s %s on %s: %s",
+                               source, field, addr, getattr(parent, "name", "?"), e)
 
     def _tag_ip_mac(self, ipobj: Any, mac: str, source: str, addr: str) -> None:
         """Best-effort write ``mac_address`` onto an ipam.ip_address custom
