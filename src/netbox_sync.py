@@ -1663,7 +1663,7 @@ class SyncMixin:
             try:
                 params: Dict[str, Any] = {"limit": 500}
                 if tenant:
-                    params["tenant"] = tenant.id
+                    params["tenant_id"] = tenant.id  # ``tenant`` filters by slug
                 rows = self._api_get_all("/api/dcim/devices/", params)
             except Exception as e:
                 return {"status": "ERROR",
