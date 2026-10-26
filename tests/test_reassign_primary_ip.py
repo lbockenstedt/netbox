@@ -75,11 +75,20 @@ def test_failed_move_restores_released_primary():
     assert dev.save.call_count == 2
 
 
-def test_device_sinks_never_strip_another_parents_primary():
-    eng = _engine([])
-    assert eng._reassign_ip(_ip(VMIF, 900), 12, None, "", "", "sync_devices", "a")
-    eng.nb.dcim.devices.get.assert_not_called()
+def test_device_sink_never_takes_an_ip_off_a_vm():
+    log = []
+    eng = _engine(log)
+    assert not eng._reassign_ip(_ip(VMIF, 900), 12, None, "", "", "Kea", "a")
+    assert log == []
     eng.nb.virtualization.virtual_machines.get.assert_not_called()
+
+
+def test_device_sink_moving_between_devices_does_not_release_primaries():
+    log = []
+    eng = _engine(log)
+    assert eng._reassign_ip(_ip(), 12, None, "", "", "sync_devices", "a")
+    assert log == [("update", 12)]
+    eng.nb.dcim.devices.get.assert_not_called()
 
 
 def test_ip_that_is_not_the_old_parents_primary_is_left_alone():

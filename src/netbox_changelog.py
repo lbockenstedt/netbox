@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("NetboxEngine")
 
 
+VMIF = "virtualization.vminterface"
+
+
+def _aot(ipobj: Any) -> Any:
+    """An IP's ``assigned_object_type`` as ``app_label.model``."""
+    aot = getattr(ipobj, "assigned_object_type", None)
+    if isinstance(aot, dict):
+        aot = f"{aot.get('app_label', '')}.{aot.get('model', '')}"
+    return aot
+
+
 def _ref_id(ref: Any) -> Any:
     """Id of a pynetbox reference: a Record, a nested dict, or a bare id.
     (A Record never equals an int, so compare ids, not objects.)"""
@@ -148,10 +159,17 @@ class ChangelogMixin:
         to move an IP that is still its parent's primary ("Cannot reassign IP
         address while it is designated as the primary IP for the parent
         object"). If the move then fails, that primary IP is put back.
+        The reverse is refused: a device sink never takes an IP off a VM
+        interface (the hypervisor is authoritative for its VMs' IPs).
         Never raises.
         """
+        moving = getattr(ipobj, "assigned_object_id", None) != iface_id
+        if moving and iface_type == "dcim.interface" and _aot(ipobj) == VMIF:
+            logger.debug("%s: IP %s belongs to a VM interface — not moving it "
+                         "to a device", source, addr)
+            return False
         updates: Dict[str, Any] = {}
-        if getattr(ipobj, "assigned_object_id", None) != iface_id:
+        if moving:
             updates["assigned_object_type"] = iface_type
             updates["assigned_object_id"] = iface_id
         if tenant and getattr(ipobj, "tenant", None) != tenant.id:
@@ -195,14 +213,12 @@ class ChangelogMixin:
         Never raises — on any error the move is simply attempted as-is."""
         released: List[tuple] = []
         try:
-            aot = getattr(ipobj, "assigned_object_type", None)
-            if isinstance(aot, dict):
-                aot = f"{aot.get('app_label', '')}.{aot.get('model', '')}"
+            aot = _aot(ipobj)
             iface_id = _ref_id(getattr(ipobj, "assigned_object_id", None))
             if aot == "dcim.interface":
                 ifaces, parent_key, parents = (self.nb.dcim.interfaces, "device",
                                                self.nb.dcim.devices)
-            elif aot == "virtualization.vminterface":
+            elif aot == VMIF:
                 ifaces, parent_key, parents = (self.nb.virtualization.interfaces,
                                                "virtual_machine",
                                                self.nb.virtualization.virtual_machines)
