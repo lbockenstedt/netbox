@@ -276,3 +276,16 @@ def test_sync_nw_device_keeps_auto_name_when_poll_has_only_ip_name():
     eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
                        defaults=_DEFAULTS)
     assert rec.name == "DEVICE-001A1E042F00"
+
+
+def test_sync_nw_device_filters_tenant_devices_by_tenant_id():
+    # NetBox's ``tenant`` filter takes a slug; a numeric id there is a 400.
+    eng = _engine()
+    eng._resolve_tenant_ci = MagicMock(return_value=MagicMock(id=7, slug="lrb"))
+    eng.nb.dcim.devices.create = MagicMock(return_value=_Obj(id=100, name="sw1"))
+    eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="lrb",
+                       defaults=_DEFAULTS)
+    params = [c.args[1] for c in eng._api_get_all.call_args_list
+              if "dcim/devices" in c.args[0]]
+    assert params and params[0].get("tenant_id") == 7
+    assert "tenant" not in params[0]
