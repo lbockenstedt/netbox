@@ -1803,7 +1803,7 @@ class SyncMixin:
             # ── Index existing interfaces on this device by name (lowercased) ──
             existing_ifaces: Dict[str, Any] = {}
             try:
-                for ifc in self.nb.dcim.interfaces.filter(device=dev_id):
+                for ifc in self.nb.dcim.interfaces.filter(device_id=dev_id):
                     existing_ifaces[str(getattr(ifc, "name", "") or "").lower()] = ifc
             except Exception as e:
                 logger.debug("sync_nw_device: list interfaces for %s failed: %s",
