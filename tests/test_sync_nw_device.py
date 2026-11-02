@@ -139,6 +139,9 @@ def test_sync_nw_device_updates_existing_in_place_no_recreate():
     assert res["deleted"] == 1           # oldport (nw-managed, stale) deleted
     eng.nb.dcim.devices.create.assert_not_called()       # existing → no recreate
     eng.nb.dcim.interfaces.create.assert_not_called()    # vlan1 matched by name
+    # Index by device *id* — NetBox's `device` filter matches the name, so
+    # filter(device=<id>) returns nothing and every iface re-creates (400).
+    eng.nb.dcim.interfaces.filter.assert_called_with(device_id=7)
     # vlan1 was updated (status → active, mac stamped) + saved.
     assert vlan1.status == "active"
     assert vlan1.mac_address == "aa:bb:cc:dd:ee:01"
