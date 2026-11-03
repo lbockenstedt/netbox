@@ -876,6 +876,7 @@ class SyncMixin:
                                        f"Check the tenant's NetBox slug mapping.",
                             "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                             "devices_total": len(devices or [])}
+                self._move_tenant_ips_to_vrf(run.tenant)
 
             incoming, run.skipped = self._normalize_incoming_devices(devices)
 
@@ -1749,6 +1750,8 @@ class SyncMixin:
             tenant = None
             if tenant_slug:
                 tenant = self._resolve_tenant_ci(tenant_slug)
+            if tenant:
+                self._move_tenant_ips_to_vrf(tenant)
 
             # ── Resolve the existing device via the canonical ladder ──────────
             # SERIAL → MAC → nw_device_id → mgmt-IP → name. Serial and the
@@ -2129,6 +2132,7 @@ class SyncMixin:
                                        f"access-tracker sessions not attributed.",
                             "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                             "sessions_total": len(sessions or [])}
+                self._move_tenant_ips_to_vrf(tenant)
 
             role = self._ensure_device_role(defaults.get("role") or "discovered")
             dtype = self._ensure_device_type(defaults.get("device_type") or "discovered")
