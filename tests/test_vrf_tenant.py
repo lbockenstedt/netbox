@@ -38,6 +38,19 @@ def test_reuse_or_create_ip_creates_in_tenant_vrf():
     assert eng.nb.ipam.ip_addresses.create.call_args[1]["vrf"] == 7
 
 
+def test_reuse_ip_for_tenant_without_vrf_stays_in_global_table():
+    # Another tenant's VRF may hold the same address; a VRF-less tenant must
+    # not find (and retag) it.
+    eng = _engine([])
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng._tag_ip_mac = MagicMock()
+    eng._reuse_or_create_ip("10.0.0.5/24", {"address": "10.0.0.5/24"}, "10.0.0.5", 1,
+                            tenant=SimpleNamespace(id=3))
+    assert eng.nb.ipam.ip_addresses.get.call_args[1] == {"address": "10.0.0.5/24",
+                                                         "vrf_id": "null"}
+    assert "vrf" not in eng.nb.ipam.ip_addresses.create.call_args[1]
+
+
 def test_mask_uses_only_tenant_vrf_prefixes():
     import ipaddress
     eng = _engine([{"id": 7, "name": "acme"}])
