@@ -225,7 +225,7 @@ class SyncMixin:
         has_ip = isinstance(pip, dict) and bool(
             (pip.get("address") or "").split("/")[0].strip())
         cf = row.get("custom_fields") or {}
-        has_mac = bool(NetboxEngine._norm_mac(cf.get("mac_address", "")))
+        has_mac = bool(SyncMixin._norm_mac(cf.get("mac_address", "")))
         return has_ip or has_mac
 
     # ── perf FIX C: per-sync-run prefix prefetch for _mask_for_ip ────────────
@@ -504,14 +504,11 @@ class SyncMixin:
         tenant B could not see tenant A's record of the same MAC and minted a
         copy every time (the RA/LRB ``device-<mac>`` pairs). ``rows`` is an
         already-fetched global device listing (sync_devices pages it once and
-        reuses it); without it the listing is fetched here. Best-effort: a
-        listing failure leaves the scoped indexes as they were."""
+        reuses it); without it the listing is fetched here. A listing failure
+        raises: matching without global identities creates cross-tenant
+        duplicates, so the sync must fail and retry instead."""
         if rows is None:
-            try:
-                rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-            except Exception as e:
-                logger.debug("global MAC/serial index: %s", e)
-                return
+            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
         for row in rows or []:
             cf = row.get("custom_fields") or {}
             rmac = self._norm_mac(cf.get("mac_address", ""))
@@ -982,17 +979,11 @@ class SyncMixin:
         then EVERY device for the global MAC/serial index (2d95909). Now it
         pages everything once and keeps the tenant's rows in listing order
         (same order NetBox's ``?tenant=`` filter returns, so first-row-wins
-        indexing is unchanged). If the global listing fails it falls back to
-        the old tenant-scoped listing without global identities — exactly what
-        the old code ended up with when its global listing failed."""
+        indexing is unchanged). There is no tenant-only fallback: matching
+        without the global MAC/serial index mints cross-tenant duplicates."""
+        all_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
         if not run.tenant_slug:
-            return self._api_get_all("/api/dcim/devices/", {"limit": 500}), None
-        try:
-            all_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-        except Exception as e:
-            logger.debug("global MAC/serial index: %s", e)
-            return self._api_get_all("/api/dcim/devices/",
-                                     {"limit": 500, "tenant": run.tenant_slug}), None
+            return all_rows, None
         rows = [r for r in all_rows
                 if isinstance(r.get("tenant"), dict)
                 and r["tenant"].get("slug") == run.tenant_slug]
@@ -1806,8 +1797,8 @@ class SyncMixin:
                 for ifc in self.nb.dcim.interfaces.filter(device_id=dev_id):
                     existing_ifaces[str(getattr(ifc, "name", "") or "").lower()] = ifc
             except Exception as e:
-                logger.debug("sync_nw_device: list interfaces for %s failed: %s",
-                             dev_id, e)
+                logger.warning("sync_nw_device: list interfaces for %s failed: %s",
+                               dev_id, e)
 
             incoming_names: set = set()
             for ifc in (interfaces or []):
@@ -1833,6 +1824,11 @@ class SyncMixin:
                 vlan = str(ifc.get("vlan") or "").strip()
                 try:
                     match = existing_ifaces.get(ifname.lower())
+                    if match is None:
+                        # The device listing can miss an interface NetBox
+                        # already has; creating it again only fails as a dupe.
+                        match = self.nb.dcim.interfaces.get(device_id=dev_id,
+                                                            name=ifname)
                     if match is None:
                         ik: Dict[str, Any] = {"device": dev_id, "name": ifname,
                                               "type": "other", "status": status}

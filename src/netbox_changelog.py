@@ -82,11 +82,15 @@ class ChangelogMixin:
         back to a bare-IP lookup + reassign so the record isn't lost.
         """
         # Tenants have overlapping address space, each in its own VRF: create
-        # in the tenant's VRF and only reuse a record from that same VRF.
+        # in the tenant's VRF and only reuse a record from that same VRF. A
+        # tenant without a VRF lives in the global table, so it must not reuse
+        # (and retag) another tenant's VRF record.
         vrf_id = self._vrf_id_for_tenant(tenant) if tenant else None
         if vrf_id is not None:
             create_kwargs = {**create_kwargs, "vrf": vrf_id}
             lookup: Dict[str, Any] = {"vrf_id": vrf_id}
+        elif tenant:
+            lookup = {"vrf_id": "null"}
         else:
             lookup = {}
 
