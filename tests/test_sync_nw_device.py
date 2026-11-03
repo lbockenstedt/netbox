@@ -359,3 +359,29 @@ def test_sync_nw_device_keeps_a_type_and_role_someone_set():
     eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
     assert dev_obj.device_type.slug == "8325-48y8c"
     assert dev_obj.role.slug == "core"
+
+
+_SPEC = {"manufacturer": "Aruba", "model": "8325-48Y8C", "role": "switch", "u_height": 1,
+         "ports": [{"prefix": "1/1/", "start": 1, "count": 2, "type": "25gbase-x-sfp28"}],
+         "console": None, "power": []}
+
+
+def test_sync_nw_device_spec_builds_type_with_ports_and_replaces_bare_sku_type():
+    eng = _engine()
+    eng.nb.dcim.device_types.get = MagicMock(
+        side_effect=lambda slug=None, **kw: MagicMock(id=302 if slug == "aruba-8325-48y8c" else 301))
+    dev_obj = _generic_existing(eng, type_slug="aruba-jl635a", role_slug="switch")
+    dev = dict(_DEV, model="JL635A", object_type="cx_switch", spec=_SPEC)
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
+    assert res["status"] == "SUCCESS", res
+    assert dev_obj.device_type == 302
+    names = [c.kwargs["name"] for c in eng.nb.dcim.interface_templates.create.call_args_list]
+    assert names == ["1/1/1", "1/1/2"]
+
+
+def test_sync_nw_device_spec_never_replaces_a_type_someone_set():
+    eng = _engine()
+    dev_obj = _generic_existing(eng, type_slug="my-core-switch", role_slug="core")
+    dev = dict(_DEV, model="JL635A", object_type="cx_switch", spec=_SPEC)
+    eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
+    assert dev_obj.device_type.slug == "my-core-switch"
