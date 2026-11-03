@@ -187,7 +187,10 @@ class FakeNetBox(BaseAdapter):
                 else:
                     rows = [r for r in rows if _host(r["address"]) == addr]
             if one("vrf_id") is not None:
-                rows = [r for r in rows if str(r.get("vrf_id")) == one("vrf_id")]
+                want = None if one("vrf_id") == "null" else one("vrf_id")
+                rows = [r for r in rows
+                        if (r.get("vrf_id") is None if want is None
+                            else str(r.get("vrf_id")) == want)]
         if coll == "prefixes":
             rows = []  # no containing prefixes → sync falls back to /32
         if coll == "devices":
