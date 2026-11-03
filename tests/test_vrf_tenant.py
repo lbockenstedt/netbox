@@ -59,3 +59,24 @@ def test_mask_uses_only_tenant_vrf_prefixes():
                                 8: [ipaddress.ip_network("10.0.0.0/24")]}
     assert eng._mask_for_ip("10.0.0.5", SimpleNamespace(id=3)) == "16"
     assert eng._mask_for_ip("10.0.0.5") == "24"
+
+
+def test_global_ips_of_a_vrf_tenant_move_into_its_vrf():
+    # IPs created before the tenant got a VRF stay global until a sync moves
+    # them; one the VRF already holds is left (moving it would duplicate it).
+    eng = _engine([{"id": 7, "name": "acme"}])
+    eng._api_get_all = MagicMock(side_effect=[
+        [{"id": 1, "address": "10.0.0.5/24"}, {"id": 2, "address": "10.0.0.6/24"}],
+        [{"id": 9, "address": "10.0.0.6/24"}],
+    ])
+    out = eng._move_tenant_ips_to_vrf(SimpleNamespace(id=3))
+    assert eng._api_get_all.call_args_list[0][0][1]["vrf_id"] == "null"
+    eng.nb.ipam.ip_addresses.update.assert_called_once_with([{"id": 1, "vrf": 7}])
+    assert out == {"moved": 1, "conflicts": ["10.0.0.6/24"]}
+
+
+def test_tenant_without_vrf_moves_nothing():
+    eng = _engine([])
+    eng._api_get_all = MagicMock()
+    assert eng._move_tenant_ips_to_vrf(SimpleNamespace(id=3))["moved"] == 0
+    eng._api_get_all.assert_not_called()
