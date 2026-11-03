@@ -225,7 +225,7 @@ class SyncMixin:
         has_ip = isinstance(pip, dict) and bool(
             (pip.get("address") or "").split("/")[0].strip())
         cf = row.get("custom_fields") or {}
-        has_mac = bool(NetboxEngine._norm_mac(cf.get("mac_address", "")))
+        has_mac = bool(SyncMixin._norm_mac(cf.get("mac_address", "")))
         return has_ip or has_mac
 
     # ── perf FIX C: per-sync-run prefix prefetch for _mask_for_ip ────────────
