@@ -474,13 +474,49 @@ class SyncMixin:
             logger.warning("device_type_for_model '%s' failed: %s", model, e)
             return None
 
+    def _device_type_from_spec(self, spec: Dict[str, Any]):
+        """Get-or-create the device type (with port/console/power templates)
+        described by a hub-learned model spec. None when it can't be built."""
+        t = dict(spec, slug=self._slugify(f"{spec.get('manufacturer')}-{spec.get('model')}"))
+
+        def _fetch():
+            mfr, _ = self._seed_manufacturer(t["manufacturer"], {})
+            dt, _, _ = self._seed_device_type(t, mfr)
+            try:
+                self._seed_templates(dt, t)
+            except Exception as e:  # noqa: BLE001 — the type is still right
+                logger.warning("device type %s templates incomplete: %s", t["slug"], e)
+            return dt
+        try:
+            return self._cached_ref("device_type_spec", t["slug"], _fetch)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("device type from spec %s failed: %s", t["slug"], e)
+            return None
+
+    def _identified_device_type(self, model: str, manufacturer: str, spec: Any):
+        """The device type a feeder identified: the model spec's type when one
+        is known, else a bare type named after the reported model.
+        Returns ``(device_type|None, slugs it may replace)``."""
+        raw_slugs = {_GENERIC_SLUG}
+        if model:
+            raw_slugs.add(self._slugify(f"{manufacturer}-{model}" if manufacturer else model))
+        if isinstance(spec, dict) and spec.get("manufacturer") and spec.get("model"):
+            dt = self._device_type_from_spec(spec)
+            if dt is not None:
+                return dt, raw_slugs
+        return self._device_type_for_model(model, manufacturer), {_GENERIC_SLUG}
+
     @staticmethod
-    def _upgrade_generic_identity(devobj: Any, dtype: Any = None, role: Any = None) -> bool:
+    def _upgrade_generic_identity(devobj: Any, dtype: Any = None, role: Any = None,
+                                  replaceable_types: Any = (_GENERIC_SLUG,)) -> bool:
         """Move a device off the generic 'discovered' type/role once a feeder
-        has identified it. A type or role someone set is never replaced.
-        Returns True when ``devobj`` changed (the caller saves)."""
+        has identified it. A type or role someone set is never replaced; only
+        the generic type or a bare type LM named after the reported model
+        (``replaceable_types``). Returns True when ``devobj`` changed."""
         changed = False
-        if dtype is not None and _ref_slug(getattr(devobj, "device_type", None)) == _GENERIC_SLUG:
+        current_type = _ref_slug(getattr(devobj, "device_type", None))
+        if (dtype is not None and current_type in replaceable_types
+                and current_type != _ref_slug(dtype)):
             devobj.device_type = dtype.id
             changed = True
         if role is not None and _ref_slug(getattr(devobj, "role", None)) == _GENERIC_SLUG:
@@ -1693,6 +1729,10 @@ class SyncMixin:
             model = str(dev.get("model") or "").strip()
             ident_role, ident_mfr = _NW_OBJECT_TYPE_IDENTITY.get(
                 str(dev.get("object_type") or "").strip().lower(), ("", ""))
+            # Hub-learned model spec (LLM-identified once per model).
+            spec = dev.get("spec") if isinstance(dev.get("spec"), dict) else None
+            if spec and not ident_role and spec.get("role") != "other":
+                ident_role = str(spec.get("role") or "")
             if not name and not nw_id:
                 return {"status": "ERROR", "message": "nw device has no name/id",
                         "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
@@ -1736,7 +1776,7 @@ class SyncMixin:
             if existing is None:
                 # The polled model and object_type identify the device; the
                 # configured defaults only fill in what they can't.
-                model_dt = self._device_type_for_model(model, ident_mfr)
+                model_dt, _ = self._identified_device_type(model, ident_mfr, spec)
                 dt_slug = str(defaults.get("device_type") or "").strip()
                 role_slug = ident_role or str(defaults.get("role") or "").strip()
                 site_slug = str(defaults.get("site") or "").strip()
@@ -1839,9 +1879,11 @@ class SyncMixin:
                         devobj.serial = serial
                     # The device may have been created generic by an ARP/DHCP
                     # feed before this poll learned what it is.
+                    known_dt, replaceable = self._identified_device_type(model, ident_mfr, spec)
                     self._upgrade_generic_identity(
-                        devobj, self._device_type_for_model(model, ident_mfr),
-                        self._ensure_device_role(ident_role) if ident_role else None)
+                        devobj, known_dt,
+                        self._ensure_device_role(ident_role) if ident_role else None,
+                        replaceable)
                     devobj.save()
                 except Exception as e:
                     logger.debug("sync_nw_device: refresh device cf skipped: %s", e)
