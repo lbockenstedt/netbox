@@ -231,13 +231,15 @@ def test_other_tenants_mac_is_adopted_and_tenant_rows_win():
     assert len(f.db["devices"]) == 1
 
 
-def test_global_listing_failure_falls_back_to_the_tenant_listing():
+def test_global_listing_failure_fails_the_sync_instead_of_duplicating():
+    # Matching on the tenant's rows alone can't see another tenant's record of
+    # the same MAC/serial, so it would mint a copy: fail and retry instead.
     f, feed = _world(n_owned=2)
+    before = dict(f.db["devices"])
     f.fail.add(("GET", "devices", "list-global"))
     _, res = _sync(f, feed)
-    assert res["status"] == "SUCCESS", res
-    assert res["pushed"] == 2 and len(f.db["devices"]) == 2  # matched, not duplicated
-    assert any(x[1] == "/api/dcim/devices/" and "tenant=t1" in x[2] for x in _gets(f))
+    assert res["status"] == "ERROR", res
+    assert f.db["devices"] == before
 
 
 def test_replace_delete_of_a_device_already_gone_is_a_silent_noop():
