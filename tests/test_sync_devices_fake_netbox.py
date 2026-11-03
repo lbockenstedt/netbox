@@ -300,3 +300,18 @@ def test_matched_device_keeps_a_type_someone_set():
     feed[0].update(model="JL635A", manufacturer="Aruba")
     _sync(f, feed)
     assert f.db["devices"][100]["device_type_id"] == 42
+
+
+def test_record_spec_enriches_the_bare_model_type_and_sets_role():
+    f, feed = _world(n_owned=1)
+    f.add("device-types", {"id": 42, "slug": "juniper-srx345", "model": "SRX345"})
+    f.db["devices"][100]["device_type_id"] = 42
+    spec = {"manufacturer": "Juniper", "model": "SRX345", "role": "firewall",
+            "u_height": 1, "ports": [], "power": [], "console": None,
+            "comments": "Juniper SRX345 firewall"}
+    feed[0].update(model="SRX345", manufacturer="Juniper", role="firewall", spec=spec)
+    _sync(f, feed)
+    dev = f.db["devices"][100]
+    assert dev["device_type_id"] == 42                       # same model: type enriched in place
+    assert f.db["device-types"][42]["comments"] == "Juniper SRX345 firewall"
+    assert f.db["device-roles"][dev["role_id"]]["slug"] == "firewall"
