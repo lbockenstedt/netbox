@@ -124,7 +124,8 @@ def test_sync_nw_device_adopts_interface_the_listing_missed():
 
 def test_sync_nw_device_missing_defaults_errors_named():
     eng = _engine()
-    res = eng.sync_nw_device(device=_DEV, interfaces=[{"name": "vlan1"}],
+    unidentified = dict(_DEV, object_type="")
+    res = eng.sync_nw_device(device=unidentified, interfaces=[{"name": "vlan1"}],
                              tenant_slug="", defaults={})
     assert res["status"] == "ERROR"
     assert "device_type" in res["message"]
@@ -313,3 +314,48 @@ def test_sync_nw_device_filters_tenant_devices_by_tenant_id():
               if "dcim/devices" in c.args[0]]
     assert params and params[0].get("tenant_id") == 7
     assert "tenant" not in params[0]
+
+
+def test_sync_nw_device_create_takes_type_from_model_and_role_from_object_type():
+    eng = _engine()
+    eng.nb.dcim.devices.create = MagicMock(return_value=_Obj(id=7, name="SW1"))
+    dev = dict(_DEV, model="JL635A", object_type="cx_switch")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="",
+                             defaults={"site": "site1"})
+    assert res["status"] == "SUCCESS", res
+    eng.nb.dcim.device_types.get.assert_any_call(slug="aruba-jl635a")
+    eng.nb.dcim.device_roles.get.assert_any_call(slug="switch")
+    kwargs = eng.nb.dcim.devices.create.call_args.kwargs
+    assert kwargs["device_type"] == 301 and kwargs["role"] == 401
+
+
+def _generic_existing(eng, type_slug="discovered", role_slug="discovered"):
+    existing_row = {"id": 7, "name": "sw1",
+                    "custom_fields": {"nw_device_id": "nw-1"}}
+    dev_obj = _Obj(id=7, name="sw1", custom_fields={"nw_device_id": "nw-1"})
+    dev_obj.device_type = MagicMock(slug=type_slug)
+    dev_obj.role = MagicMock(slug=role_slug)
+    eng._api_get_all.side_effect = (
+        lambda path, params=None, **kw: [existing_row] if "dcim/devices" in path else [])
+    eng.nb.dcim.devices.get = MagicMock(return_value=dev_obj)
+    return dev_obj
+
+
+def test_sync_nw_device_upgrades_generic_existing_device_type_and_role():
+    eng = _engine()
+    dev_obj = _generic_existing(eng)
+    dev = dict(_DEV, model="JL635A", object_type="cx_switch")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
+    assert res["status"] == "SUCCESS", res
+    assert dev_obj.device_type == 301
+    assert dev_obj.role == 401
+    dev_obj.save.assert_called()
+
+
+def test_sync_nw_device_keeps_a_type_and_role_someone_set():
+    eng = _engine()
+    dev_obj = _generic_existing(eng, type_slug="8325-48y8c", role_slug="core")
+    dev = dict(_DEV, model="JL635A", object_type="cx_switch")
+    eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
+    assert dev_obj.device_type.slug == "8325-48y8c"
+    assert dev_obj.role.slug == "core"
