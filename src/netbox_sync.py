@@ -38,6 +38,24 @@ _DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
 # Y"). The incoming record uses the same names (``_incoming_device_record``).
 _SWITCH_CF_KEYS = ("switch_name", "switch_ip", "switch_port")
 
+# The placeholder type/role slug for a device nobody has identified yet.
+_GENERIC_SLUG = "discovered"
+
+# nw poll ``object_type`` -> (device role slug, manufacturer).
+_NW_OBJECT_TYPE_IDENTITY = {
+    "aos_switch": ("switch", "Aruba"),
+    "cx_switch": ("switch", "Aruba"),
+    "ex_switch": ("switch", "Juniper"),
+    "gateway": ("gateway", "Aruba"),
+}
+
+
+def _ref_slug(ref: Any) -> str:
+    """Slug of a nested NetBox reference (listing dict or pynetbox record)."""
+    if isinstance(ref, dict):
+        return str(ref.get("slug") or "")
+    return str(getattr(ref, "slug", "") or "")
+
 
 def _normalize_source_tag(source: Any) -> str:
     """The ``discovered_from`` ownership tag for a sync ``source``: the
@@ -455,6 +473,20 @@ class SyncMixin:
         except Exception as e:
             logger.warning("device_type_for_model '%s' failed: %s", model, e)
             return None
+
+    @staticmethod
+    def _upgrade_generic_identity(devobj: Any, dtype: Any = None, role: Any = None) -> bool:
+        """Move a device off the generic 'discovered' type/role once a feeder
+        has identified it. A type or role someone set is never replaced.
+        Returns True when ``devobj`` changed (the caller saves)."""
+        changed = False
+        if dtype is not None and _ref_slug(getattr(devobj, "device_type", None)) == _GENERIC_SLUG:
+            devobj.device_type = dtype.id
+            changed = True
+        if role is not None and _ref_slug(getattr(devobj, "role", None)) == _GENERIC_SLUG:
+            devobj.role = role.id
+            changed = True
+        return changed
 
     def _resolve_site(self, slug: str = "", tenant=None):
         """Resolve a site for device creation. Configured slug first; else the
@@ -1215,6 +1247,7 @@ class SyncMixin:
         rname = str(row.get("name") or "").strip().lower()
         if rname:
             run.used_names.add(rname)
+        self._identify_matched_device(run, d, row)
         if run.source_of_truth == "netbox":
             self._fill_device_gaps(run, row, d.hostname, d.mac)
             self._touch_last_seen_if_stale(run, row, d.key, "last_seen refresh")
@@ -1223,6 +1256,30 @@ class SyncMixin:
             self._stamp_matched_device_fields(run, d, row)
             self._rename_or_touch_matched_device(run, d, row)
         run.pushed += 1
+
+    def _identify_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                                 row: dict) -> None:
+        """Give a matched device the real type/role this record carries when
+        the device is still generic. Types and roles are otherwise set on
+        create only, so a device first seen by an ARP/DHCP feed stayed
+        'Discovered' even after the console/poll learned its model.
+        Best-effort."""
+        model = d.rec.get("model", "")
+        rec_role = d.rec.get("role", "")
+        if not (model or rec_role):
+            return
+        if (_ref_slug(row.get("device_type")) != _GENERIC_SLUG
+                and _ref_slug(row.get("role")) != _GENERIC_SLUG):
+            return
+        try:
+            devobj = self._device_record(run, row["id"])
+            dtype = self._device_type_for_model(model, d.rec.get("manufacturer", ""))
+            role = self._ensure_device_role(rec_role) if rec_role else None
+            if devobj and self._upgrade_generic_identity(devobj, dtype, role):
+                devobj.save()
+        except Exception as e:
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: identify %s failed: %s", d.key, e)
 
     def _touch_last_seen_if_stale(self, run: "_DeviceSyncRun", row: dict, key: str,
                                   what: str) -> None:
@@ -1609,10 +1666,12 @@ class SyncMixin:
         set — so NetBox tracks the live switch without touching manually-created
         interfaces.
 
-        ``defaults`` (``device_type``/``role``/``site`` slugs) are required to
-        CREATE a device; an existing match needs only an interface refresh. A
-        missing default on the create path returns an ERROR naming it (never
-        silently fail).
+        On CREATE the polled ``model`` gives the device_type and the
+        ``object_type`` the role (switch/gateway); ``defaults`` (``device_type``/
+        ``role``/``site`` slugs) fill what the poll can't — site always. A
+        missing value returns an ERROR naming it (never silently fail). An
+        existing match still on the generic 'discovered' type/role is upgraded
+        the same way.
 
         Returns ``{status, pushed, errors, skipped, deleted, interfaces_total,
         device_id, message}``.
@@ -1631,6 +1690,9 @@ class SyncMixin:
             if not re.fullmatch(r"[0-9a-f]{12}", re.sub(r"[:.\-]", "", base_mac)):
                 base_mac = ""
             mgmt_ip = str(dev.get("address") or "").strip().split("/")[0].strip()
+            model = str(dev.get("model") or "").strip()
+            ident_role, ident_mfr = _NW_OBJECT_TYPE_IDENTITY.get(
+                str(dev.get("object_type") or "").strip().lower(), ("", ""))
             if not name and not nw_id:
                 return {"status": "ERROR", "message": "nw device has no name/id",
                         "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
@@ -1672,10 +1734,13 @@ class SyncMixin:
 
             # ── Create the device if missing (defaults required) ────────────────
             if existing is None:
+                # The polled model and object_type identify the device; the
+                # configured defaults only fill in what they can't.
+                model_dt = self._device_type_for_model(model, ident_mfr)
                 dt_slug = str(defaults.get("device_type") or "").strip()
-                role_slug = str(defaults.get("role") or "").strip()
+                role_slug = ident_role or str(defaults.get("role") or "").strip()
                 site_slug = str(defaults.get("site") or "").strip()
-                missing = [k for k, v in (("device_type", dt_slug),
+                missing = [k for k, v in (("device_type", model_dt or dt_slug),
                                          ("role", role_slug),
                                          ("site", site_slug)) if not v]
                 if missing:
@@ -1687,20 +1752,15 @@ class SyncMixin:
                             "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                             "interfaces_total": len(interfaces or []), "device_id": None}
                 try:
-                    dt = self.nb.dcim.device_types.get(slug=dt_slug)
-                    # Prefer the device_type resolved from the polled hardware
-                    # model (real type, e.g. 'Aruba 2930F') over the generic
-                    # default; a resolved model type also satisfies the required
-                    # device_type even when the default slug is unset/missing.
-                    model_dt = self._device_type_for_model(
-                        str(dev.get("model") or "").strip())
-                    if model_dt:
-                        dt = model_dt
+                    dt = model_dt or self.nb.dcim.device_types.get(slug=dt_slug)
                     # perf-scan D1b: role + site TTL-cached — a fleet POLL NOW
                     # otherwise re-fetches the same two slugs once per device.
-                    role = self._cached_ref(
-                        "device_role", role_slug,
-                        lambda: self.nb.dcim.device_roles.get(slug=role_slug))
+                    if ident_role:
+                        role = self._ensure_device_role(ident_role)
+                    else:
+                        role = self._cached_ref(
+                            "device_role", role_slug,
+                            lambda: self.nb.dcim.device_roles.get(slug=role_slug))
                     site = self._cached_ref(
                         "site", site_slug,
                         lambda: self.nb.dcim.sites.get(slug=site_slug))
@@ -1777,6 +1837,11 @@ class SyncMixin:
                     # serial another feeder already set.
                     if serial and not str(getattr(devobj, "serial", "") or "").strip():
                         devobj.serial = serial
+                    # The device may have been created generic by an ARP/DHCP
+                    # feed before this poll learned what it is.
+                    self._upgrade_generic_identity(
+                        devobj, self._device_type_for_model(model, ident_mfr),
+                        self._ensure_device_role(ident_role) if ident_role else None)
                     devobj.save()
                 except Exception as e:
                     logger.debug("sync_nw_device: refresh device cf skipped: %s", e)
