@@ -61,22 +61,42 @@ def test_mask_uses_only_tenant_vrf_prefixes():
     assert eng._mask_for_ip("10.0.0.5") == "24"
 
 
+def _api_get_all(stale, prefixes, in_vrf):
+    def get_all(path, params):
+        if "prefixes" in path:
+            return prefixes
+        return stale if params.get("vrf_id") == "null" else in_vrf.get(params["vrf_id"], [])
+    return MagicMock(side_effect=get_all)
+
+
 def test_global_ips_of_a_vrf_tenant_move_into_its_vrf():
     # IPs created before the tenant got a VRF stay global until a sync moves
     # them; one the VRF already holds is left (moving it would duplicate it).
     eng = _engine([{"id": 7, "name": "acme"}])
-    eng._api_get_all = MagicMock(side_effect=[
+    eng._api_get_all = _api_get_all(
         [{"id": 1, "address": "10.0.0.5/24"}, {"id": 2, "address": "10.0.0.6/24"}],
-        [{"id": 9, "address": "10.0.0.6/24"}],
-    ])
+        [], {7: [{"id": 9, "address": "10.0.0.6/24"}]})
     out = eng._move_tenant_ips_to_vrf(SimpleNamespace(id=3))
-    assert eng._api_get_all.call_args_list[0][0][1]["vrf_id"] == "null"
     eng.nb.ipam.ip_addresses.update.assert_called_once_with([{"id": 1, "vrf": 7}])
     assert out == {"moved": 1, "conflicts": ["10.0.0.6/24"]}
 
 
-def test_tenant_without_vrf_moves_nothing():
+def test_global_ips_move_into_the_vrf_of_their_prefix():
+    # A tenant's prefix can sit in a shared VRF it does not own: the IP goes
+    # to its most specific prefix's VRF; one under a global prefix stays.
     eng = _engine([])
-    eng._api_get_all = MagicMock()
+    eng._api_get_all = _api_get_all(
+        [{"id": 1, "address": "172.21.1.5/24"}, {"id": 2, "address": "192.168.1.5/24"}],
+        [{"prefix": "172.21.0.0/16", "vrf": {"id": 4}},
+         {"prefix": "172.21.1.0/24", "vrf": {"id": 5}},
+         {"prefix": "192.168.1.0/24", "vrf": None}], {})
+    out = eng._move_tenant_ips_to_vrf(SimpleNamespace(id=3))
+    eng.nb.ipam.ip_addresses.update.assert_called_once_with([{"id": 1, "vrf": 5}])
+    assert out["moved"] == 1
+
+
+def test_tenant_without_vrf_or_prefixes_moves_nothing():
+    eng = _engine([])
+    eng._api_get_all = _api_get_all([{"id": 1, "address": "10.0.0.5/24"}], [], {})
     assert eng._move_tenant_ips_to_vrf(SimpleNamespace(id=3))["moved"] == 0
-    eng._api_get_all.assert_not_called()
+    eng.nb.ipam.ip_addresses.update.assert_not_called()
