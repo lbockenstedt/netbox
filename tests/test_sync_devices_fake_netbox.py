@@ -281,3 +281,22 @@ def test_netbox_source_of_truth_fills_only_empty_values_delta_only():
     assert f.db["ip-addresses"][102]["dns_name"] == "x"  # empty → filled
     dev_patches = [x[3] for x in _writes(f) if x[1] == "/api/dcim/devices/100/"]
     assert {"custom_fields": {"mac_address": "aa:bb:cc:05:05:05"}} in dev_patches
+
+
+def test_matched_generic_device_takes_the_records_model_and_role():
+    f, feed = _world(n_owned=1)
+    feed[0].update(model="JL635A", manufacturer="Aruba", role="switch")
+    _sync(f, feed)
+    dev = f.db["devices"][100]
+    dtype = f.db["device-types"][dev["device_type_id"]]
+    assert dtype["model"] == "JL635A"
+    assert f.db["device-roles"][dev["role_id"]]["slug"] == "switch"
+
+
+def test_matched_device_keeps_a_type_someone_set():
+    f, feed = _world(n_owned=1)
+    f.add("device-types", {"id": 42, "slug": "8325-48y8c", "model": "8325-48Y8C"})
+    f.db["devices"][100]["device_type_id"] = 42
+    feed[0].update(model="JL635A", manufacturer="Aruba")
+    _sync(f, feed)
+    assert f.db["devices"][100]["device_type_id"] == 42
