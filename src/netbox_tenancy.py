@@ -1,4 +1,5 @@
 """Tenancy + DHCP-prefix read methods for NetboxEngine."""
+import ipaddress
 import logging
 from typing import Any, Dict
 
@@ -39,28 +40,70 @@ class TenancyMixin:
 
         return self._cached_ref("vrf_tenant", str(tid), _fetch)
 
-    def _move_tenant_ips_to_vrf(self, tenant: Any) -> Dict[str, Any]:
-        """Move ``tenant``'s IP addresses still in the global table into the
-        tenant's VRF. IPs created before the tenant had a VRF stayed global,
-        and the syncs only update a matched IP in place, so nothing moved them.
-        An address the VRF already holds is left alone and reported (moving it
-        would make a duplicate). Best-effort; never raises."""
-        result: Dict[str, Any] = {"moved": 0, "conflicts": []}
-        vrf_id = self._vrf_id_for_tenant(tenant)
-        if vrf_id is None:
-            return result
-        tid = tenant if isinstance(tenant, int) else (
+    @staticmethod
+    def _tenant_id(tenant: Any):
+        if tenant is None or tenant == "":
+            return None
+        return tenant if isinstance(tenant, int) else (
             tenant.get("id") if isinstance(tenant, dict) else getattr(tenant, "id", None))
+
+    def _tenant_prefix_vrfs(self, tid):
+        """``[(prefix, vrf_id|None)]`` for the tenant's prefixes (TTL-cached)."""
+        def _fetch():
+            rows = self._api_get_all("/api/ipam/prefixes/", {"tenant_id": tid, "limit": 500})
+            return [(r["prefix"], (r.get("vrf") or {}).get("id")) for r in rows or []]
+        return self._cached_ref("tenant_prefixes", str(tid), _fetch) or []
+
+    def _vrf_id_for_ip(self, tenant: Any, ip: str):
+        """The VRF an IP of ``tenant`` belongs in: the VRF of the tenant's most
+        specific prefix containing it (None when that prefix is in the global
+        table). With no containing prefix, the VRF the tenant owns. A tenant
+        can have prefixes in a VRF it does not own (a shared VRF), so the
+        prefix, not VRF ownership, decides."""
+        tid = self._tenant_id(tenant)
+        if tid is None:
+            return None
+
+        try:
+            addr = ipaddress.ip_address(str(ip).split("/")[0])
+            best = None
+            for prefix, vrf in self._tenant_prefix_vrfs(tid):
+                net = ipaddress.ip_network(prefix, strict=False)
+                if addr in net and (best is None or net.prefixlen > best[0]):
+                    best = (net.prefixlen, vrf)
+        except Exception as e:
+            logger.debug("vrf for ip %s (tenant id=%s) failed: %s", ip, tid, e)
+            best = None
+        return best[1] if best else self._vrf_id_for_tenant(tenant)
+
+    def _move_tenant_ips_to_vrf(self, tenant: Any) -> Dict[str, Any]:
+        """Move ``tenant``'s IP addresses still in the global table into the VRF
+        they belong in (``_vrf_id_for_ip``). IPs created before the VRFs
+        existed stayed global, and the syncs only update a matched IP in place,
+        so nothing moved them. An address the VRF already holds is left alone
+        and reported (moving it would make a duplicate). Best-effort; never
+        raises."""
+        result: Dict[str, Any] = {"moved": 0, "conflicts": []}
+        tid = self._tenant_id(tenant)
+        if tid is None:
+            return result
+        if self._vrf_id_for_tenant(tenant) is None and not any(
+                vrf for _, vrf in self._tenant_prefix_vrfs(tid)):
+            return result
         try:
             stale = self._api_get_all("/api/ipam/ip-addresses/",
                                       {"tenant_id": tid, "vrf_id": "null", "limit": 500})
-            if not stale:
-                return result
-            in_vrf = {r["address"].split("/")[0] for r in self._api_get_all(
-                "/api/ipam/ip-addresses/", {"vrf_id": vrf_id, "limit": 500})}
+            in_vrf: Dict[Any, set] = {}
             moves = []
-            for r in stale:
-                if r["address"].split("/")[0] in in_vrf:
+            for r in stale or []:
+                bare = r["address"].split("/")[0]
+                vrf_id = self._vrf_id_for_ip(tenant, bare)
+                if vrf_id is None:
+                    continue
+                if vrf_id not in in_vrf:
+                    in_vrf[vrf_id] = {x["address"].split("/")[0] for x in self._api_get_all(
+                        "/api/ipam/ip-addresses/", {"vrf_id": vrf_id, "limit": 500})}
+                if bare in in_vrf[vrf_id]:
                     result["conflicts"].append(r["address"])
                 else:
                     moves.append({"id": r["id"], "vrf": vrf_id})
@@ -68,11 +111,10 @@ class TenancyMixin:
                 self.nb.ipam.ip_addresses.update(moves[i:i + 100])
                 result["moved"] += len(moves[i:i + 100])
         except Exception as e:
-            logger.warning("[sync-error] move tenant id=%s IPs into VRF %s failed: %s",
-                           tid, vrf_id, e)
+            logger.warning("[sync-error] move tenant id=%s global IPs into VRFs failed: %s", tid, e)
         if result["moved"] or result["conflicts"]:
-            logger.info("tenant id=%s: moved %d global IPs into VRF %s; %d already in the "
-                        "VRF left global: %s", tid, result["moved"], vrf_id,
+            logger.info("tenant id=%s: moved %d global IPs into VRFs; %d already in the "
+                        "VRF left global: %s", tid, result["moved"],
                         len(result["conflicts"]), ", ".join(result["conflicts"][:20]))
         return result
 
