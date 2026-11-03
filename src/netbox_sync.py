@@ -1001,6 +1001,8 @@ class SyncMixin:
         role = str(dev.get("role") or "").strip()
         if role:
             rec["role"] = role
+        if isinstance(dev.get("spec"), dict):
+            rec["spec"] = dev["spec"]
         rec_cfs = dev.get("custom_fields")
         if isinstance(rec_cfs, dict) and rec_cfs:
             rec["custom_fields"] = {str(k): ("" if v is None else str(v))
@@ -1304,14 +1306,16 @@ class SyncMixin:
         rec_role = d.rec.get("role", "")
         if not (model or rec_role):
             return
-        if (_ref_slug(row.get("device_type")) != _GENERIC_SLUG
+        mfr = d.rec.get("manufacturer", "")
+        raw_type = self._slugify(f"{mfr}-{model}" if mfr else model) if model else ""
+        if (_ref_slug(row.get("device_type")) not in (_GENERIC_SLUG, raw_type)
                 and _ref_slug(row.get("role")) != _GENERIC_SLUG):
             return
         try:
             devobj = self._device_record(run, row["id"])
-            dtype = self._device_type_for_model(model, d.rec.get("manufacturer", ""))
+            dtype, replaceable = self._identified_device_type(model, mfr, d.rec.get("spec"))
             role = self._ensure_device_role(rec_role) if rec_role else None
-            if devobj and self._upgrade_generic_identity(devobj, dtype, role):
+            if devobj and self._upgrade_generic_identity(devobj, dtype, role, replaceable):
                 devobj.save()
         except Exception as e:
             run.forget_device(row["id"])
@@ -1604,8 +1608,8 @@ class SyncMixin:
         create_role = self._ensure_device_role(rec_role) if rec_role else run.role
         if create_role:
             kwargs["role"] = create_role.id
-        rec_dtype = self._device_type_for_model(
-            d.rec.get("model", ""), d.rec.get("manufacturer", "")) or run.dtype
+        rec_dtype = self._identified_device_type(
+            d.rec.get("model", ""), d.rec.get("manufacturer", ""), d.rec.get("spec"))[0] or run.dtype
         if rec_dtype:
             kwargs["device_type"] = rec_dtype.id
         if run.site:
