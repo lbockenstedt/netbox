@@ -1806,8 +1806,8 @@ class SyncMixin:
                 for ifc in self.nb.dcim.interfaces.filter(device_id=dev_id):
                     existing_ifaces[str(getattr(ifc, "name", "") or "").lower()] = ifc
             except Exception as e:
-                logger.debug("sync_nw_device: list interfaces for %s failed: %s",
-                             dev_id, e)
+                logger.warning("sync_nw_device: list interfaces for %s failed: %s",
+                               dev_id, e)
 
             incoming_names: set = set()
             for ifc in (interfaces or []):
@@ -1833,6 +1833,11 @@ class SyncMixin:
                 vlan = str(ifc.get("vlan") or "").strip()
                 try:
                     match = existing_ifaces.get(ifname.lower())
+                    if match is None:
+                        # The device listing can miss an interface NetBox
+                        # already has; creating it again only fails as a dupe.
+                        match = self.nb.dcim.interfaces.get(device_id=dev_id,
+                                                            name=ifname)
                     if match is None:
                         ik: Dict[str, Any] = {"device": dev_id, "name": ifname,
                                               "type": "other", "status": status}
