@@ -39,6 +39,43 @@ class TenancyMixin:
 
         return self._cached_ref("vrf_tenant", str(tid), _fetch)
 
+    def _move_tenant_ips_to_vrf(self, tenant: Any) -> Dict[str, Any]:
+        """Move ``tenant``'s IP addresses still in the global table into the
+        tenant's VRF. IPs created before the tenant had a VRF stayed global,
+        and the syncs only update a matched IP in place, so nothing moved them.
+        An address the VRF already holds is left alone and reported (moving it
+        would make a duplicate). Best-effort; never raises."""
+        result: Dict[str, Any] = {"moved": 0, "conflicts": []}
+        vrf_id = self._vrf_id_for_tenant(tenant)
+        if vrf_id is None:
+            return result
+        tid = tenant if isinstance(tenant, int) else (
+            tenant.get("id") if isinstance(tenant, dict) else getattr(tenant, "id", None))
+        try:
+            stale = self._api_get_all("/api/ipam/ip-addresses/",
+                                      {"tenant_id": tid, "vrf_id": "null", "limit": 500})
+            if not stale:
+                return result
+            in_vrf = {r["address"].split("/")[0] for r in self._api_get_all(
+                "/api/ipam/ip-addresses/", {"vrf_id": vrf_id, "limit": 500})}
+            moves = []
+            for r in stale:
+                if r["address"].split("/")[0] in in_vrf:
+                    result["conflicts"].append(r["address"])
+                else:
+                    moves.append({"id": r["id"], "vrf": vrf_id})
+            for i in range(0, len(moves), 100):
+                self.nb.ipam.ip_addresses.update(moves[i:i + 100])
+                result["moved"] += len(moves[i:i + 100])
+        except Exception as e:
+            logger.warning("[sync-error] move tenant id=%s IPs into VRF %s failed: %s",
+                           tid, vrf_id, e)
+        if result["moved"] or result["conflicts"]:
+            logger.info("tenant id=%s: moved %d global IPs into VRF %s; %d already in the "
+                        "VRF left global: %s", tid, result["moved"], vrf_id,
+                        len(result["conflicts"]), ", ".join(result["conflicts"][:20]))
+        return result
+
     def _vrf_id_for_tenant_slug(self, tenant_slug: str):
         """Like ``_vrf_id_for_tenant`` but resolves a tenant slug first."""
         if not tenant_slug:

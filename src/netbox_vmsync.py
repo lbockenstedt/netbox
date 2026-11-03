@@ -595,6 +595,8 @@ class VmSyncMixin:
             # Confirmed result (found, or a genuine "no such tenant" None) — safe
             # to memoize for the run.
             tenant_cache[s] = t
+            if t:
+                self._move_tenant_ips_to_vrf(t)
             return t
 
         try:
