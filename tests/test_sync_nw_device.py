@@ -65,6 +65,7 @@ def _engine(existing_devices=None, existing_ifaces=None, tenant_rows=None):
     eng.nb.dcim.devices.get = MagicMock(return_value=None)
     # interfaces.filter → the existing interface stand-ins for the device
     eng.nb.dcim.interfaces.filter = MagicMock(return_value=list(existing_ifaces or []))
+    eng.nb.dcim.interfaces.get = MagicMock(return_value=None)
     # IP reuse: no existing → create path
     eng.nb.ipam.ip_addresses.get = MagicMock(return_value=None)
     eng.nb.ipam.ip_addresses.create = MagicMock(return_value=_Obj(id=9000))
@@ -99,6 +100,26 @@ def test_sync_nw_device_creates_device_interfaces_and_primary_ip():
     assert eng.nb.dcim.interfaces.create.call_count == 2
     # primary_ip4 set from the management-address interface IP.
     assert dev_obj.primary_ip4 == 9000
+
+
+def test_sync_nw_device_adopts_interface_the_listing_missed():
+    # NetBox already has vlan1 on the device but the listing came back empty:
+    # update it in place instead of a create that 400s as a duplicate.
+    existing_row = {"id": 7, "name": "sw1",
+                    "custom_fields": {"nw_device_id": "nw-1"}}
+    eng = _engine(existing_devices=[existing_row])
+    eng.nb.dcim.devices.get = MagicMock(return_value=_Obj(id=7, name="sw1"))
+    vlan1 = _Obj(name="vlan1", status="planned")
+    eng.nb.dcim.interfaces.get = MagicMock(return_value=vlan1)
+
+    res = eng.sync_nw_device(device=_DEV,
+                             interfaces=[{"name": "vlan1", "status": "up"}],
+                             tenant_slug="", defaults=_DEFAULTS)
+
+    assert res["errors"] == 0, res
+    eng.nb.dcim.interfaces.create.assert_not_called()
+    eng.nb.dcim.interfaces.get.assert_called_with(device_id=7, name="vlan1")
+    assert vlan1.status == "active"
 
 
 def test_sync_nw_device_missing_defaults_errors_named():
