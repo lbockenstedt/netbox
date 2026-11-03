@@ -385,3 +385,13 @@ def test_sync_nw_device_spec_never_replaces_a_type_someone_set():
     dev = dict(_DEV, model="JL635A", object_type="cx_switch", spec=_SPEC)
     eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults={})
     assert dev_obj.device_type.slug == "my-core-switch"
+
+
+def test_sync_nw_device_empty_poll_never_wipes_interfaces():
+    eng = _engine()
+    _generic_existing(eng, type_slug="x", role_slug="y")
+    port = _Obj(name="1/1/1", custom_fields={"nw_managed": "true"})
+    eng.nb.dcim.interfaces.filter = MagicMock(return_value=[port])
+    res = eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults={})
+    assert res["deleted"] == 0
+    port.delete.assert_not_called()

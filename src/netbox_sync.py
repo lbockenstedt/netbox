@@ -2014,7 +2014,10 @@ class SyncMixin:
                     logger.debug("sync_nw_device: iface %s failed: %s", ifname, e)
 
             # ── Replace-delete: drop nw-managed interfaces no longer reported ──
-            for ifname_l, ifc_obj in list(existing_ifaces.items()):
+            # A poll that returned no interfaces at all failed to read them
+            # (spoke restarting, CLI timeout); it never means the box lost
+            # every port, so it must not wipe the device's interfaces.
+            for ifname_l, ifc_obj in (list(existing_ifaces.items()) if incoming_names else []):
                     if ifname_l in incoming_names:
                         continue
                     try:
