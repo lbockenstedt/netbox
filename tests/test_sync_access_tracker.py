@@ -44,6 +44,7 @@ def _engine_with(existing_rows, tenant_obj=None):
     # Default: no pre-existing global IP → _reuse_or_create_ip creates. Tests
     # that need the reuse path override ip_addresses.get.return_value.
     eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.dcim.interfaces.get.return_value = None
     eng._api_get_all = MagicMock(return_value=existing_rows)
     eng._api_get = MagicMock(return_value={"results": []})
     return eng
@@ -308,3 +309,39 @@ def test_sync_access_tracker_matches_existing_by_ip_no_duplicate_and_backfills_m
     eng.nb.dcim.devices.create.assert_not_called()
     # MAC backfilled onto the matched device (was missing).
     assert matched_dev.custom_fields.get("mac_address") == "11:22:33:44:55:66"
+
+
+def test_sync_access_tracker_fills_missing_ip_on_existing_same_tenant_device():
+    # Device exists by MAC (re-created from a MAC table) but has no IP → the
+    # framed IP becomes its primary IP; no new device.
+    row = {"id": 77, "name": "DEVICE-AABBCCDDEEFF", "tenant": {"id": 1},
+           "primary_ip4": None,
+           "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:ff",
+                             "discovered_from": "Network Devices"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=77, name="DEVICE-AABBCCDDEEFF")
+    eng.nb.dcim.devices.get.return_value = dev
+    eng.nb.dcim.interfaces.create.return_value = _Iface(id=100)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+
+    res = eng.sync_access_tracker(
+        sessions=[{"mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.5"}],
+        tenant_slug="lrb", defaults={})
+
+    assert res["pushed"] == 1
+    eng.nb.dcim.devices.create.assert_not_called()
+    assert dev.primary_ip4 == 555
+
+
+def test_sync_access_tracker_does_not_put_ip_on_other_tenant_device():
+    row = {"id": 77, "name": "DEVICE-AABBCCDDEEFF", "tenant": {"id": 2},
+           "primary_ip4": None,
+           "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:ff"}}
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+
+    res = eng.sync_access_tracker(
+        sessions=[{"mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.5"}],
+        tenant_slug="lrb", defaults={})
+
+    assert res["skipped"] == 1
+    eng.nb.ipam.ip_addresses.create.assert_not_called()
