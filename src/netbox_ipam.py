@@ -655,11 +655,16 @@ class IpamMixin:
         scope" checkbox on Edit never persisted, so a prefix could never
         become a Kea DHCP scope through the edit path, and the checkbox
         never reflected NetBox's actual saved state on reopen.
+
+        A site change cascades to every child prefix (nested inside this one,
+        same VRF) in one bulk NetBox update; if that fails the parent's site
+        is put back so parent and children never disagree.
         """
         try:
             pfx = self.nb.ipam.prefixes.get(prefix_id)
             if not pfx:
                 return {"status": "ERROR", "message": f"Prefix {prefix_id} not found"}
+            old_scope = (getattr(pfx, "scope_type", None), getattr(pfx, "scope_id", None))
             if description is not None:
                 pfx.description = description
             if status:
@@ -677,10 +682,32 @@ class IpamMixin:
                 merged.update(custom_fields)
                 pfx.custom_fields = merged
             pfx.save()
-            return {"status": "SUCCESS", "id": pfx.id, "prefix": str(pfx.prefix)}
+            result = {"status": "SUCCESS", "id": pfx.id, "prefix": str(pfx.prefix)}
+            if site_slug is not None:
+                try:
+                    result["children_updated"] = self._cascade_prefix_site(pfx)
+                except Exception as e:
+                    pfx.scope_type, pfx.scope_id = old_scope
+                    pfx.save()
+                    raise RuntimeError(f"child prefixes not updated, site change rolled back: {e}")
+            return result
         except Exception as e:
             logger.error(f"update_prefix failed: {e}")
             return {"status": "ERROR", "message": str(e)}
+
+    def _cascade_prefix_site(self, pfx: Any) -> int:
+        """Give every prefix inside ``pfx`` (same VRF) ``pfx``'s site scope."""
+        vrf_id = self._obj_vrf_id(pfx)
+        children = self._api_get_all("/api/ipam/prefixes/", {
+            "within": str(pfx.prefix),
+            "vrf_id": vrf_id if vrf_id is not None else "null",
+            "limit": 500,
+        })
+        updates = [{"id": c["id"], "scope_type": pfx.scope_type, "scope_id": pfx.scope_id}
+                   for c in children]
+        if updates:
+            self.nb.ipam.prefixes.update(updates)
+        return len(updates)
 
     def delete_prefix(self, prefix_id: int) -> Dict[str, Any]:
         """Delete an IP prefix record by ID."""
