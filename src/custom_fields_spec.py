@@ -112,3 +112,17 @@ CUSTOM_FIELDS_SPEC = [
     ("lease_time", "integer", "DHCP lease time (seconds)", "ipam.prefix"),
     ("exclusion_ranges", "text", "DHCP exclusion ranges (comma-separated)", "ipam.prefix"),
 ]
+# Site that holds devices no site-scoped prefix covers (no configured default
+# site). A device whose management IP later falls in a prefix scoped to a site
+# (Prefix → Scope → DCIM › Site, also editable in LM's Edit Subnet dialog) is
+# moved out of it. Prefix site itself is NetBox's native scope (4.2+), so it
+# needs no custom field.
+FALLBACK_SITE_SLUG = "discovered"
+
+# Reference objects LM expects to exist, provisioned by install.sh next to the
+# custom fields (and created on demand at runtime as a safety net):
+# (REST list path, lookup slug, POST body).
+REFERENCE_OBJECTS_SPEC = [
+    ("/api/dcim/sites/", FALLBACK_SITE_SLUG,
+     {"name": "Discovered", "slug": FALLBACK_SITE_SLUG, "status": "active"}),
+]
