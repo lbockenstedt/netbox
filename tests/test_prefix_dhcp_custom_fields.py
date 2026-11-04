@@ -181,3 +181,20 @@ def test_claim_prefix_omits_custom_fields_when_not_given():
 
     eng.claim_prefix("10.0.0.0/24")
     assert "custom_fields" not in created
+
+
+def test_prefix_site_reads_and_writes_netbox_scope():
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[
+        {"id": 1, "prefix": "10.0.0.0/24", "status": {"value": "active"},
+         "scope_type": "dcim.site", "scope": {"id": 9, "name": "MIP", "slug": "mip"}}])
+    p = eng.get_prefixes()["prefixes"][0]
+    assert (p["site"], p["site_slug"]) == ("MIP", "mip")
+    pfx = _Rec(id=5, prefix="10.0.0.0/24", custom_fields={})
+    pfx.save = MagicMock()
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=pfx)
+    eng.nb.dcim.sites.get = MagicMock(return_value=_Rec(id=9))
+    assert eng.update_prefix(5, site_slug="mip")["status"] == "SUCCESS"
+    assert (pfx.scope_type, pfx.scope_id) == ("dcim.site", 9)
+    eng.update_prefix(5, site_slug="")
+    assert (pfx.scope_type, pfx.scope_id) == (None, None)

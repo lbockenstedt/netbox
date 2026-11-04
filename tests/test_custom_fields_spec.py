@@ -165,3 +165,18 @@ def test_ensure_custom_fields_partial_on_create_failure():
     assert report["status"] == "PARTIAL", report
     assert report["warnings"], "expected at least one warning"
     assert getattr(eng, "_cf_ensured", False) is False  # cache unset → retries
+
+def test_ensure_custom_fields_creates_missing_fallback_site():
+    from custom_fields_spec import FALLBACK_SITE_SLUG
+    by_name = {name: _Cf(name, content_types=[ct]) for name, _f, _l, ct in CUSTOM_FIELDS_SPEC}
+    for name, _f, _l, ct in CUSTOM_FIELDS_SPEC:
+        if ct not in by_name[name].content_types:
+            by_name[name].content_types.append(ct)
+    eng = _engine_with_existing(by_name)
+    eng.nb.dcim.sites.get.return_value = None
+
+    report = eng._ensure_custom_fields(force=True)
+
+    assert report["status"] == "SUCCESS", report
+    eng.nb.dcim.sites.get.assert_called_once_with(slug=FALLBACK_SITE_SLUG)
+    assert eng.nb.dcim.sites.create.call_args.kwargs["slug"] == FALLBACK_SITE_SLUG

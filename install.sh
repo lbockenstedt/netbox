@@ -1662,6 +1662,18 @@ for name, ftype, label, ct in FIELDS:
         print(f"SKIP {name}/{ct}: {e}")
         skipped += 1
 print(f"custom fields: {ok} present, {created} created, {attached} newly attached, {skipped} skipped (of {len(FIELDS)} spec entries)")
+# Reference objects (e.g. the fallback "discovered" site) from the same spec module.
+from custom_fields_spec import REFERENCE_OBJECTS_SPEC
+for path, slug, body in REFERENCE_OBJECTS_SPEC:
+    try:
+        st, resp = _req("GET", f"{path}?slug={slug}")
+        if resp.get("results"):
+            print(f"present {path}{slug}")
+        else:
+            _req("POST", path, body)
+            print(f"created {path}{slug}")
+    except Exception as e:
+        print(f"SKIP {path}{slug}: {e}")
 LMCF
     set -e
     ok "Lab Manager custom fields ensured (see lines above)"
