@@ -198,3 +198,36 @@ def test_prefix_site_reads_and_writes_netbox_scope():
     assert (pfx.scope_type, pfx.scope_id) == ("dcim.site", 9)
     eng.update_prefix(5, site_slug="")
     assert (pfx.scope_type, pfx.scope_id) == (None, None)
+
+
+def test_prefix_site_change_cascades_to_child_prefixes():
+    eng = _engine()
+    pfx = _Rec(id=5, prefix="10.0.0.0/16", vrf=_Rec(id=3), custom_fields={})
+    pfx.save = MagicMock()
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=pfx)
+    eng.nb.dcim.sites.get = MagicMock(return_value=_Rec(id=9))
+    eng._api_get_all = MagicMock(return_value=[{"id": 6}, {"id": 7}])
+
+    res = eng.update_prefix(5, site_slug="mip")
+
+    assert res["children_updated"] == 2
+    eng._api_get_all.assert_called_once_with(
+        "/api/ipam/prefixes/", {"within": "10.0.0.0/16", "vrf_id": 3, "limit": 500})
+    eng.nb.ipam.prefixes.update.assert_called_once_with([
+        {"id": 6, "scope_type": "dcim.site", "scope_id": 9},
+        {"id": 7, "scope_type": "dcim.site", "scope_id": 9}])
+
+
+def test_prefix_site_cascade_failure_rolls_back_parent():
+    eng = _engine()
+    pfx = _Rec(id=5, prefix="10.0.0.0/16", scope_type="dcim.site", scope_id=1,
+               custom_fields={})
+    pfx.save = MagicMock()
+    eng.nb.ipam.prefixes.get = MagicMock(return_value=pfx)
+    eng.nb.dcim.sites.get = MagicMock(return_value=_Rec(id=9))
+    eng._api_get_all = MagicMock(return_value=[{"id": 6}])
+    eng.nb.ipam.prefixes.update = MagicMock(side_effect=Exception("boom"))
+
+    assert eng.update_prefix(5, site_slug="mip")["status"] == "ERROR"
+    assert (pfx.scope_type, pfx.scope_id) == ("dcim.site", 1)
+    assert pfx.save.call_count == 2
