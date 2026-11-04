@@ -1488,7 +1488,10 @@ class SyncMixin:
         NetBox enforces global IP uniqueness, so an address the IPAM already
         holds is REUSED and reassigned instead of 400ing "Duplicate IP address
         found in global table" (which used to fail ~every record)."""
-        iface = self.nb.dcim.interfaces.create(device=device_id, name="mgmt", type="other")
+        # Reuse an existing mgmt interface (its IP was deleted) — a second one
+        # with the same name is rejected by NetBox.
+        iface = (self.nb.dcim.interfaces.get(device_id=device_id, name="mgmt")
+                 or self.nb.dcim.interfaces.create(device=device_id, name="mgmt", type="other"))
         mask = self._mask_for_ip(d.real_ip, run.tenant)
         ip_kwargs: Dict[str, Any] = {
             "address": f"{d.real_ip}/{mask}",
