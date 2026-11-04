@@ -50,6 +50,7 @@ def _engine_with(existing_rows, tenant_obj=None):
     # Default: no pre-existing global IP → _reuse_or_create_ip creates. Tests
     # that need the reuse/refresh path override ip_addresses.get.return_value.
     eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.dcim.interfaces.get.return_value = None
 
     def _list(path, params=None):
         # Real device rows carry their nested tenant; sync_devices pages ALL
@@ -1216,6 +1217,23 @@ def test_netbox_sot_fills_missing_primary_ip():
         tenant_slug="lrb", replace=False, defaults={}, source_of_truth="netbox")
     assert dev.primary_ip4 == 555
     eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_assign_ip_reuses_existing_mgmt_interface():
+    # The device kept its mgmt interface after its IP was deleted; a second
+    # "mgmt" would be rejected by NetBox, so the IP goes on the existing one.
+    row = _existing_placeholder_row(dev_mac="aa:bb:cc:dd:ee:ff")
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=7); dev.name = row["name"]
+    eng.nb.dcim.devices.get.return_value = dev
+    eng.nb.dcim.interfaces.get.return_value = SimpleNamespace(id=300)
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={})
+    eng.nb.dcim.interfaces.create.assert_not_called()
+    assert eng.nb.ipam.ip_addresses.create.call_args.kwargs["assigned_object_id"] == 300
+    assert dev.primary_ip4 == 555
 
 
 def test_netbox_sot_skips_invalid_dns_name_but_still_fills_mac():
