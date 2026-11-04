@@ -18,9 +18,21 @@ Detection is the default (``apply=False``) — a dry run reports the groups it
 WOULD merge so an operator can review before anything is changed.
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("NetboxEngine")
+
+# Values that are not a unique hardware identity: placeholder serials and
+# shared/virtual MACs (VRRP, HSRP, multicast, all-zero). Two devices sharing one
+# of these are NOT the same box.
+_JUNK_SERIALS = {"0", "na", "n/a", "none", "null", "unknown", "default string",
+                 "to be filled by o.e.m.", "system serial number",
+                 "not specified", "0123456789", "123456789", "1234567890"}
+_SHARED_MAC_PREFIXES = ("00:00:5e:00:01", "00:00:5e:00:02", "00:00:0c:07:ac",
+                        "00:00:0c:9f:f")
+# A "duplicate group" bigger than this is a shared identity, not one box.
+_MAX_GROUP = 5
 
 
 class DedupeMixin:
@@ -42,12 +54,48 @@ class DedupeMixin:
             parent[rb] = ra
 
     @staticmethod
+    def _real_serial(serial) -> str:
+        s = str(serial or "").strip().lower()
+        if len(s) < 4 or s in _JUNK_SERIALS or len(set(s)) == 1:
+            return ""
+        return s
+
+    def _real_mac(self, mac) -> str:
+        m = self._norm_mac(mac or "")
+        if not re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", m):
+            return ""
+        if int(m[:2], 16) & 1 or m in ("00:00:00:00:00:00",) \
+                or m.startswith(_SHARED_MAC_PREFIXES):
+            return ""
+        return m
+
+    @staticmethod
+    def _slug(ref) -> str:
+        return str((ref or {}).get("slug") or "").lower() if isinstance(ref, dict) else ""
+
+    @staticmethod
+    def _is_legacy_row(row: dict) -> bool:
+        """An old LM-created record no sync maintains any more: no last_seen,
+        no serial/MAC, not racked, in the generic 'discovered' site. Records a
+        human placed (rack, real site) never qualify."""
+        cf = row.get("custom_fields") or {}
+        return (not str(cf.get("last_seen") or "").strip()
+                and not str(row.get("serial") or "").strip()
+                and not str(cf.get("mac_address") or "").strip()
+                and not row.get("rack")
+                and DedupeMixin._slug(row.get("site")) == "discovered")
+
+    @staticmethod
     def _completeness_score(row: dict) -> int:
         """Rank a device row for survivor election: the record carrying the most
         hardware truth wins. Serial (globally unique) is weighted highest, then
         MAC, then a real (non-generic) device_type, a primary IP and a name."""
         cf = row.get("custom_fields") or {}
         score = 0
+        if row.get("rack"):
+            score += 16  # placed by a human: never delete it in favour of a copy
+        if str(cf.get("last_seen") or "").strip():
+            score += 1
         if str(row.get("serial") or "").strip():
             score += 8
         if str(cf.get("mac_address") or "").strip():
@@ -100,8 +148,8 @@ class DedupeMixin:
                         "scanned": 0, "groups": [], "merged": 0, "deleted": 0,
                         "errors": 0, "applied": bool(apply)}
             by_id: Dict[Any, dict] = {}
-            serial_map: Dict[str, List[Any]] = {}
-            mac_map: Dict[str, List[Any]] = {}
+            keyed: Dict[str, List[Any]] = {}
+            by_name: Dict[str, List[Any]] = {}
             parent: Dict[Any, Any] = {}
             for row in (rows or []):
                 did = row.get("id")
@@ -110,18 +158,34 @@ class DedupeMixin:
                 scanned += 1
                 by_id[did] = row
                 parent[did] = did
-                serial = str(row.get("serial") or "").strip().lower()
+                serial = self._real_serial(row.get("serial"))
                 if serial:
-                    serial_map.setdefault(serial, []).append(did)
+                    keyed.setdefault("serial:" + serial, []).append(did)
                 cf = row.get("custom_fields") or {}
-                mac = self._norm_mac(cf.get("mac_address") or "")
+                mac = self._real_mac(cf.get("mac_address"))
                 if mac:
-                    mac_map.setdefault(mac, []).append(did)
+                    keyed.setdefault("mac:" + mac, []).append(did)
+                name = str(row.get("name") or "").strip().lower().rstrip(".")
+                pip = row.get("primary_ip4")
+                ip = str((pip or {}).get("address") or "").split("/")[0] if isinstance(pip, dict) else ""
+                if name:
+                    by_name.setdefault(name, []).append(did)
+                    if ip:
+                        # Same name AND same IP within one tenant is one device.
+                        keyed.setdefault(f"nameip:{self._slug(row.get('tenant'))}|{name}|{ip}",
+                                         []).append(did)
 
-            # Union devices that share a serial, then a MAC (transitive).
-            for ids in list(serial_map.values()) + list(mac_map.values()):
+            # Union devices that share a serial, MAC or name+IP (transitive).
+            for ids in keyed.values():
                 for other in ids[1:]:
                     self._dsu_union(parent, ids[0], other)
+            # A legacy record (see _is_legacy_row) folds into the one live
+            # record with the same name, whatever its tenant or name case.
+            for ids in by_name.values():
+                live = [i for i in ids if not self._is_legacy_row(by_id[i])]
+                if len(live) == 1 and len(ids) > 1:
+                    for i in ids:
+                        self._dsu_union(parent, live[0], i)
 
             # Collect components of size > 1.
             comps: Dict[Any, List[Any]] = {}
@@ -130,6 +194,10 @@ class DedupeMixin:
 
             for comp_ids in comps.values():
                 if len(comp_ids) < 2:
+                    continue
+                if len(comp_ids) > _MAX_GROUP:
+                    logger.warning("dedupe: skip %d devices sharing one identity (ids %s)",
+                                   len(comp_ids), sorted(comp_ids)[:10])
                     continue
                 members = [by_id[i] for i in comp_ids]
                 # Survivor = most complete; tie-break lowest (oldest) id.
@@ -145,6 +213,7 @@ class DedupeMixin:
                 elif str(scf.get("mac_address") or "").strip():
                     key = f"mac:{self._norm_mac(scf.get('mac_address'))}"
                 else:
+                    key = "name:" + str(survivor.get("name") or "").lower()
                     for d in dupes:
                         s = str(d.get("serial") or "").strip()
                         if s:
