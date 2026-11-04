@@ -916,11 +916,20 @@ class NetboxSpoke(BaseSpoke):
             # this on a schedule + on-demand (StalenessSweepMixin). See
             # lm core/src/staleness_sweep.py. Defaults mirror the hub config
             # defaults so a sweep without explicit thresholds is safe.
-            return await self._run_sync(
+            res = await self._run_sync(
                 self.engine.staleness_sweep,
                 stale_days=int(data.get("stale_days", 7)),
                 delete_days=int(data.get("delete_days", 30)),
             )
+            # Merge duplicate devices on the same schedule, so NetBox heals
+            # itself without an operator running the dedupe by hand.
+            dd = await self._run_sync(self.engine.dedupe_devices, apply=True)
+            logger.info("auto-dedupe: %s", dd.get("message"))
+            if isinstance(res, dict):
+                res["dedupe_merged"] = dd.get("merged", 0)
+                res["errors"] = int(res.get("errors") or 0) + int(dd.get("errors") or 0)
+                res["message"] = f"{res.get('message') or 'sweep complete'}; dedupe: {dd.get('message')}"
+            return res
 
         if normalized == "NETBOX_DEDUPE_DEVICES":
             # Find (and, when apply=True, merge) duplicate devices that share a
