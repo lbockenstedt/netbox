@@ -1289,6 +1289,10 @@ class SyncMixin:
         self._identify_matched_device(run, d, row)
         if run.source_of_truth == "netbox":
             self._fill_device_gaps(run, row, d.hostname, d.mac)
+            # An empty primary IP is a gap too (e.g. the device was deleted
+            # and re-created by a feed that had no IP for it).
+            if d.real_ip and not _primary_addr(row):
+                self._assign_primary_ip(run, d, row, "")
             self._touch_last_seen_if_stale(run, row, d.key, "last_seen refresh")
         else:
             self._sync_matched_primary_ip(run, d, row)
@@ -2084,6 +2088,37 @@ class SyncMixin:
             except Exception:
                 return None
 
+    def _attach_endpoint_ip(self, devobj: Any, mac: str, ip: str, username: str,
+                            tenant: Any, start_time: str = "") -> Any:
+        """Put an endpoint's framed IP on its ``eth0`` NIC (created if missing)
+        and make it the device's primary IP. Returns the NIC. Raises on failure.
+
+        The IP goes through ``_reuse_or_create_ip``: NetBox enforces global IP
+        uniqueness, so an existing record is reassigned instead of 400ing."""
+        nic = (self.nb.dcim.interfaces.get(device_id=devobj.id, name="eth0")
+               or self.nb.dcim.interfaces.create(device=devobj.id, name="eth0",
+                                                 type="other", mac_address=mac))
+        mask = self._mask_for_ip(ip, tenant)
+        ip_kwargs: Dict[str, Any] = {
+            "address": f"{ip}/{mask}",
+            "assigned_object_type": "dcim.interface",
+            "assigned_object_id": nic.id,
+        }
+        if tenant:
+            ip_kwargs["tenant"] = tenant.id
+        if username:
+            ip_kwargs["dns_name"] = username
+        ipobj = self._reuse_or_create_ip(
+            f"{ip}/{mask}", ip_kwargs, ip, nic.id,
+            tenant=tenant, hostname=username, mac=mac,
+            source="realtime-nac-access-tracker")
+        devobj.primary_ip4 = ipobj.id
+        devobj.save()
+        self._journal("ipam.ipaddress", ipobj.id, "realtime-nac-access-tracker",
+                      note=f"framed IP {ip}/{mask} → {devobj.name}")
+        self._stamp_last_seen(ipobj, when=start_time)
+        return nic
+
     def sync_access_tracker(self, sessions: list, tenant_slug: str = "",
                             defaults: Optional[Dict[str, Any]] = None,
                             source_of_truth: str = "netbox") -> Dict[str, Any]:
@@ -2330,6 +2365,24 @@ class SyncMixin:
                                     existing_by_mac.setdefault(mac, row)
                             except Exception as e:
                                 logger.debug("sync_access_tracker: backfill mac %s failed: %s", mac, e)
+                        # Fill a missing primary IP with the framed IP (e.g. the
+                        # device was re-created from a MAC table with no IP).
+                        # Same tenant only: never put this tenant's IP on another
+                        # tenant's device.
+                        row_tid = (row.get("tenant") or {}).get("id")
+                        filled = False
+                        if (ip and not row.get("primary_ip4")
+                                and row_tid == (tenant.id if tenant else None)):
+                            try:
+                                devobj = self.nb.dcim.devices.get(row["id"])
+                                if devobj:
+                                    self._attach_endpoint_ip(devobj, mac, ip, username,
+                                                             tenant, start_time)
+                                    row["primary_ip4"] = {"address": ip}
+                                    existing_by_ip.setdefault(ip, row)
+                                    filled = True
+                            except Exception as e:
+                                logger.debug("sync_access_tracker: fill IP %s failed: %s", ip, e)
                         # Best-effort refresh of topology/last_seen ONLY on a
                         # device we own (never touch another source's record).
                         if str((cf.get("discovered_from") or "")).lower() == "cppm-access-tracker":
@@ -2349,7 +2402,10 @@ class SyncMixin:
                                     devobj.save()
                             except Exception as e:
                                 logger.debug("sync_access_tracker: refresh %s failed: %s", mac, e)
-                        skipped += 1
+                        if filled:
+                            pushed += 1
+                        else:
+                            skipped += 1
                         continue
 
                     # Create the missing endpoint device.
@@ -2393,33 +2449,8 @@ class SyncMixin:
                     # NIC interface (native MAC) + framed IP + primary_ip4.
                     nic = None
                     if ip:
-                        nic = self.nb.dcim.interfaces.create(
-                            device=devobj.id, name="eth0", type="other",
-                            mac_address=mac)
-                        mask = self._mask_for_ip(ip, tenant)
-                        ip_kwargs: Dict[str, Any] = {
-                            "address": f"{ip}/{mask}",
-                            "assigned_object_type": "dcim.interface",
-                            "assigned_object_id": nic.id,
-                        }
-                        if tenant:
-                            ip_kwargs["tenant"] = tenant.id
-                        if username:
-                            ip_kwargs["dns_name"] = username
-                        # Reuse an existing global IP record (NetBox enforces
-                        # global uniqueness) and reassign it to this NIC instead
-                        # of creating a duplicate that 400s — same fix as
-                        # sync_devices, for the same root cause.
-                        ipobj = self._reuse_or_create_ip(
-                            f"{ip}/{mask}", ip_kwargs, ip, nic.id,
-                            tenant=tenant, hostname=username, mac=mac,
-                            source="realtime-nac-access-tracker")
-                        devobj.primary_ip4 = ipobj.id
-                        devobj.save()
-                        self._journal("ipam.ipaddress", ipobj.id,
-                                      "realtime-nac-access-tracker",
-                                      note=f"framed IP {ip}/{mask} → {name}")
-                        self._stamp_last_seen(ipobj, when=start_time)
+                        nic = self._attach_endpoint_ip(devobj, mac, ip, username,
+                                                       tenant, start_time)
 
                     # Switch topology (best-effort, never breaks the sync).
                     if nas_ip:
