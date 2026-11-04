@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import pynetbox
+from types import SimpleNamespace
+
+from custom_fields_spec import FALLBACK_SITE_SLUG
 
 logger = logging.getLogger("NetboxEngine")
 
@@ -524,6 +527,69 @@ class SyncMixin:
             changed = True
         return changed
 
+    def _site_for_ip(self, ip: str, tenant=None) -> Optional[Dict[str, Any]]:
+        """The site of the most specific site-scoped prefix containing ``ip``
+        (``{id, slug, name}``), else None. On a tie (the same prefix in two
+        tenants' VRFs) the device tenant's prefix wins. The prefix list is
+        cached for a minute so a fleet poll asks NetBox once."""
+        import time as _time
+        try:
+            addr = ipaddress.ip_address(str(ip or "").split("/")[0].strip())
+        except ValueError:
+            return None
+        cache = self.__dict__.get("_site_prefix_cache")
+        if not cache or _time.monotonic() - cache[0] > 60:
+            try:
+                rows = self._api_get_all("/api/ipam/prefixes/", {"scope_type": "dcim.site", "limit": 1000})
+            except Exception as e:  # noqa: BLE001
+                logger.warning("site_for_ip: listing site-scoped prefixes failed: %s", e)
+                rows = []
+            nets = []
+            for p in rows:
+                scope = p.get("scope") if p.get("scope_type") == "dcim.site" else None
+                try:
+                    if isinstance(scope, dict) and scope.get("id"):
+                        nets.append((ipaddress.ip_network(p["prefix"], strict=False),
+                                     (p.get("tenant") or {}).get("id"),
+                                     {k: scope.get(k) for k in ("id", "slug", "name")}))
+                except (KeyError, ValueError):
+                    continue
+            cache = self.__dict__["_site_prefix_cache"] = (_time.monotonic(), nets)
+        tid = getattr(tenant, "id", None)
+        best = None
+        for net, ptid, site in cache[1]:
+            if addr.version != net.version or addr not in net:
+                continue
+            rank = (net.prefixlen, ptid == tid and tid is not None)
+            if best is None or rank > best[0]:
+                best = (rank, site)
+        return best[1] if best else None
+
+    def _device_site_ref(self, devobj: Any) -> Dict[str, Any]:
+        """``{slug, name}`` of the device's site ({} when unknown)."""
+        site = getattr(devobj, "site", None)
+        if isinstance(site, int):  # just assigned by id
+            site = next((SimpleNamespace(**x[2]) for x in
+                         (self.__dict__.get("_site_prefix_cache") or (0, []))[1]
+                         if x[2].get("id") == site), None)
+        slug = getattr(site, "slug", None)
+        return {"slug": str(slug), "name": str(getattr(site, "name", "") or slug)} if isinstance(slug, str) and slug else {}
+
+    def _place_in_prefix_site(self, devobj: Any, ip: str, tenant=None) -> bool:
+        """Move a device still in the auto-created ``discovered`` site into the
+        site of the prefix holding ``ip``. A device someone placed in a real
+        site is left alone. Returns True when the site changed."""
+        cur = getattr(devobj, "site", None)
+        if str(getattr(cur, "slug", "") or "") != FALLBACK_SITE_SLUG:
+            return False
+        site = self._site_for_ip(ip, tenant)
+        if not site or site["id"] == getattr(cur, "id", None):
+            return False
+        devobj.site = site["id"]
+        logger.info("netbox: device %s moved to site %s (prefix of %s)",
+                    getattr(devobj, "name", devobj), site.get("slug"), ip)
+        return True
+
     def _resolve_site(self, slug: str = "", tenant=None):
         """Resolve a site for device creation. Configured slug first; else the
         first existing site; else AUTO-CREATE a fallback site. NetBox REQUIRES
@@ -552,7 +618,7 @@ class SyncMixin:
         # Use the configured slug if given, else a default 'discovered' (mirrors
         # _ensure_device_role/_type). Created once; the first-site fallback above
         # adopts it on subsequent syncs.
-        create_slug = slug or "discovered"
+        create_slug = slug or FALLBACK_SITE_SLUG
         try:
             return self.nb.dcim.sites.create(
                 name=create_slug.replace("-", " ").replace("_", " ").title(),
@@ -1287,6 +1353,7 @@ class SyncMixin:
         if rname:
             run.used_names.add(rname)
         self._identify_matched_device(run, d, row)
+        self._site_matched_device(run, d, row)
         if run.source_of_truth == "netbox":
             self._fill_device_gaps(run, row, d.hostname, d.mac)
             # An empty primary IP is a gap too (e.g. the device was deleted
@@ -1299,6 +1366,21 @@ class SyncMixin:
             self._stamp_matched_device_fields(run, d, row)
             self._rename_or_touch_matched_device(run, d, row)
         run.pushed += 1
+
+    def _site_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
+                             row: dict) -> None:
+        """A matched device still in the fallback site joins its prefix's site."""
+        if not d.real_ip or _ref_slug(row.get("site")) != FALLBACK_SITE_SLUG:
+            return
+        if not self._site_for_ip(d.real_ip, run.tenant):
+            return
+        try:
+            devobj = self._device_record(run, row["id"])
+            if devobj and self._place_in_prefix_site(devobj, d.real_ip, run.tenant):
+                devobj.save()
+        except Exception as e:  # noqa: BLE001
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: site %s failed: %s", d.key, e)
 
     def _identify_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                                  row: dict) -> None:
@@ -1617,7 +1699,10 @@ class SyncMixin:
             d.rec.get("model", ""), d.rec.get("manufacturer", ""), d.rec.get("spec"))[0] or run.dtype
         if rec_dtype:
             kwargs["device_type"] = rec_dtype.id
-        if run.site:
+        ip_site = self._site_for_ip(d.real_ip, run.tenant) if d.real_ip else None
+        if ip_site:
+            kwargs["site"] = ip_site["id"]
+        elif run.site:
             kwargs["site"] = run.site.id
         if run.tenant:
             kwargs["tenant"] = run.tenant.id
@@ -1791,9 +1876,10 @@ class SyncMixin:
                 dt_slug = str(defaults.get("device_type") or "").strip()
                 role_slug = ident_role or str(defaults.get("role") or "").strip()
                 site_slug = str(defaults.get("site") or "").strip()
+                ip_site = self._site_for_ip(mgmt_ip, tenant)
                 missing = [k for k, v in (("device_type", model_dt or dt_slug),
                                          ("role", role_slug),
-                                         ("site", site_slug)) if not v]
+                                         ("site", ip_site or site_slug)) if not v]
                 if missing:
                     return {"status": "ERROR",
                             "message": f"cannot create nw device {name!r}: missing "
@@ -1812,9 +1898,10 @@ class SyncMixin:
                         role = self._cached_ref(
                             "device_role", role_slug,
                             lambda: self.nb.dcim.device_roles.get(slug=role_slug))
-                    site = self._cached_ref(
+                    # The site of the prefix holding the management IP beats the default.
+                    site = (SimpleNamespace(**ip_site) if ip_site else self._cached_ref(
                         "site", site_slug,
-                        lambda: self.nb.dcim.sites.get(slug=site_slug))
+                        lambda: self.nb.dcim.sites.get(slug=site_slug)))
                     # A configured-but-nonexistent slug resolves to None; guard
                     # so it's a clear, actionable error instead of an
                     # AttributeError on .id.
@@ -1888,6 +1975,7 @@ class SyncMixin:
                     # serial another feeder already set.
                     if serial and not str(getattr(devobj, "serial", "") or "").strip():
                         devobj.serial = serial
+                    self._place_in_prefix_site(devobj, mgmt_ip, tenant)
                     # The device may have been created generic by an ARP/DHCP
                     # feed before this poll learned what it is.
                     known_dt, replaceable = self._identified_device_type(model, ident_mfr, spec)
@@ -2054,7 +2142,8 @@ class SyncMixin:
             return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
                     "skipped": skipped, "deleted": deleted,
                     "interfaces_total": len(interfaces or []),
-                    "device_id": dev_id, "message": msg}
+                    "device_id": dev_id, "message": msg,
+                    "site": self._device_site_ref(devobj)}
         except Exception as e:
             logger.error("sync_nw_device failed: %s", e)
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
