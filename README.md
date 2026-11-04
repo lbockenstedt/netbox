@@ -398,7 +398,7 @@ unreachable. **Secret rotation** = re-run the installer with a new
 
 ## Prefix sites (device placement)
 
-A prefix's site uses NetBox's native **scope** (`scope_type=dcim.site` + `scope_id`; NetBox ≥ 4.2 removed `Prefix.site`). `get_prefixes` returns `site`/`site_slug`; `allocate_prefix`, `claim_prefix` and `update_prefix` take `site_slug` (an unknown slug is an error; `""` clears the scope). LM's NetBox → Prefixes → Edit/Allocate Subnet offers a dropdown of the sites that exist in NetBox.
+A prefix's site uses NetBox's native **scope** (`scope_type=dcim.site` + `scope_id`; NetBox ≥ 4.2 removed `Prefix.site`). `get_prefixes` returns `site`/`site_slug`; `allocate_prefix`, `claim_prefix` and `update_prefix` take `site_slug` (an unknown slug is an error; `""` clears the scope). Changing a prefix's site via `update_prefix` also sets it on every child prefix (nested inside it, same VRF) in one bulk update; if that fails the parent's site is rolled back and an error returned. LM's NetBox → Prefixes → Edit/Allocate Subnet offers a dropdown of the sites that exist in NetBox.
 
 On every network-device and discovery sync, a device's site comes from the **most specific site-scoped prefix containing its IP** (the tenant's own prefix wins a tie; the list is cached 60 s), then `defaults.site`, then the first site, then the fallback site. An existing device is moved only while it is still in the fallback site (`discovered`), so a site set by hand is never overwritten (`netbox: device X moved to site Y`). `sync_nw_device` returns the device's `site`, which the hub records on the fleet entry (NW → Site column).
 
