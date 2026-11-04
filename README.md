@@ -38,7 +38,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 - **`src/netbox_sync.py` (`SyncMixin`)**: Multi-source device discovery upsert (switches, APs, firewalls, ClearPass access tracker) with MAC normalization and prefix-length derivation.
 - **`src/netbox_tenancy.py` (`TenancyMixin`)**: Tenant queries, multi-model tenant data reassignment/migration (`migrate_tenant`), and DHCP scope harvesting.
 - **`src/netbox_staleness.py` (`StalenessMixin`)**: Scheduled discovery record retirement (marking devices offline after inactivity, followed by automatic purge).
-- **`src/custom_fields_spec.py`**: Pure-data specification defining custom fields required for discovery tracking, Proxmox links, switch ports, and tenancy ranges.
+- **`src/custom_fields_spec.py`**: Pure-data specification defining custom fields required for discovery tracking, Proxmox links, switch ports, and tenancy ranges, plus the reference objects (fallback `discovered` site) the syncs rely on.
 
 ---
 
@@ -395,6 +395,14 @@ button **Sign in with Microsoft** with the Microsoft icon). **Break-glass:** a l
 by the installer) still logs in via NetBox's local Django auth when Entra is
 unreachable. **Secret rotation** = re-run the installer with a new
 `--netbox-sso-client-secret`.
+
+## Prefix sites (device placement)
+
+A prefix's site uses NetBox's native **scope** (`scope_type=dcim.site` + `scope_id`; NetBox ≥ 4.2 removed `Prefix.site`). `get_prefixes` returns `site`/`site_slug`; `allocate_prefix`, `claim_prefix` and `update_prefix` take `site_slug` (an unknown slug is an error; `""` clears the scope). LM's NetBox → Prefixes → Edit/Allocate Subnet offers a dropdown of the sites that exist in NetBox.
+
+On every network-device and discovery sync, a device's site comes from the **most specific site-scoped prefix containing its IP** (the tenant's own prefix wins a tie; the list is cached 60 s), then `defaults.site`, then the first site, then the fallback site. An existing device is moved only while it is still in the fallback site (`discovered`), so a site set by hand is never overwritten (`netbox: device X moved to site Y`). `sync_nw_device` returns the device's `site`, which the hub records on the fleet entry (NW → Site column).
+
+**Reinstall:** the fallback site is declared in `custom_fields_spec.REFERENCE_OBJECTS_SPEC` and provisioned with the custom fields by `install.sh`, the spoke self-heal and **Apply schema changes**. Prefix → site assignments are NetBox *data* — keep them across a reinstall with a NetBox database backup/restore.
 
 ## Tenant VRFs
 

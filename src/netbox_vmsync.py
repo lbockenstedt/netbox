@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from custom_fields_spec import CUSTOM_FIELDS_SPEC
+from custom_fields_spec import CUSTOM_FIELDS_SPEC, REFERENCE_OBJECTS_SPEC
 
 logger = logging.getLogger("NetboxEngine")
 
@@ -235,6 +235,20 @@ class VmSyncMixin:
                 logger.warning("ensure_custom_fields: attach %s to %s failed: %s",
                                name, content_type, e)
                 report["warnings"].append(f"attach {name} to {content_type}: {e}")
+                had_failure = True
+        # Reference objects the syncs rely on (e.g. the fallback site), from the
+        # same spec install.sh provisions.
+        for path, slug, body in REFERENCE_OBJECTS_SPEC:
+            try:
+                app, ep = path.strip("/").split("/")[1:3]
+                endpoint = getattr(getattr(self.nb, app), ep)
+                if endpoint.get(slug=slug) is None:
+                    endpoint.create(**body)
+                    logger.info("ensure_custom_fields: created %s %s", path, slug)
+                    report["created"] += 1
+            except Exception as e:
+                logger.warning("ensure_custom_fields: reference %s %s failed: %s", path, slug, e)
+                report["warnings"].append(f"reference {path} {slug}: {e}")
                 had_failure = True
         if had_failure:
             report["status"] = "PARTIAL"

@@ -6,6 +6,21 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("NetboxEngine")
 
 
+
+# NetBox 4.2 replaced Prefix.site with a generic scope (region/site group/site/location).
+SITE_SCOPE_TYPE = "dcim.site"
+
+
+def _site_scope(site_id: int) -> Dict[str, Any]:
+    return {"scope_type": SITE_SCOPE_TYPE, "scope_id": site_id}
+
+
+def _prefix_site(p: Dict[str, Any]) -> Dict[str, Any]:
+    """The site a prefix (API row) is scoped to, or {}."""
+    if p.get("scope_type") == SITE_SCOPE_TYPE and isinstance(p.get("scope"), dict):
+        return p["scope"]
+    return p["site"] if isinstance(p.get("site"), dict) else {}
+
 class IpamMixin:
     """IPAM prefix/IP methods incl. free-subnet finder + claim for NetboxEngine."""
 
@@ -42,7 +57,8 @@ class IpamMixin:
                     "id": p["id"],
                     "prefix": p["prefix"],
                     "status": status.get("value", "") if isinstance(status, dict) else str(status),
-                    "site": p["site"]["name"] if p.get("site") else "",
+                    "site": _prefix_site(p).get("name", ""),
+                    "site_slug": _prefix_site(p).get("slug", ""),
                     "vrf": p["vrf"]["name"] if p.get("vrf") else "",
                     "description": p.get("description") or "",
                     "is_pool": p.get("is_pool", False),
@@ -97,8 +113,9 @@ class IpamMixin:
                 payload["custom_fields"] = custom_fields
             if site_slug:
                 site = self.nb.dcim.sites.get(slug=site_slug)
-                if site:
-                    payload["site"] = site.id
+                if not site:
+                    return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
+                payload.update(_site_scope(site.id))
             if tenant_slug:
                 tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
                 if tenant:
@@ -399,7 +416,7 @@ class IpamMixin:
                 if status:
                     existing.status = status
                 if site_id is not None:
-                    existing.site = site_id
+                    existing.scope_type, existing.scope_id = SITE_SCOPE_TYPE, site_id
                 if custom_fields:
                     merged = dict(existing.custom_fields or {})
                     merged.update(custom_fields)
@@ -413,7 +430,7 @@ class IpamMixin:
             if vrf_id is not None:
                 payload["vrf"] = vrf_id
             if site_id is not None:
-                payload["site"] = site_id
+                payload.update(_site_scope(site_id))
             if custom_fields:
                 payload["custom_fields"] = custom_fields
             created = self.nb.ipam.prefixes.create(payload)
@@ -652,9 +669,9 @@ class IpamMixin:
                     site = self.nb.dcim.sites.get(slug=site_slug)
                     if not site:
                         return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
-                    pfx.site = site.id
+                    pfx.scope_type, pfx.scope_id = SITE_SCOPE_TYPE, site.id
                 else:
-                    pfx.site = None
+                    pfx.scope_type, pfx.scope_id = None, None
             if custom_fields:
                 merged = dict(pfx.custom_fields or {})
                 merged.update(custom_fields)
