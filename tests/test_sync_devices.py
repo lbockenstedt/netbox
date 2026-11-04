@@ -1203,6 +1203,20 @@ def test_netbox_sot_never_overwrites_populated_values():
     ip.save.assert_not_called()
 
 
+def test_netbox_sot_fills_missing_primary_ip():
+    row = _existing_placeholder_row(dev_mac="aa:bb:cc:dd:ee:ff")
+    eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
+    dev = _Obj(id=7); dev.name = row["name"]
+    eng.nb.dcim.devices.get.return_value = dev
+    eng.nb.ipam.ip_addresses.get.return_value = None
+    eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
+    eng.sync_devices(
+        devices=[{"ip": "10.0.0.5", "mac": "AA:BB:CC:DD:EE:FF", "hostname": ""}],
+        tenant_slug="lrb", replace=False, defaults={}, source_of_truth="netbox")
+    assert dev.primary_ip4 == 555
+    eng.nb.dcim.devices.create.assert_not_called()
+
+
 def test_netbox_sot_skips_invalid_dns_name_but_still_fills_mac():
     row = _existing_placeholder_row(ip_id=55)
     eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
