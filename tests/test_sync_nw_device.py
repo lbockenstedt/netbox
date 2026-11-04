@@ -395,3 +395,47 @@ def test_sync_nw_device_empty_poll_never_wipes_interfaces():
     res = eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults={})
     assert res["deleted"] == 0
     port.delete.assert_not_called()
+
+
+def _with_site_prefixes(eng, prefixes):
+    """Add site-scoped prefix rows to the faked /ipam/prefixes listing."""
+    inner = eng._api_get_all.side_effect
+
+    def fake(path, params=None, **kw):
+        if "ipam/prefixes" in path:
+            return prefixes
+        return inner(path, params, **kw)
+    eng._api_get_all = MagicMock(side_effect=fake)
+
+
+_MIP = {"prefix": "10.0.0.0/16", "scope_type": "dcim.site",
+        "scope": {"id": 77, "slug": "mip", "name": "MIP"}}
+_MIP24 = {"prefix": "10.0.0.0/24", "scope_type": "dcim.site",
+          "scope": {"id": 78, "slug": "mip-lab", "name": "MIP Lab"}}
+
+
+def test_sync_nw_device_creates_in_site_of_most_specific_prefix():
+    eng = _engine()
+    _with_site_prefixes(eng, [_MIP, _MIP24, {"prefix": "10.0.0.0/8"}])
+    eng.nb.dcim.devices.create = MagicMock(return_value=_Obj(id=100, name="sw1"))
+    res = eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="",
+                             defaults={"device_type": "switch", "role": "switch"})
+    assert res["status"] == "SUCCESS", res
+    assert eng.nb.dcim.devices.create.call_args.kwargs["site"] == 78
+
+
+def test_sync_nw_device_moves_device_out_of_fallback_site_only():
+    row = {"id": 7, "name": "sw1", "custom_fields": {"nw_device_id": "nw-1"}}
+    eng = _engine(existing_devices=[row])
+    _with_site_prefixes(eng, [_MIP])
+    dev_obj = _Obj(id=7, name="sw1", custom_fields={"nw_device_id": "nw-1"})
+    dev_obj.site = MagicMock(id=1, slug="discovered")
+    eng.nb.dcim.devices.get = MagicMock(return_value=dev_obj)
+    res = eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert dev_obj.site == 77
+    assert res["site"] == {"slug": "mip", "name": "MIP"}
+    placed = _Obj(id=7, name="sw1", custom_fields={"nw_device_id": "nw-1"})
+    placed.site = MagicMock(id=5, slug="olathe")
+    eng.nb.dcim.devices.get = MagicMock(return_value=placed)
+    eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert placed.site.slug == "olathe"
