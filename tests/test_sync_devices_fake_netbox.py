@@ -309,6 +309,15 @@ def test_new_device_role_comes_from_its_probe_profile():
     assert f.db["device-roles"][dev["role_id"]]["slug"] == "bmc"
 
 
+def test_sighting_of_a_vm_address_creates_no_device():
+    f, _ = _world()
+    f.add("ip-addresses", {"address": "10.1.0.40/24", "vrf_id": None,
+                           "assigned_object_type": "virtualization.vminterface",
+                           "assigned_object_id": 7, "custom_fields": {}})
+    _, res = _sync(f, [{"ip": "10.1.0.40", "mac": "", "hostname": "vm-a"}])
+    assert res["skipped"] == 1 and not f.db["devices"]
+
+
 def test_matched_device_keeps_a_type_someone_set():
     f, feed = _world(n_owned=1)
     f.add("device-types", {"id": 42, "slug": "8325-48y8c", "model": "8325-48Y8C"})

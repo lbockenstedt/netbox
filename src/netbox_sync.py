@@ -1595,6 +1595,9 @@ class SyncMixin:
         3. stamp ownership + ``last_seen`` + MAC + switch + per-record cfs;
         4. with a real IP: ``mgmt`` interface + IP + ``primary_ip4``.
         """
+        if d.real_ip and self._ip_on_vm(d.real_ip):
+            run.skipped += 1  # the hypervisor sync owns VM addresses
+            return
         name = self._claim_create_name(run, d, d.default_name)
         # A prior create already 400'd on a missing site — the same 400 hits
         # every record, so stop attempting creates (count once each, one
@@ -1634,6 +1637,17 @@ class SyncMixin:
                           note=f"IP {d.real_ip}/{mask} → {name}")
             self._stamp_last_seen(ipobj)
         run.pushed += 1
+
+    def _ip_on_vm(self, ip: str) -> bool:
+        """True when NetBox has ``ip`` (any VRF) on a VM interface: a sighting
+        of a VM must not mint a device copy of it. Best-effort: False on error."""
+        try:
+            rows = self._api_get_all("/api/ipam/ip-addresses/", {"address": ip})
+        except Exception as e:
+            logger.debug("sync_devices: VM-IP lookup %s failed: %s", ip, e)
+            return False
+        return any(r.get("assigned_object_type") == "virtualization.vminterface"
+                   for r in rows or [] if isinstance(r, dict))
 
     def _claim_create_name(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                            name: str) -> str:
