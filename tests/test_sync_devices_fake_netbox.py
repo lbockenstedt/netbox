@@ -293,6 +293,31 @@ def test_matched_generic_device_takes_the_records_model_and_role():
     assert f.db["device-roles"][dev["role_id"]]["slug"] == "switch"
 
 
+def test_matched_generic_device_is_typed_from_its_name():
+    f, feed = _world(n_owned=1)
+    f.db["devices"][100]["name"] = "U36-AP-02"
+    feed[0]["hostname"] = "unknown"
+    _sync(f, feed)
+    assert f.db["device-roles"][f.db["devices"][100]["role_id"]]["slug"] == "access-point"
+
+
+def test_new_device_role_comes_from_its_probe_profile():
+    f, _ = _world()
+    _sync(f, [{"ip": "10.1.0.9", "mac": "", "hostname": "",
+               "profile": {"http_title": "HPE Integrated Lights-Out 5"}}])
+    dev = next(d for d in f.db["devices"].values() if d["name"] != "")
+    assert f.db["device-roles"][dev["role_id"]]["slug"] == "bmc"
+
+
+def test_sighting_of_a_vm_address_creates_no_device():
+    f, _ = _world()
+    f.add("ip-addresses", {"address": "10.1.0.40/24", "vrf_id": None,
+                           "assigned_object_type": "virtualization.vminterface",
+                           "assigned_object_id": 7, "custom_fields": {}})
+    _, res = _sync(f, [{"ip": "10.1.0.40", "mac": "", "hostname": "vm-a"}])
+    assert res["skipped"] == 1 and not f.db["devices"]
+
+
 def test_matched_device_keeps_a_type_someone_set():
     f, feed = _world(n_owned=1)
     f.add("device-types", {"id": 42, "slug": "8325-48y8c", "model": "8325-48Y8C"})

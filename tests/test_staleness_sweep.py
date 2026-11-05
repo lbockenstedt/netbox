@@ -199,3 +199,29 @@ def test_staleness_sweep_keeps_assigned_ip():
 
     assert res["ip_freed"] == 0
     eng.nb.ipam.ip_addresses.get.assert_not_called()
+
+def test_staleness_sweep_revives_device_seen_after_decommission():
+    # Tombstoned 40 days ago but seen again yesterday → back to active, not deleted.
+    eng = _engine(device_rows=[_row(21, last_seen=_iso(1), status="offline", decomm=_iso(40))])
+    dev = _Obj(id=21, custom_fields={"last_seen": _iso(1), "decommissioned_at": _iso(40)},
+               status="offline")
+    eng.nb.dcim.devices.get.return_value = dev
+
+    res = eng.staleness_sweep(stale_days=7, delete_days=30)
+
+    assert res["revived"] == 1 and res["deleted"] == 0, res
+    assert dev.status == "active"
+    assert dev.custom_fields["decommissioned_at"] is None
+    dev.delete.assert_not_called()
+
+
+def test_staleness_sweep_still_deletes_device_not_seen_since_decommission():
+    eng = _engine(device_rows=[_row(22, last_seen=_iso(45), status="offline", decomm=_iso(38))])
+    dev = _Obj(id=22, custom_fields={"last_seen": _iso(45), "decommissioned_at": _iso(38)},
+               status="offline")
+    eng.nb.dcim.devices.get.return_value = dev
+
+    res = eng.staleness_sweep(stale_days=7, delete_days=30)
+
+    assert res["deleted"] == 1 and res["revived"] == 0, res
+    dev.delete.assert_called_once()
