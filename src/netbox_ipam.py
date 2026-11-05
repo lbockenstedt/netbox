@@ -571,6 +571,7 @@ class IpamMixin:
                     "vrf": (ip.get("vrf") or {}).get("name", "") if isinstance(ip.get("vrf"), dict) else "",
                     "assigned_to": ao.get("display", "") if isinstance(ao, dict) else (str(ao) if ao else ""),
                     "device": device_name,
+                    "tenant": (ip.get("tenant") or {}).get("slug", "") if isinstance(ip.get("tenant"), dict) else "",
                     # Forward custom_fields so the hub can read mac_address for
                     # IPAM→ClearPass endpoint sync (without this, mac is always
                     # empty at the hub and every record skips in CPPM).
