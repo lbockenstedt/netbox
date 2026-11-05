@@ -53,6 +53,8 @@ class StalenessMixin:
           • not seen for ``stale_days`` (default 7) and not already offline →
             set ``status = "offline"`` + ``decommissioned_at = now`` + journal
             entry ``staleness-sweep: decommissioned: not seen since <last_seen>``.
+          • offline but seen again after ``decommissioned_at`` → revived
+            (``status = "active"``, ``decommissioned_at`` cleared).
           • offline with ``decommissioned_at`` older than ``delete_days``
             (default 30) → DELETE the object. Deleting a device/VM frees its
             assigned IPs automatically (assigned_object goes null); an
@@ -62,7 +64,7 @@ class StalenessMixin:
         errors, message, per_tenant}``. Never raises — a sweep failure is
         per-object and recorded in ``errors`` so one bad row can't abort the run.
         """
-        scanned = 0; decommissioned = 0; deleted = 0; ip_freed = 0; errors = 0
+        scanned = 0; decommissioned = 0; deleted = 0; revived = 0; ip_freed = 0; errors = 0
         first_err: Optional[str] = None
         per_tenant: Dict[str, Dict[str, int]] = {}
 
@@ -85,6 +87,18 @@ class StalenessMixin:
             if dt is None:
                 return None
             return (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
+
+        def _seen_since(last_seen: str, decomm: str) -> bool:
+            """Seen again after it was decommissioned (e.g. it answers pings again)."""
+            ls_dt, dc_dt = self._parse_iso_cf(last_seen), self._parse_iso_cf(decomm)
+            return bool(ls_dt and dc_dt and ls_dt > dc_dt)
+
+        def _revive(obj) -> None:
+            obj.status = "active"
+            m = dict(obj.custom_fields or {})
+            m["decommissioned_at"] = None
+            obj.custom_fields = m
+            obj.save()
 
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
@@ -170,10 +184,12 @@ class StalenessMixin:
                 # per-row ``.get(id)`` round-trip entirely (was an N+1 fetch on
                 # every device, even ones far from any threshold). Only fetch
                 # the live object when we're actually about to mutate it.
-                action = None  # "delete" | "decommission" | None
+                action = None  # "revive" | "delete" | "decommission" | None
                 if status_val == "offline" and decomm:
                     dage = _age_days(decomm)
-                    if dage is not None and dage >= cutoff_delete:
+                    if _seen_since(ls, decomm):
+                        action = "revive"
+                    elif dage is not None and dage >= cutoff_delete:
                         action = "delete"
                 if action is None and age >= cutoff_stale and status_val != "offline":
                     action = "decommission"
@@ -189,6 +205,12 @@ class StalenessMixin:
                         _bucket(tslug)["deleted"] += 1
                         self._journal("dcim.device", row["id"], "staleness-sweep",
                                        note=f"deleted: offline since {decomm}")
+                        continue
+                    if action == "revive":
+                        _revive(obj)
+                        revived += 1
+                        self._journal("dcim.device", row["id"], "staleness-sweep",
+                                       note=f"revived: seen {ls} after decommission {decomm}")
                         continue
                     # 7-day decommission: unseen past stale_days + not yet offline.
                     try:
@@ -236,7 +258,9 @@ class StalenessMixin:
                 action = None
                 if status_val == "offline" and decomm:
                     dage = _age_days(decomm)
-                    if dage is not None and dage >= cutoff_delete:
+                    if _seen_since(ls, decomm):
+                        action = "revive"
+                    elif dage is not None and dage >= cutoff_delete:
                         action = "delete"
                 if action is None and age >= cutoff_stale and status_val != "offline":
                     action = "decommission"
@@ -253,6 +277,13 @@ class StalenessMixin:
                         self._journal("virtualization.virtualmachine", row["id"],
                                        "staleness-sweep",
                                        note=f"deleted: offline since {decomm}")
+                        continue
+                    if action == "revive":
+                        _revive(obj)
+                        revived += 1
+                        self._journal("virtualization.virtualmachine", row["id"],
+                                       "staleness-sweep",
+                                       note=f"revived: seen {ls} after decommission {decomm}")
                         continue
                     try:
                         obj.status = "offline"
@@ -312,14 +343,14 @@ class StalenessMixin:
                     logger.debug("staleness_sweep: IP %s failed: %s", row["id"], e)
 
             msg = (f"swept {scanned} object(s): {decommissioned} decommissioned, "
-                   f"{deleted} deleted, {ip_freed} IP(s) freed, {errors} errors")
+                   f"{revived} revived, {deleted} deleted, {ip_freed} IP(s) freed, {errors} errors")
             if errors and first_err:
                 msg += f" — first error: {first_err}"
                 logger.warning("staleness_sweep: %s", msg)
             else:
                 logger.info("staleness_sweep: %s", msg)
             return {"status": "SUCCESS", "scanned": scanned,
-                    "decommissioned": decommissioned, "deleted": deleted,
+                    "decommissioned": decommissioned, "revived": revived, "deleted": deleted,
                     "ip_freed": ip_freed, "errors": errors, "message": msg,
                     "per_tenant": per_tenant}
         except Exception as e:
