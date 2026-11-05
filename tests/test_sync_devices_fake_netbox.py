@@ -231,6 +231,28 @@ def test_other_tenants_mac_is_adopted_and_tenant_rows_win():
     assert len(f.db["devices"]) == 1
 
 
+def test_untenanted_device_holding_the_ip_is_matched_and_adopted():
+    # A device that lost its tenant still owns the tenant's IP: an IP-only
+    # sighting updates it (and tenants it) instead of creating a duplicate
+    # whose IP reassign fails.
+    f, _ = _world()
+    _add_device(f, 300, "DEVICE-AABBCC000303", "aa:bb:cc:00:03:03", "10.1.0.50", "",
+                {"discovered_from": "Network Devices"}, tenant_id=None)
+    f.db["ip-addresses"][302]["tenant_id"] = 1
+    _, res = _sync(f, [{"ip": "10.1.0.50", "mac": "", "hostname": ""}], source="Network Sweep")
+    assert res["pushed"] == 1 and res["errors"] == 0, res
+    assert list(f.db["devices"]) == [300] and f.db["devices"][300]["tenant_id"] == 1
+
+
+def test_untenanted_device_on_another_tenants_ip_is_not_adopted():
+    f, _ = _world()
+    _add_device(f, 300, "DEVICE-AABBCC000303", "aa:bb:cc:00:03:03", "10.1.0.50", "",
+                {"discovered_from": "Network Devices"}, tenant_id=None)
+    f.db["ip-addresses"][302]["tenant_id"] = 2
+    _sync(f, [{"ip": "10.1.0.50", "mac": "", "hostname": ""}], source="Network Sweep")
+    assert f.db["devices"][300]["tenant_id"] is None
+
+
 def test_global_listing_failure_fails_the_sync_instead_of_duplicating():
     # Matching on the tenant's rows alone can't see another tenant's record of
     # the same MAC/serial, so it would mint a copy: fail and retry instead.

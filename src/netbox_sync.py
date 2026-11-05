@@ -965,6 +965,13 @@ class SyncMixin:
             # rows still win, and replace-delete stays tenant-scoped (owned_ips).
             if all_rows is not None:
                 self._add_global_identities(run.by_mac, run.by_serial, rows=all_rows)
+                # A device with NO tenant holding one of this tenant's IPs is
+                # this tenant's: match it by IP (and adopt it) instead of
+                # minting a duplicate whose IP reassign then fails.
+                for r in all_rows:
+                    addr = _primary_addr(r)
+                    if addr and not r.get("tenant"):
+                        run.by_ip.setdefault(addr, r)
 
             if replace and tenant_slug:
                 self._delete_vanished_owned_devices(run, incoming)
@@ -1289,6 +1296,8 @@ class SyncMixin:
             row = run.by_mac.get(d.mac)
         if row is None and d.keyed_by_ip:
             row = run.by_ip.get(d.key)
+            if row is not None and not row.get("tenant") and not self._ip_is_tenants(run, row):
+                row = None
         if row is None and d.has_hostname:
             row = self._adoptable_by_name(run, d)
         return row
@@ -1358,6 +1367,7 @@ class SyncMixin:
         rname = str(row.get("name") or "").strip().lower()
         if rname:
             run.used_names.add(rname)
+        self._adopt_untenanted_device(run, row)
         self._identify_matched_device(run, d, row)
         self._site_matched_device(run, d, row)
         if run.source_of_truth == "netbox":
@@ -1372,6 +1382,33 @@ class SyncMixin:
             self._stamp_matched_device_fields(run, d, row)
             self._rename_or_touch_matched_device(run, d, row)
         run.pushed += 1
+
+    def _ip_is_tenants(self, run: "_DeviceSyncRun", row: dict) -> bool:
+        """True when the untenanted ``row``'s primary IP belongs to this sync's
+        tenant (or to none): overlapping VRFs mean the same address can be
+        another tenant's."""
+        if not run.tenant:
+            return True
+        try:
+            ip = self.nb.ipam.ip_addresses.get((row.get("primary_ip4") or {}).get("id"))
+        except Exception:  # noqa: BLE001
+            return False
+        t = getattr(ip, "tenant", None) if ip else None
+        return ip is not None and (t is None or getattr(t, "id", None) == run.tenant.id)
+
+    def _adopt_untenanted_device(self, run: "_DeviceSyncRun", row: dict) -> None:
+        """Give a matched device with no tenant this sync's tenant. Best-effort."""
+        if row.get("tenant") or not run.tenant:
+            return
+        try:
+            devobj = self._device_record(run, row["id"])
+            if devobj:
+                devobj.tenant = run.tenant.id
+                devobj.save()
+                row["tenant"] = {"id": run.tenant.id, "slug": run.tenant_slug}
+        except Exception as e:  # noqa: BLE001
+            run.forget_device(row["id"])
+            logger.debug("sync_devices: adopt untenanted device %s: %s", row.get("id"), e)
 
     def _site_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                              row: dict) -> None:
