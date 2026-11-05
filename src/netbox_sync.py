@@ -1476,12 +1476,15 @@ class SyncMixin:
         """``replace=True`` (tenant-scoped only — the caller checks): delete
         devices THIS source created (``owned_ips``) whose primary IP is absent
         from the incoming set. Human / other-source devices are never touched.
-        A failed delete is counted as an error, not raised."""
+        A device carrying ``last_seen`` is left to the staleness sweep
+        (offline after stale_days, deleted delete_days later): one feed cycle
+        missing it is not proof it is gone. A failed delete is counted as an
+        error, not raised."""
         # Owned IPs not present in the incoming feed are the stale ones.
         for ip_str in list(run.owned_ips - set(incoming.keys())):
             # Find the device row for that IP; skip if it is no longer indexed.
             row = run.by_ip.get(ip_str)
-            if not row:
+            if not row or (row.get("custom_fields") or {}).get("last_seen"):
                 continue
             # Delete it; a failure is recorded as an error and the loop continues.
             try:

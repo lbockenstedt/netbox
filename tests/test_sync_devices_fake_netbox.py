@@ -282,10 +282,17 @@ def test_replace_delete_of_a_device_already_gone_is_a_silent_noop():
 
 def test_replace_delete_removes_vanished_owned_device_and_its_ip():
     f, feed = _world(n_owned=2)
+    f.db["devices"][103]["custom_fields"].pop("last_seen")
     _, res = _sync(f, feed[:1], replace=True)
     assert res["deleted"] == 1, res
     assert 103 not in f.db["devices"] and 105 not in f.db["ip-addresses"]
     assert 100 in f.db["devices"]
+
+
+def test_replace_leaves_a_vanished_seen_device_to_the_staleness_sweep():
+    f, feed = _world(n_owned=2)
+    _, res = _sync(f, feed[:1], replace=True)
+    assert res["deleted"] == 0 and 103 in f.db["devices"], res
 
 
 def test_netbox_source_of_truth_fills_only_empty_values_delta_only():
