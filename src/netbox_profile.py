@@ -6,7 +6,7 @@ HTTP title/server/realm, SSH banner). A device with nothing better stays on the
 generic 'discovered' role; this turns those clues into a real role slug.
 
 Order: specific profile evidence, then hostname tokens, then generic OS/web
-server evidence ("server"). Returns "" when nothing matches.
+server evidence ("server"), then a hypervisor MAC OUI ("virtual-machine"). Returns "" when nothing matches.
 """
 # re matches the role patterns against profile text and hostname tokens.
 import re
@@ -52,6 +52,15 @@ _HOSTNAME_RULES: List[Tuple[str, str]] = [
     ("server", r"SVR\d*|SRV\d*|SERVER\d*|DC\d+"),
 ]
 
+# MAC OUIs that hypervisors assign to guest NICs: the host is a virtual machine.
+_VM_OUIS = {
+    "BC2411",                      # Proxmox VE
+    "005056", "000C29", "000569",  # VMware
+    "525400",                      # QEMU / KVM
+    "00155D",                      # Hyper-V
+    "080027",                      # VirtualBox
+}
+
 # A bare IPv4 address used as a "hostname" carries no role clues.
 _IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
@@ -78,8 +87,8 @@ def hostname_tokens(hostname: str) -> List[str]:
     return [t for t in re.split(r"[^A-Za-z0-9]+", name.split(".")[0].upper()) if t]
 
 
-def guess_role(hostname: str = "", profile: Dict[str, Any] = None) -> str:
-    """Role slug for a device from its hostname + probe profile, or ""."""
+def guess_role(hostname: str = "", profile: Dict[str, Any] = None, mac: str = "") -> str:
+    """Role slug for a device from its hostname + probe profile + MAC, or ""."""
     # 1) Specific evidence from what the device answered with.
     text = profile_text(profile)
     for role, pattern in _PROFILE_RULES:
@@ -93,5 +102,8 @@ def guess_role(hostname: str = "", profile: Dict[str, Any] = None) -> str:
     # 3) A generic OS / web-server banner means at least "server".
     if text and re.search(_SERVER_RULE, text):
         return "server"
+    # 4) A hypervisor-assigned MAC means a virtual machine.
+    if re.sub(r"[^0-9A-F]", "", str(mac or "").upper())[:6] in _VM_OUIS:
+        return "virtual-machine"
     # No clue matched: leave the device on its generic role.
     return ""

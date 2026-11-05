@@ -1718,7 +1718,7 @@ class SyncMixin:
         # Identity the record carries: a model, and an explicit or guessed role.
         model = d.rec.get("model", "")
         rec_role = d.rec.get("role", "") or guess_role(
-            d.hostname if d.has_hostname else row.get("name", ""), d.rec.get("profile"))
+            d.hostname if d.has_hostname else row.get("name", ""), d.rec.get("profile"), d.mac)
         # Nothing to upgrade to.
         if not (model or rec_role):
             return
@@ -2093,7 +2093,7 @@ class SyncMixin:
         # Role: per-record first, else a guess when the batch default is generic, else the default.
         rec_role = d.rec.get("role")
         if not rec_role and _ref_slug(run.role) in ("", _GENERIC_SLUG):
-            rec_role = guess_role(d.hostname if d.has_hostname else "", d.rec.get("profile"))
+            rec_role = guess_role(d.hostname if d.has_hostname else "", d.rec.get("profile"), d.mac)
         create_role = self._ensure_device_role(rec_role) if rec_role else run.role
         if create_role:
             kwargs["role"] = create_role.id
