@@ -73,6 +73,9 @@ CUSTOM_FIELDS_SPEC = [
     # firewall discovery stamps with mac_address for CPPM/DNS identity must
     # never silently turn into a DHCP reservation. Default false/unset.
     ("dhcp_reservation", "boolean", "DHCP reservation", "ipam.ipaddress"),
+    # Per-device ClearPass role override (a ClearPass role named SSPLM-*),
+    # picked in LM and pushed to the ClearPass endpoint as LM_Role. Empty = none.
+    ("nac_role", "text", "NAC role override", "ipam.ipaddress"),
     # Access-tracker (NAC→IPAM reverse sync) + network-devices (nw) ARP/MAC-table
     # endpoint topology (dcim.device). switch_name is the source switch's name
     # (ClearPass nas_name / nw fleet device name); switch_ip its mgmt IP;
