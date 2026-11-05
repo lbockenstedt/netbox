@@ -1,4 +1,5 @@
 """DCIM sites/racks/devices + health + universal search methods for NetboxEngine."""
+# Standard library: addresses, JSON, logging, regex, locks, timing, paths.
 import ipaddress
 import json
 import logging
@@ -6,41 +7,50 @@ import re
 import threading
 import time
 from pathlib import Path
+# Type hints.
 from typing import Any, Dict, List, Optional
 
+# Shares the engine's logger name so all engine messages go to one place.
 logger = logging.getLogger("NetboxEngine")
 
+# Search inventory cache limits.
 _SEARCH_INV_TTL = 60.0      # seconds a cached inventory snapshot stays valid
 _SEARCH_INV_MAX = 20000     # max rows kept per type (device / ip / vm)
 _SEARCH_MATCH_LIMIT = 50    # max inventory matches returned per type
+# A query made only of MAC characters, and a filter that strips non-hex.
 _MAC_QUERY_RE = re.compile(r"^[0-9a-f:.\-]+$")
 _NON_HEX_RE = re.compile(r"[^0-9a-f]")
 
 
 def _status_of(obj: Dict, key: str = "value") -> str:
     """Extract status string value or label from a dictionary object."""
+    # Status may be a dict (value/label) or a bare string.
     st = obj.get("status") or {}
     return st.get(key, "") if isinstance(st, dict) else str(st)
 
 
 def _tags_of(obj: Dict) -> str:
     """Format an object's tags list into a comma-separated string."""
+    # Collect each tag's name.
     names = []
     for t in obj.get("tags") or []:
         n = (t.get("name") or t.get("display") or "") if isinstance(t, dict) else str(t)
         if n:
             names.append(n)
+    # Comma-joined.
     return ",".join(names)
 
 
 def _nested(obj: Dict, key: str, field: str = "name") -> str:
     """Safely extract a nested dictionary field string."""
+    # Field of a nested dict, or empty.
     v = obj.get(key)
     return (v.get(field) or "") if isinstance(v, dict) else ""
 
 
 def _finish_row(row: Dict, extra: List[str]) -> Dict:
     """Attach the private _hay / _mac_hex search keys to an inventory row."""
+    # Every searchable field, plus the bare IP and any extras.
     ip = row.get("ip") or ""
     parts = [row.get(k) or "" for k in (
         "name", "serial", "asset_tag", "device_type", "manufacturer", "role",
@@ -49,17 +59,21 @@ def _finish_row(row: Dict, extra: List[str]) -> Dict:
     parts.append(ip)
     parts.append(ip.split("/")[0])
     parts.extend(extra)
+    # Lowercased haystack and hex-only MAC for matching.
     row["_hay"] = " ".join(str(p) for p in parts if p).lower()
     row["_mac_hex"] = _NON_HEX_RE.sub("", (row.get("mac") or "").lower())
+    # Same row, with search keys added.
     return row
 
 
 def _device_row(d: Dict) -> Dict:
     """Format a NetBox device dict into a normalized search inventory row."""
+    # Custom fields, primary IP, device type and role (old or new key).
     cf = d.get("custom_fields") or {}
     pip = d.get("primary_ip")
     dt = d.get("device_type") if isinstance(d.get("device_type"), dict) else {}
     role = d.get("role") if d.get("role") is not None else d.get("device_role")
+    # Build the row and add search keys.
     return _finish_row({
         "source":       "netbox",
         "type":         "device",
@@ -83,8 +97,10 @@ def _device_row(d: Dict) -> Dict:
 
 def _ip_row(ip: Dict) -> Dict:
     """Format a NetBox IP address dict into a normalized search inventory row."""
+    # Custom fields and assigned interface.
     cf = ip.get("custom_fields") or {}
     ao = ip.get("assigned_object")
+    # Build the row and add search keys.
     return _finish_row({
         "source":      "netbox",
         "type":        "ip",
@@ -103,7 +119,9 @@ def _ip_row(ip: Dict) -> Dict:
 
 def _vm_row(vm: Dict) -> Dict:
     """Format a NetBox VM dict into a normalized search inventory row."""
+    # Primary IP.
     pip = vm.get("primary_ip")
+    # Build the row and add search keys (status value as an extra).
     return _finish_row({
         "source":  "netbox",
         "type":    "vm",
@@ -120,6 +138,7 @@ def _vm_row(vm: Dict) -> Dict:
 
 # Bundled Aruba/HPE/Juniper device-type catalog loaded by seed_catalog(). Lives
 # next to this module so the spoke ships it without an extra install step.
+# Path to the bundled catalog.
 _SEED_CATALOG_PATH = Path(__file__).parent / "seed_catalog.json"
 
 
@@ -130,22 +149,28 @@ class DcimMixin:
 
     def get_system_health(self) -> Dict[str, Any]:
         """Perform a quick health check query against the NetBox DCIM API."""
+        # Fetch one site to prove the API answers.
         try:
             data = self._api_get("/api/dcim/sites/", {"limit": 1})
             return {"status": "SUCCESS", "api_reachable": True, "site_count": data.get("count", 0)}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     # ─── DCIM – Sites / Racks / Devices ───────────────────────────────────────
 
     def get_sites(self) -> Dict[str, Any]:
         """Retrieve all sites configured in NetBox."""
+        # Fetch every site.
         try:
             rows = self._api_get_all("/api/dcim/sites/")
+            # Keep id, name and slug.
             sites = [{"id": s["id"], "name": s["name"], "slug": s["slug"]}
                      for s in rows]
+            # All sites.
             return {"status": "SUCCESS", "sites": sites}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def get_racks(self, site: Optional[str] = None, tenant: Optional[str] = None,
@@ -154,7 +179,9 @@ class DcimMixin:
 
         ``tenant_group`` supersedes ``tenant`` and unions every tenant in the
         group (and its descendant groups) — see :meth:`get_prefixes`."""
+        # Any API failure becomes an ERROR envelope.
         try:
+            # Build the filter parameters.
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
@@ -163,8 +190,10 @@ class DcimMixin:
                 params["tenant_group"] = tenant_group
             elif tenant:
                 params["tenant"] = tenant
+            # Fetch every page.
             rows = self._api_get_all("/api/dcim/racks/", params)
             racks = []
+            # Flatten each rack.
             for r in rows:
                 racks.append({
                     "id": r["id"],
@@ -173,8 +202,10 @@ class DcimMixin:
                     "u_height": r.get("u_height"),
                     "facility_id": r.get("facility_id"),
                 })
+            # All racks.
             return {"status": "SUCCESS", "racks": racks}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def get_devices(self, site: Optional[str] = None, rack: Optional[str] = None,
@@ -184,7 +215,9 @@ class DcimMixin:
 
         ``tenant_group`` supersedes ``tenant`` and unions every tenant in the
         group (and its descendant groups) — see :meth:`get_prefixes`."""
+        # Any API failure becomes an ERROR envelope.
         try:
+            # Build the filter parameters.
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
@@ -195,8 +228,10 @@ class DcimMixin:
                 params["tenant_group"] = tenant_group
             elif tenant:
                 params["tenant"] = tenant
+            # Fetch every page.
             rows = self._api_get_all("/api/dcim/devices/", params)
             devices = []
+            # Flatten each device.
             for d in rows:
                 status = d.get("status") or {}
                 devices.append({
@@ -212,8 +247,10 @@ class DcimMixin:
                     "serial": d.get("serial") or "",
                     "mac": str((d.get("custom_fields") or {}).get("mac_address") or ""),
                 })
+            # All devices.
             return {"status": "SUCCESS", "devices": devices}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def get_cables(self, site: Optional[str] = None) -> Dict[str, Any]:
@@ -229,17 +266,23 @@ class DcimMixin:
         not raised as an error — an operator's cable inventory is never fully
         "topology-clean" and one odd row must not blank the rest.
         """
+        # Any API failure becomes an ERROR envelope.
         try:
+            # Optional site filter.
             params: Dict[str, Any] = {}
             if site:
                 params["site"] = site
+            # Fetch every page.
             rows = self._api_get_all("/api/dcim/cables/", params)
             cables = []
+            # Reduce each cable to its first interface on each end.
             for c in rows:
                 a = self._first_interface_termination(c.get("a_terminations"))
                 b = self._first_interface_termination(c.get("b_terminations"))
+                # Skip cables that do not join two interfaces.
                 if not a or not b:
                     continue
+                # Flatten the cable.
                 status = c.get("status") or {}
                 cables.append({
                     "id": c["id"],
@@ -250,8 +293,10 @@ class DcimMixin:
                     "status": status.get("value", "") if isinstance(status, dict) else str(status),
                     "label": c.get("label") or "",
                 })
+            # All usable cables.
             return {"status": "SUCCESS", "cables": cables}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def sync_cable(self, a_device: str, a_port: str, b_device: str,
@@ -274,18 +319,22 @@ class DcimMixin:
         an unexpected NetBox API failure; never raises.
         """
         try:
+            # All four inputs are required.
             if not a_device or not b_device or not a_port or not b_port:
                 return {"status": "ERROR",
                         "message": "a_device/a_port/b_device/b_port are all required"}
 
+            # Both devices must already exist.
             dev_a = self._device_by_name(a_device)
             dev_b = self._device_by_name(b_device)
             if not dev_a or not dev_b:
                 missing = a_device if not dev_a else b_device
                 return {"status": "SKIPPED",
                         "message": f"device '{missing}' not in NetBox"}
+            # Cable them.
             return self._cable_devices(dev_a, a_port, dev_b, b_port, status)
         except Exception as e:
+            # Log and return the error.
             logger.error("sync_cable failed: %s", e)
             return {"status": "ERROR", "message": str(e)}
 
@@ -293,33 +342,42 @@ class DcimMixin:
         """A NetBox device by name, ignoring case and the domain suffix:
         ``mipbe-ssplm-pxmx02.orange-tme.com`` finds ``MIPBE-SSPLM-PXMX02``.
         A short name matching several devices is ambiguous -> ``None``."""
+        # Empty name: nothing to find.
         name = str(name or "").strip()
         if not name:
             return None
+        # Exact match.
         dev = self.nb.dcim.devices.get(name=name)
         if dev:
             return dev
+        # Case-insensitive match, if unique.
         hits = list(self.nb.dcim.devices.filter(name__ie=name))
         if len(hits) == 1:
             return hits[0]
+        # FQDN (not an IP): match on the short host name, if unique.
         if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name):
             short = name.split(".", 1)[0]
             hits = [d for d in self.nb.dcim.devices.filter(name__isw=short)
                     if str(d.name or "").split(".", 1)[0].casefold() == short.casefold()]
             if len(hits) == 1:
                 return hits[0]
+        # Not found or ambiguous.
         return None
 
     @staticmethod
     def _iface_cable_peer(iface):
         """Return (device_name, port_name) of the far end of a cable, or None."""
+        # No cable: no peer.
         if not getattr(iface, "cable", None):
             return None
+        # Far-end objects, under whichever attribute this NetBox exposes.
         peers = getattr(iface, "link_peers", None) or getattr(iface, "connected_endpoints", None) or getattr(iface, "connected_endpoint", None)
         if peers and not isinstance(peers, (list, tuple)):
             peers = [peers]
+        # Cabled but the far end is unknown.
         if not peers:
             return ("(unknown)", "")
+        # Device and port of the first far end.
         p = peers[0]
         device = p.get("device") if isinstance(p, dict) else getattr(p, "device", None)
         port = p.get("name") if isinstance(p, dict) else getattr(p, "name", "")
@@ -328,30 +386,40 @@ class DcimMixin:
     def _cable_devices(self, dev_a, a_port: str, dev_b, b_port: str,
                        status: str = "connected") -> Dict[str, Any]:
         """Cable two resolved NetBox devices port-to-port (see :meth:`sync_cable`)."""
+        # Display names for messages.
         a_device = self._name_of(dev_a)
         b_device = self._name_of(dev_b)
+        # Any API failure becomes an ERROR envelope.
         try:
 
+            # Helper: get or create a port on a device.
             def _find_or_create_iface(dev, port_name):
+                """Interface ``port_name`` on ``dev``, created if missing."""
+                # Existing interface.
                 iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
                 if iface:
                     return iface
+                # Otherwise create it.
                 return self.nb.dcim.interfaces.create(
                     device=dev.id, name=port_name, type="other")
 
+            # Both ports.
             iface_a = _find_or_create_iface(dev_a, a_port)
             iface_b = _find_or_create_iface(dev_b, b_port)
 
             def _connected_device_port(iface):
                 """(device_name, port_name) of whatever an interface is
                 already cabled to, or ``None`` if it's unconnected."""
+                # Re-read the interface and return its cable peer.
                 try:
                     fresh = self.nb.dcim.interfaces.get(iface.id)
                     return self._iface_cable_peer(fresh) if fresh else None
                 except Exception as e:
+                    # Check failed: treat as unconnected.
                     logger.debug("sync_cable: connected-endpoint check failed: %s", e)
                     return None
 
+            # Port A already cabled: same peer is a no-op; a different one is left alone.
             existing = _connected_device_port(iface_a)
             if existing is not None:
                 if existing[0].casefold() == b_device.casefold():
@@ -362,6 +430,7 @@ class DcimMixin:
                         "message": f"{a_device}:{a_port} already cabled to "
                                    f"{existing[0]}:{existing[1]} — not overwriting"}
 
+            # Same check for port B.
             existing_b = _connected_device_port(iface_b)
             if existing_b is not None:
                 if existing_b[0].casefold() == a_device.casefold():
@@ -372,15 +441,18 @@ class DcimMixin:
                         "message": f"{b_device}:{b_port} already cabled to "
                                    f"{existing_b[0]}:{existing_b[1]} — not overwriting"}
 
+            # Create the cable.
             self.nb.dcim.cables.create(
                 a_terminations=[{"object_type": "dcim.interface",
                                  "object_id": iface_a.id}],
                 b_terminations=[{"object_type": "dcim.interface",
                                  "object_id": iface_b.id}],
                 status=status or "connected")
+            # Done.
             return {"status": "SUCCESS",
                     "message": f"cabled {a_device}:{a_port} <-> {b_device}:{b_port}"}
         except Exception as e:
+            # Log and return the error.
             logger.error("sync_cable failed: %s", e)
             return {"status": "ERROR", "message": str(e)}
 
@@ -393,21 +465,30 @@ class DcimMixin:
         twin (the ``(name, site, tenant)`` unique constraint) is reported and
         skipped -- the duplicate is left for "Merge duplicates" to resolve.
         """
+        # Optional tenant filter.
         params: Dict[str, Any] = {}
         if tenant_slug:
             params["tenant"] = tenant_slug
+        # List devices.
         try:
             rows = self._api_get_all("/api/dcim/devices/", params)
         except Exception as e:
+            # Listing failed.
             return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}"}
+        # Counters and up to 20 detail messages.
         renamed = collisions = errors = 0
         details: List[str] = []
+        # Rename each device whose name is not upper-case.
         for row in rows:
+            # Current and wanted names.
             name = str(row.get("name") or "")
             want = self._nb_name(name)
+            # Already correct: skip.
             if not name or name == want:
                 continue
+            # Rename failures are counted, not raised.
             try:
+                # Fetch, rename and save.
                 rec = self.nb.dcim.devices.get(row["id"])
                 if not rec:
                     continue
@@ -415,14 +496,17 @@ class DcimMixin:
                 rec.save()
                 renamed += 1
             except Exception as e:
+                # Name clash: count as a collision.
                 if "unique" in str(e).lower() or "already exists" in str(e).lower():
                     collisions += 1
                     if len(details) < 20:
                         details.append(f"{name}: an upper-case {want} already exists")
                 else:
+                    # Any other failure.
                     errors += 1
                     if len(details) < 20:
                         details.append(f"{name}: {e}")
+        # Totals and details.
         return {"status": "SUCCESS" if not errors else "PARTIAL",
                 "message": f"{renamed} renamed, {collisions} collisions, {errors} errors",
                 "renamed": renamed, "collisions": collisions, "errors": errors,
@@ -441,48 +525,60 @@ class DcimMixin:
         upper-cased hostname. Cabling goes through :meth:`_cable_devices`, so a
         human's existing cable on the port is never overwritten.
         """
+        # Result counters and messages.
         counters = {"cabled": 0, "unchanged": 0, "skipped": 0, "created": 0,
                     "renamed": 0, "errors": 0}
         messages = []
 
+        # List every device.
         try:
             rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
         except Exception as e:
+            # Listing failed.
             return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}", **counters}
 
+        # Identity index over existing devices.
         idx = self._index_existing_devices(rows)
 
         # Build by_short index
+        # Count devices by short name.
         by_short = {}
         short_counts = {}
         for row in rows:
             n = str(row.get("name") or "").strip().lower()
             short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
             short_counts[short] = short_counts.get(short, 0) + 1
+        # Index devices whose short name is unique.
         for row in rows:
             n = str(row.get("name") or "").strip().lower()
             short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
             if short_counts[short] == 1:
                 by_short[short] = row
 
+        # Tenant and lazily resolved defaults for created devices.
         tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
         role = dtype = site = None
         created_device = False
 
+        # Cache of resolved ends.
         cache = {}
 
         def resolve(end):
+            """NetBox device row for one link end, created as discovered if unknown."""
             nonlocal role, dtype, site, created_device
+            # Name, MACs and IPs of this end.
             name = str(end.get("name") or "").strip()
             macs = [self._norm_mac(m) for m in end.get("macs") or []]
             macs = [m for m in macs if m]
             ips = [str(a).split("/")[0].strip() for a in end.get("addresses") or []]
             ips = [ip for ip in ips if ip]
 
+            # Cache key: the name, else the first MAC.
             key = name.lower() or (macs[0] if macs else "")
             if key in cache:
                 return cache[key]
 
+            # Resolution failures are counted and the end is skipped.
             row = None
             try:
                 # Hardware identities first: SERIAL, then MAC, then nw_device_id.
@@ -510,13 +606,17 @@ class DcimMixin:
                     short = name.lower().split(".", 1)[0] if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) else name.lower()
                     row = by_short.get(short)
             except Exception as e:
+                # Resolution failed.
                 counters["errors"] += 1
                 messages.append(f"failed to resolve device {name}: {e}")
                 return None
 
+            # Existing device: backfill its MAC and adopt the LLDP name.
             rec = None
             if row:
+                # Update failures are only logged.
                 try:
+                    # Fetch the record; set the MAC if it has none.
                     rec = self.nb.dcim.devices.get(row["id"])
                     if rec and macs and not (rec.custom_fields or {}).get("mac_address"):
                         cf = dict(rec.custom_fields or {})
@@ -529,10 +629,12 @@ class DcimMixin:
                             rec, name, idx["by_name"], source="lldp"):
                         counters["renamed"] += 1
                 except Exception as e:
+                    # Update failed.
                     logger.debug(f"failed to update custom fields for device {row['id']}: {e}")
             elif create_missing and len(name) >= 3 and ".." not in name \
                     and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name) and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) \
                     and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())):
+                # First creation: provision custom fields and resolve role/type/site once.
                 if not created_device:
                     try:
                         self._ensure_custom_fields()
@@ -543,11 +645,13 @@ class DcimMixin:
                     site = self._resolve_site("", tenant)
                     created_device = True
 
+                # Defaults could not be resolved.
                 if not role or not dtype or not site:
                     counters["errors"] += 1
                     messages.append(f"failed to resolve device role/type/site for {name}")
                     return None
 
+                # Upper-case short host name and the create payload.
                 new_name = self._nb_name(name.split(".", 1)[0])
                 ck = {
                     "name": new_name,
@@ -556,10 +660,13 @@ class DcimMixin:
                     "site": site.id,
                     "status": "active"
                 }
+                # Attribute it to the tenant.
                 if tenant:
                     ck["tenant"] = tenant.id
 
+                # Create failures are counted and the end is skipped.
                 try:
+                    # Create, tag as LLDP-discovered and journal it.
                     rec = self.nb.dcim.devices.create(**ck)
                     rec.custom_fields = {"discovered_from": "LLDP", **({"mac_address": macs[0]} if macs else {})}
                     rec.save()
@@ -575,32 +682,41 @@ class DcimMixin:
                     short = new_name.lower().split(".", 1)[0] if "." in new_name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", new_name) else new_name.lower()
                     by_short[short] = {"id": rec.id, "name": new_name}
                 except Exception as e:
+                    # Create failed.
                     counters["errors"] += 1
                     messages.append(f"failed to create device {new_name}: {e}")
                     return None
             else:
+                # Unknown and not creatable.
                 rec = None
 
+            # Cache and return.
             if key:
                 cache[key] = rec
             return rec
 
+        # Cable each link.
         for link in links:
+            # Skip malformed links.
             if not isinstance(link, dict):
                 continue
+            # Both port names are required.
             a_port = str(link.get("a_port") or "").strip()
             b_port = str(link.get("b_port") or "").strip()
             if not a_port or not b_port:
                 counters["skipped"] += 1
                 continue
 
+            # Resolve both ends.
             ra = resolve(link.get("a") or {})
             rb = resolve(link.get("b") or {})
 
+            # Skip unresolved ends and self-links.
             if not ra or not rb or ra.id == rb.id:
                 counters["skipped"] += 1
                 continue
 
+            # Cable them and count the outcome.
             res = self._cable_devices(ra, a_port, rb, b_port)
             st = res.get("status")
             if st == "SUCCESS":
@@ -614,6 +730,7 @@ class DcimMixin:
                 counters["errors"] += 1
                 messages.append(res.get("message", ""))
 
+        # Overall status and summary.
         status = "SUCCESS" if counters["errors"] == 0 else "PARTIAL"
         return {
             "status": status,
@@ -627,42 +744,55 @@ class DcimMixin:
         """Pick the first ``dcim.interface`` termination out of a cable end's
         termination list, returning its device name + interface name, or
         ``None`` if that end has no interface termination at all."""
+        # Walk the terminations.
         for t in (terminations or []):
+            # Skip non-interface terminations.
             if not isinstance(t, dict) or t.get("object_type") != "dcim.interface":
                 continue
+            # Device and port name.
             obj = t.get("object") or {}
             device = obj.get("device") or {}
             device_name = device.get("name") if isinstance(device, dict) else ""
             port_name = obj.get("name") or ""
+            # First one with a device wins.
             if device_name:
                 return {"device": device_name, "port": port_name}
+        # No interface termination.
         return None
 
     @staticmethod
     def _name_of(obj) -> str:
         """Read a .name from a NetBox nested object that may be a pynetbox
         Record (attribute access) or a plain dict (REST JSON)."""
+        # Nothing to read.
         if obj is None:
             return ""
+        # Plain dict.
         if isinstance(obj, dict):
             return obj.get("name") or ""
+        # pynetbox Record.
         return getattr(obj, "name", "") or ""
 
     def _elev_devsum(self, d) -> Optional[Dict[str, Any]]:
         """Flatten a nested NetBox device (from the elevation unit list or the
         rack's device list) into the summary the WebUI elevation view renders:
         name/model/u_height/role(+color)/status/primary_ip/tenant/face."""
+        # No device.
         if not d:
             return None
+        # Nested parts, each defaulting to empty.
         dt = d.get("device_type") or {}
         role = d.get("role") or {}
         status = d.get("status") or {}
         tenant = d.get("tenant") or {}
         primary_ip = d.get("primary_ip") or d.get("primary_ip4") or d.get("primary_ip6") or {}
+        # Height in units, default 1.
         try:
             u_h = int(dt.get("u_height") or 1)
         except (TypeError, ValueError):
+            # Unparseable height.
             u_h = 1
+        # Summary row.
         return {
             "id": d.get("id"),
             "name": d.get("name") or "",
@@ -690,14 +820,20 @@ class DcimMixin:
         position null/0 — never in the unit list) are returned separately in
         ``zero_u``. Device summaries carry the role ``color`` so slots are
         tinted like NetBox."""
+        # Any API failure becomes an ERROR envelope.
         try:
+            # Look up the rack.
             rack = self.nb.dcim.racks.get(int(rack_id))
+            # Unknown rack: error.
             if not rack:
                 return {"status": "ERROR", "message": f"Rack {rack_id} not found"}
+            # Rack height.
             try:
                 u_height = int(getattr(rack, "u_height", 0) or 0)
             except (TypeError, ValueError):
+                # Unparseable height.
                 u_height = 0
+            # Rack summary.
             rack_meta = {
                 "id": getattr(rack, "id", int(rack_id)),
                 "name": getattr(rack, "name", "") or "",
@@ -716,22 +852,28 @@ class DcimMixin:
                 # (e.g. 25) even ``limit=0`` returns only one truncated page, so a
                 # 42U rack would silently stop at unit 18. ``_api_get_all`` walks
                 # every page, guaranteeing the full elevation regardless of cap.
+                """Every unit on one face, top to bottom, with its device summary."""
                 data = self._api_get_all(
                     f"/api/dcim/racks/{rack_id}/elevation/", {"face": face})
                 # ``_api_get_all`` already returns a flat list; defensively accept
                 # a paginated {results: [...]} shape too.
                 if isinstance(data, dict):
                     data = data.get("results", [])
+                # Build one entry per unit.
                 out = []
                 for u in data:
+                    # Skip malformed rows.
                     if not isinstance(u, dict):
                         continue
+                    # Unit number from the id, else parsed from the name.
                     unit = u.get("id")
                     if unit is None:
                         try:
                             unit = int(str(u.get("name", "")).lstrip("Uu"))
                         except ValueError:
+                            # Unparseable name.
                             unit = None
+                    # Device in this unit, tagged with its face.
                     dev = self._elev_devsum(u.get("device"))
                     if dev is not None:
                         dev["face"] = u.get("face") or face
@@ -741,6 +883,7 @@ class DcimMixin:
                     # units to int; keep an occupied half-U slot defensively.
                     if unit is not None:
                         try:
+                            # Drop empty half-U slots; whole units become ints.
                             uf = float(unit)
                             if uf != int(uf):
                                 if dev is None:
@@ -748,28 +891,36 @@ class DcimMixin:
                             else:
                                 unit = int(uf)
                         except (TypeError, ValueError):
+                            # Not numeric: leave as-is.
                             pass
+                    # Add the unit.
                     out.append({"unit": unit, "device": dev})
                 # Guarantee top→bottom (highest unit first) regardless of API order.
                 out.sort(key=lambda r: (r["unit"] is None, -(r["unit"] or 0)))
+                # Sorted units.
                 return out
 
+            # Both faces.
             front = _units("front")
             rear = _units("rear")
+            # Devices already placed in a unit.
             positioned_ids = {u["device"]["id"] for u in (front + rear)
                               if u.get("device")}
             # 0U / side devices: position null or 0, not in the elevation units.
             all_devs = self._api_get_all("/api/dcim/devices/", {"rack_id": rack_id})
             zero_u = []
+            # Collect devices with no rack position that were not placed above.
             for d in all_devs:
                 pos = d.get("position")
                 if (pos is None or pos == 0) and d.get("id") not in positioned_ids:
                     ds = self._elev_devsum(d)
                     if ds:
                         zero_u.append(ds)
+            # Rack, both faces and the 0U list.
             return {"status": "SUCCESS", "rack": rack_meta,
                     "faces": {"front": front, "rear": rear}, "zero_u": zero_u}
         except Exception as e:
+            # Log and return the error.
             logger.error("get_rack_elevation failed: %s", e)
             return {"status": "ERROR", "message": str(e)}
 
@@ -785,23 +936,29 @@ class DcimMixin:
         status: str = "active",
     ) -> Dict[str, Any]:
         """Create a device and place it in a specific rack unit."""
+        # Any API failure becomes an ERROR envelope.
         try:
+            # Resolve the site.
             site = self.nb.dcim.sites.get(slug=site_slug)
             if not site:
                 return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
 
+            # Resolve the rack at that site.
             rack = self.nb.dcim.racks.get(name=rack_name, site_id=site.id)
             if not rack:
                 return {"status": "ERROR", "message": f"Rack '{rack_name}' not found at site '{site_slug}'"}
 
+            # Resolve the device type.
             device_type = self.nb.dcim.device_types.get(slug=device_type_slug)
             if not device_type:
                 return {"status": "ERROR", "message": f"Device type '{device_type_slug}' not found"}
 
+            # Resolve the role.
             role = self.nb.dcim.device_roles.get(slug=role_slug)
             if not role:
                 return {"status": "ERROR", "message": f"Role '{role_slug}' not found"}
 
+            # Create the device in the rack unit.
             device = self.nb.dcim.devices.create(
                 name=self._nb_name(name),
                 device_type=device_type.id,
@@ -812,8 +969,10 @@ class DcimMixin:
                 face=face,
                 status=status,
             )
+            # New device id.
             return {"status": "SUCCESS", "device_id": device.id, "name": name, "rack": rack_name, "unit": rack_unit}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"add_device_to_rack failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
@@ -823,8 +982,10 @@ class DcimMixin:
         unknown device' modal so the user chooses from real NetBox values
         rather than typing slugs blind."""
         try:
+            # Sites.
             sites = [{"id": s["id"], "name": s["name"], "slug": s["slug"]}
                      for s in self._api_get_all("/api/dcim/sites/")]
+            # Device types with their manufacturer.
             dt_data = self._api_get("/api/dcim/device-types/", {"limit": 500})
             device_types = []
             for d in dt_data.get("results", []):
@@ -835,14 +996,18 @@ class DcimMixin:
                     "model": d.get("model", ""),
                     "manufacturer": mfr.get("name", "") if isinstance(mfr, dict) else str(mfr),
                 })
+            # Device roles.
             dr_data = self._api_get("/api/dcim/device-roles/", {"limit": 500})
             device_roles = [{"id": r["id"], "name": r["name"], "slug": r.get("slug", "")}
                             for r in dr_data.get("results", [])]
+            # Tenants.
             tenants = [{"id": t["id"], "name": t["name"], "slug": t["slug"]}
                        for t in self._api_get_all("/api/tenancy/tenants/")]
+            # All picklists.
             return {"status": "SUCCESS", "sites": sites, "device_types": device_types,
                     "device_roles": device_roles, "tenants": tenants}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"get_device_form_options failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
@@ -858,6 +1023,7 @@ class DcimMixin:
         and leaves 'Unknown Devices'. ``site`` and ``device_type`` are required
         by NetBox; the others are optional."""
         try:
+            # Resolve site, device type, role and tenant; each named one must exist.
             site = self.nb.dcim.sites.get(slug=site_slug) if site_slug else None
             if site_slug and not site:
                 return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
@@ -871,10 +1037,12 @@ class DcimMixin:
             if tenant_slug and not tenant:
                 return {"status": "ERROR", "message": f"Tenant '{tenant_slug}' not found"}
 
+            # Description, with the MAC appended.
             desc = (description or "").strip()
             if mac:
                 desc = f"{desc}\nMAC: {mac}".strip()
 
+            # Upper-case name and the create payload.
             name = self._nb_name(name)
             create_kwargs: Dict[str, Any] = {"name": name, "status": status, "description": desc}
             if device_type:
@@ -885,10 +1053,13 @@ class DcimMixin:
                 create_kwargs["site"] = site.id
             if tenant:
                 create_kwargs["tenant"] = tenant.id
+            # Create the device.
             device = self.nb.dcim.devices.create(**create_kwargs)
 
+            # Attach the IP, if given.
             attached_ip = ""
             if ip_address and ip_address.strip():
+                # Address with a mask.
                 ip_str = ip_address.strip()
                 if "/" in ip_str:
                     full = ip_str
@@ -896,7 +1067,9 @@ class DcimMixin:
                     # Derive the mask from the most specific containing prefix;
                     # fall back to a family-correct host route (/32 IPv4,
                     # /128 IPv6) if the lookup fails/empty.
+                    # Default host mask for the family.
                     mask = "128" if ipaddress.ip_address(ip_str).version == 6 else "32"
+                    # Use the longest containing prefix's mask, if found.
                     try:
                         q: Dict[str, Any] = {"contains": ip_str, "limit": 500}
                         if tenant and self._vrf_id_for_tenant(tenant) is not None:
@@ -908,22 +1081,29 @@ class DcimMixin:
                             prefs.sort(key=lambda n: n.prefixlen, reverse=True)  # longest first
                             mask = str(prefs[0].prefixlen)
                     except Exception as e:
+                        # Lookup failed: keep the host mask.
                         logger.debug(f"containing-prefix lookup for {ip_str} failed, using /32: {e}")
+                    # Address with the derived mask.
                     full = f"{ip_str}/{mask}"
+                # Management interface for the IP.
                 iface = self.nb.dcim.interfaces.create(
                     device=device.id, name="mgmt", type="other")
+                # IP assigned to that interface.
                 ip_kwargs: Dict[str, Any] = {
                     "address": full,
                     "assigned_object_type": "dcim.interface",
                     "assigned_object_id": iface.id,
                 }
+                # Attribute to the tenant and its VRF.
                 if tenant:
                     ip_kwargs["tenant"] = tenant.id
                     _vrf = self._vrf_id_for_tenant(tenant)
                     if _vrf is not None:
                         ip_kwargs["vrf"] = _vrf
+                # DNS name, if given.
                 if dns_name:
                     ip_kwargs["dns_name"] = dns_name
+                # Create the IP.
                 ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
                 # Best-effort: store the MAC on the IP's mac_address custom field
                 # so the NetBox→CPPM endpoint sync (which keys on this field) can
@@ -932,10 +1112,12 @@ class DcimMixin:
                 # save inside try/except so a missing/unconfigured custom field
                 # never breaks the claim — the device + IP are already created.
                 if mac:
+                    # Set the MAC custom field; failure is only logged.
                     try:
                         ip_obj.custom_fields = {"mac_address": mac}
                         ip_obj.save()
                     except Exception as e:
+                        # Custom field missing.
                         logger.debug("claim_device: mac_address custom field set on IP %s skipped: %s", full, e)
                 # Dual-stack: an IPv6 claim must set primary_ip6, not
                 # primary_ip4 — assigning an IPv6 address object to
@@ -943,27 +1125,36 @@ class DcimMixin:
                 # silently forcing it to primary_ip4 would leave IPv4-only
                 # devices with no primary IP at all once a v6-only claim ran.
                 if ipaddress.ip_interface(full).ip.version == 6:
+                    # IPv6 address: primary_ip6.
                     device.primary_ip6 = ip_obj.id
                 else:
+                    # IPv4 address: primary_ip4.
                     device.primary_ip4 = ip_obj.id
+                # Save the device.
                 device.save()
                 attached_ip = ip_obj.address
 
+            # New device id and IP.
             return {"status": "SUCCESS", "device_id": device.id, "name": name,
                     "ip": attached_ip or ip_address, "tenant": tenant_slug or ""}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"claim_device failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def delete_device(self, device_id: int) -> Dict[str, Any]:
         """Delete a device record from NetBox by ID."""
         try:
+            # Look up the device.
             device = self.nb.dcim.devices.get(device_id)
+            # Unknown id: error.
             if not device:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            # Delete it.
             device.delete()
             return {"status": "SUCCESS"}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     # ─── DCIM – Racks (CRUD) ───────────────────────────────────────────────────
@@ -979,9 +1170,12 @@ class DcimMixin:
         stamps the current tenant on create, so an unresolvable slug means the
         tenant's NetBox slug mapping is wrong (not that the user wanted global)."""
         try:
+            # Resolve the site.
             site = self.nb.dcim.sites.get(slug=site_slug)
+            # Unknown site: error.
             if not site:
                 return {"status": "ERROR", "message": f"Site '{site_slug}' not found"}
+            # Resolve the tenant; a named one must exist.
             tenant_id = None
             if tenant_slug:
                 tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
@@ -991,15 +1185,19 @@ class DcimMixin:
                         f"refusing unattributed rack at site '{site_slug}'")
                     return {"status": "ERROR",
                             "message": f"NetBox tenant '{tenant_slug}' not found — rack not created. Check the tenant's NetBox slug mapping."}
+                # Tenant found.
                 tenant_id = tenant.id
+            # Rack payload.
             payload: Dict[str, Any] = {"name": name, "site": site.id, "u_height": u_height}
             if facility_id:
                 payload["facility_id"] = facility_id
             if tenant_id is not None:
                 payload["tenant"] = tenant_id
+            # Create the rack.
             rack = self.nb.dcim.racks.create(**payload)
             return {"status": "SUCCESS", "rack_id": rack.id, "name": name}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"add_rack failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
@@ -1011,36 +1209,47 @@ class DcimMixin:
         ``tenant_slug`` is supplied). A ``None`` tenant_slug leaves the existing
         tenant untouched — so an edit that doesn't send a tenant preserves it."""
         try:
+            # Look up the rack.
             rack = self.nb.dcim.racks.get(rack_id)
+            # Unknown id: error.
             if not rack:
                 return {"status": "ERROR", "message": f"Rack {rack_id} not found"}
+            # Apply only the fields that were passed.
             if name is not None:
                 rack.name = name
             if u_height is not None:
                 rack.u_height = u_height
             if facility_id is not None:
                 rack.facility_id = facility_id
+            # Tenant change: set it, or clear it when empty.
             if tenant_slug is not None:
                 tenant = self.nb.tenancy.tenants.get(slug=tenant_slug) if tenant_slug else None
+                # Named tenant not found.
                 if tenant_slug and not tenant:
                     return {"status": "ERROR",
                             "message": f"NetBox tenant '{tenant_slug}' not found — rack not updated."}
                 rack.tenant = tenant.id if tenant else None
+            # Save and return.
             rack.save()
             return {"status": "SUCCESS", "id": rack.id, "name": rack.name}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"update_rack failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
     def delete_rack(self, rack_id: int) -> Dict[str, Any]:
         """Delete a rack record from NetBox by ID."""
         try:
+            # Look up the rack.
             rack = self.nb.dcim.racks.get(rack_id)
+            # Unknown id: error.
             if not rack:
                 return {"status": "ERROR", "message": f"Rack {rack_id} not found"}
+            # Delete it.
             rack.delete()
             return {"status": "SUCCESS"}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def update_device(self, device_id: int, name: Optional[str] = None,
@@ -1049,29 +1258,39 @@ class DcimMixin:
                       rack_unit: Optional[int] = None) -> Dict[str, Any]:
         """Edit a device's name/status/rack placement."""
         try:
+            # Look up the device.
             device = self.nb.dcim.devices.get(device_id)
+            # Unknown id: error.
             if not device:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
+            # Apply only the fields that were passed.
             if name is not None:
                 device.name = self._nb_name(name)
             if status:
                 device.status = status
+            # Rack change.
             if rack_name is not None:
                 if rack_name:
+                    # Find the rack at the device's site (or anywhere if it has no site).
                     site = device.site
                     site_id = site.id if site else None
                     rack = self.nb.dcim.racks.get(name=rack_name, site_id=site_id) if site_id \
                         else self.nb.dcim.racks.get(name=rack_name)
+                    # Unknown rack: error.
                     if not rack:
                         return {"status": "ERROR", "message": f"Rack '{rack_name}' not found"}
                     device.rack = rack.id
                 else:
+                    # Empty name: remove from rack.
                     device.rack = None
+            # Rack position.
             if rack_unit is not None:
                 device.position = rack_unit
+            # Save and return.
             device.save()
             return {"status": "SUCCESS", "id": device.id, "name": device.name}
         except Exception as e:
+            # Log and return the error.
             logger.error(f"update_device failed: {e}")
             return {"status": "ERROR", "message": str(e)}
 
@@ -1080,56 +1299,72 @@ class DcimMixin:
     def update_device_ip(self, device_name: str, ip_address: str) -> Dict[str, Any]:
         """Update or assign an IP address to a device's primary interface."""
         try:
+            # Find the device.
             device = self._device_by_name(device_name)
+            # Unknown device: error.
             if not device:
                 return {"status": "ERROR", "message": f"Device {device_name} not found"}
+            # Prefer eth0, else the first interface.
             interface = next((i for i in device.interfaces if i.name == 'eth0'), None)
+            # No interfaces at all: error.
             if not interface and not device.interfaces:
                 return {"status": "ERROR", "message": f"No interfaces for {device_name}"}
             interface = interface or list(device.interfaces)[0]
+            # Update the interface's first IP, or create one.
             ip_obj = next(iter(interface.ip_addresses), None)
             if ip_obj:
+                # Change the existing IP.
                 ip_obj.address = ip_address
                 ip_obj.save()
             else:
+                # New IP on the interface.
                 ip_kwargs: Dict[str, Any] = {
                     "address": ip_address,
                     "assigned_object_type": "dcim.interface",
                     "assigned_object_id": interface.id,
                 }
+                # Attribute it to the device's tenant and its VRF.
                 dev_tenant = getattr(device, "tenant", None)
                 if dev_tenant is not None:
                     ip_kwargs["tenant"] = dev_tenant.id
                     _vrf = self._vrf_id_for_tenant(dev_tenant)
                     if _vrf is not None:
                         ip_kwargs["vrf"] = _vrf
+                # Create the IP.
                 self.nb.ipam.ip_addresses.create(**ip_kwargs)
+            # Done.
             return {"status": "SUCCESS", "device": device_name, "ip": ip_address}
         except Exception as e:
+            # API failure.
             return {"status": "ERROR", "message": str(e)}
 
     def _search_inventory(self, tenant_slugs: List[str]) -> Dict[str, List[Dict]]:
         """Scoped device / ip / vm inventory with precomputed search haystacks,
         cached per tenant scope for _SEARCH_INV_TTL seconds. Never raises; a
         type that failed to load is empty and its entry is not cached."""
+        # Cache key and lock (created on first use).
         key = tuple(sorted(tenant_slugs))
         lock = getattr(self, "_search_inv_lock", None)
         if lock is None:
             lock = self.__dict__.setdefault("_search_inv_lock", threading.Lock())
+        # Return a fresh cached snapshot.
         with lock:
             cache = self.__dict__.setdefault("_search_inv_cache", {})
             hit = cache.get(key)
             if hit and time.monotonic() - hit[0] < _SEARCH_INV_TTL:
                 return hit[1]
 
+        # One pass per tenant slug, or a single unscoped pass.
         params_list = [{"tenant": s} for s in tenant_slugs] or [{}]
         inv: Dict[str, List[Dict]] = {}
         ok = True
+        # Load each type of record.
         for name, path, build in (
                 ("device", "/api/dcim/devices/", _device_row),
                 ("ip", "/api/ipam/ip-addresses/", _ip_row),
                 ("vm", "/api/virtualization/virtual-machines/", _vm_row)):
             try:
+                # Fetch every page per pass, skipping ids already seen.
                 seen_ids: set = set()
                 rows: List[Dict] = []
                 for tp in params_list:
@@ -1138,29 +1373,37 @@ class DcimMixin:
                             continue
                         seen_ids.add(obj["id"])
                         rows.append(build(obj))
+                # Keep up to the row cap.
                 inv[name] = rows[:_SEARCH_INV_MAX]
             except Exception as e:
+                # Load failed: empty list, and do not cache.
                 logger.error(f"NetBox search inventory {name} failed: {e}")
                 inv[name] = []
                 ok = False
+        # Cache only a complete snapshot.
         if ok:
             with lock:
                 cache[key] = (time.monotonic(), inv)
+        # The inventory.
         return inv
 
     @staticmethod
     def _inventory_matches(row: Dict, q: str) -> bool:
         """Case-insensitive substring match over the row haystack, plus a
         separator-insensitive partial-MAC match (>= 4 hex digits)."""
+        # Empty query matches nothing.
         q_low = (q or "").strip().lower()
         if not q_low:
             return False
+        # Substring match on the haystack.
         if q_low in row.get("_hay", ""):
             return True
+        # Partial MAC match on at least 4 hex digits.
         if _MAC_QUERY_RE.match(q_low):
             q_hex = _NON_HEX_RE.sub("", q_low)
             if len(q_hex) >= 4 and q_hex in row.get("_mac_hex", ""):
                 return True
+        # No match.
         return False
 
     def search(self, query: str, tenant: Optional[str] = None,
@@ -1186,8 +1429,10 @@ class DcimMixin:
         rest, and results are de-duped by (type, id) so the shared-OR-tenant
         passes can't double-list.
         """
+        # Trimmed query and result list.
         q = (query or "").strip()
         results: List[Dict] = []
+        # Empty query: no results.
         if not q:
             return {"status": "SUCCESS", "results": [], "count": 0}
 
@@ -1195,6 +1440,7 @@ class DcimMixin:
         #   [slug, "shared"] → scoped caller: own tenant + shared
         #   []               → unscoped admin: every tenant
         #   None             → non-admin with no slug: nothing (no leak)
+        # Work out the tenant scope.
         if tenant:
             tenant_slugs: Optional[List[str]] = [tenant, "shared"]
         elif is_admin:
@@ -1205,15 +1451,18 @@ class DcimMixin:
         def _passes():
             # Yield one param dict per tenant slug to OR-in (shared is visible
             # to all). Empty list → a single unscoped pass (admin only).
+            """Yield one filter dict per tenant pass."""
             if not tenant_slugs:
                 yield {}
             else:
                 for s in tenant_slugs:
                     yield {"tenant": s}
 
+        # Keys already added.
         seen: set = set()
 
         def _add(r: Dict):
+            """Add a result unless its (type, id) was already added."""
             key = (r.get("type"), r.get("id"))
             if key in seen:
                 return
@@ -1221,7 +1470,9 @@ class DcimMixin:
             results.append(r)
 
         # ── Partial-match inventory pass (richer rows win the (type, id) de-dupe) ─
+        # Inventory failures are logged, not raised.
         try:
+            # Match each type, capped per type.
             inv = self._search_inventory(tenant_slugs)
             for kind in ("device", "ip", "vm"):
                 n = 0
@@ -1232,16 +1483,21 @@ class DcimMixin:
                         _add({k: v for k, v in row.items() if not k.startswith("_")})
                         n += 1
         except Exception as e:
+            # Inventory failed.
             logger.error(f"NetBox search inventory failed: {e}")
 
+        # Full MAC query?
         _MAC_RE = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
         is_mac = bool(_MAC_RE.match(q))
 
         # ── Devices (name / serial / asset / primary IP) ───────────────────────
+        # Search failures per section are logged and skipped.
         try:
+            # Devices matching the query in each pass.
             for tp in _passes():
                 for d in self._api_get("/api/dcim/devices/",
                                        {"q": q, "limit": 30, **tp}).get("results", []):
+                    # Add each device.
                     status = d.get("status") or {}
                     _add({
                         "source":      "netbox",
@@ -1258,14 +1514,17 @@ class DcimMixin:
                         "url":         f"/dcim/devices/{d['id']}/",
                     })
         except Exception as e:
+            # Device search failed.
             logger.error(f"NetBox search devices failed: {e}")
 
         # ── Interfaces by MAC → owning device (MAC search) ─────────────────────
+        # MAC query: find interfaces with that MAC and add their devices.
         if is_mac:
             try:
                 for iface in self._api_get(
                         "/api/dcim/interfaces/",
                         {"mac_address": q, "limit": 50}).get("results", []):
+                    # Add the owning device.
                     dev = iface.get("device") or {}
                     _add({
                         "source": "netbox",
@@ -1280,17 +1539,23 @@ class DcimMixin:
                         "match":  f"interface {iface.get('name', '')}",
                     })
             except Exception as e:
+                # Interface search failed.
                 logger.error(f"NetBox search interfaces-by-mac failed: {e}")
 
         # ── IP addresses (address / dns_name; MAC via cf_mac_address) ──────────
+        # IPs, by MAC custom field or free text.
         try:
+            # Filter for this query type.
             base: Dict = {"cf_mac_address": q, "limit": 30} if is_mac else {"q": q, "limit": 30}
+            # IPs in each pass.
             for tp in _passes():
                 for ip in self._api_get("/api/ipam/ip-addresses/",
                                         {**base, **tp}).get("results", []):
+                    # Status, assigned interface and custom fields.
                     status = ip.get("status") or {}
                     ao = ip.get("assigned_object")
                     cf = ip.get("custom_fields") or {}
+                    # Add the IP.
                     _add({
                         "source":      "netbox",
                         "type":        "ip",
@@ -1304,13 +1569,16 @@ class DcimMixin:
                         "url":         f"/ipam/ip-addresses/{ip['id']}/",
                     })
         except Exception as e:
+            # IP search failed.
             logger.error(f"NetBox search ip-addresses failed: {e}")
 
         # ── Prefixes ───────────────────────────────────────────────────────────
+        # Prefixes in each pass.
         try:
             for tp in _passes():
                 for pre in self._api_get("/api/ipam/prefixes/",
                                          {"q": q, "limit": 15, **tp}).get("results", []):
+                    # Add each prefix.
                     status = pre.get("status") or {}
                     _add({
                         "source": "netbox",
@@ -1324,13 +1592,16 @@ class DcimMixin:
                         "url":    f"/ipam/prefixes/{pre['id']}/",
                     })
         except Exception as e:
+            # Prefix search failed.
             logger.error(f"NetBox search prefixes failed: {e}")
 
         # ── Racks ──────────────────────────────────────────────────────────────
+        # Racks in each pass.
         try:
             for tp in _passes():
                 for rk in self._api_get("/api/dcim/racks/",
                                         {"q": q, "limit": 20, **tp}).get("results", []):
+                    # Add each rack.
                     _add({
                         "source":   "netbox",
                         "type":     "rack",
@@ -1341,13 +1612,16 @@ class DcimMixin:
                         "url":      f"/dcim/racks/{rk['id']}/",
                     })
         except Exception as e:
+            # Rack search failed.
             logger.error(f"NetBox search racks failed: {e}")
 
         # ── VLANs ──────────────────────────────────────────────────────────────
+        # VLANs in each pass.
         try:
             for tp in _passes():
                 for vl in self._api_get("/api/ipam/vlans/",
                                         {"q": q, "limit": 20, **tp}).get("results", []):
+                    # Add each VLAN.
                     _add({
                         "source": "netbox",
                         "type":   "vlan",
@@ -1358,11 +1632,14 @@ class DcimMixin:
                         "url":    f"/ipam/vlans/{vl['id']}/",
                     })
         except Exception as e:
+            # VLAN search failed.
             logger.error(f"NetBox search vlans failed: {e}")
 
         # ── Sites (physical locations — not tenant-sensitive) ──────────────────
+        # Sites, unscoped.
         try:
             for s in self._api_get("/api/dcim/sites/", {"q": q, "limit": 20}).get("results", []):
+                # Add each site.
                 _add({
                     "source": "netbox",
                     "type":   "site",
@@ -1372,15 +1649,19 @@ class DcimMixin:
                     "url":    f"/dcim/sites/{s['id']}/",
                 })
         except Exception as e:
+            # Site search failed.
             logger.error(f"NetBox search sites failed: {e}")
 
         # ── Virtual machines (cluster) ─────────────────────────────────────────
+        # VMs in each pass.
         try:
             for tp in _passes():
                 for vm in self._api_get("/api/virtualization/virtual-machines/",
                                         {"q": q, "limit": 30, **tp}).get("results", []):
+                    # Cluster and status.
                     cl = vm.get("cluster") or {}
                     vstatus = vm.get("status") or {}
+                    # Add each VM.
                     _add({
                         "source":  "netbox",
                         "type":    "vm",
@@ -1392,8 +1673,10 @@ class DcimMixin:
                         "url":     f"/virtualization/virtual-machines/{vm['id']}/",
                     })
         except Exception as e:
+            # VM search failed.
             logger.error(f"NetBox search virtual-machines failed: {e}")
 
+        # All results.
         return {"status": "SUCCESS", "results": results, "count": len(results)}
 
     # ─── Catalog seed (device types + templates) ──────────────────────────────
@@ -1401,26 +1684,33 @@ class DcimMixin:
     @staticmethod
     def _slugify(name: str) -> str:
         """Convert an arbitrary name string into a lowercase URL-friendly slug."""
+        # Non-alphanumeric runs become dashes.
         return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-") or "unknown"
 
     def _load_seed_catalog(self) -> Dict[str, Any]:
         """Load and cache the bundled seed_catalog.json (next to this module)."""
+        # Load the file once and cache it.
         cat = getattr(self, "_seed_catalog_cache", None)
         if cat is None:
             with open(_SEED_CATALOG_PATH) as f:
                 cat = json.load(f)
             self._seed_catalog_cache = cat
+        # The catalog.
         return cat
 
     def _seed_manufacturer(self, name: str, cache: Dict[str, Any]):
         """Get-or-create a manufacturer by slug. Returns (record, created)."""
+        # Slug, and the cache shortcut.
         slug = self._slugify(name)
         if slug in cache:
             return cache[slug], False
+        # Look it up.
         try:
             mfr = self.nb.dcim.manufacturers.get(slug=slug)
         except Exception:  # noqa: BLE001
+            # Lookup failed: treat as missing.
             mfr = None
+        # Create if missing, then cache.
         created = False
         if not mfr:
             mfr = self.nb.dcim.manufacturers.create(name=name, slug=slug)
@@ -1431,20 +1721,25 @@ class DcimMixin:
     def _seed_device_type(self, t: Dict[str, Any], mfr) -> tuple:
         """Get-or-create a device type; upsert scalar fields on an existing one.
         Returns (record, created, updated)."""
+        # Look up the device type.
         slug = t["slug"]
         try:
             dt = self.nb.dcim.device_types.get(slug=slug)
         except Exception:  # noqa: BLE001
+            # Lookup failed: treat as missing.
             dt = None
+        # Wanted scalar values.
         u = int(t.get("u_height", 1))
         full = bool(t.get("is_full_depth", True))
         comments = t.get("comments", "") or ""
+        # Missing: create it.
         if dt is None:
             dt = self.nb.dcim.device_types.create(
                 model=t["model"], slug=slug, manufacturer=mfr.id,
                 u_height=u, is_full_depth=full, comments=comments)
             return dt, True, False
         # Existing → upsert scalars (templates reconciled separately, add-missing)
+        # Update each scalar that differs.
         changed = False
         if u != int(getattr(dt, "u_height", 0) or 0):
             dt.u_height = u
@@ -1455,12 +1750,15 @@ class DcimMixin:
         if comments != (getattr(dt, "comments", "") or ""):
             dt.comments = comments
             changed = True
+        # Save if anything changed.
         if changed:
             try:
                 dt.save()
             except Exception as e:  # noqa: BLE001
+                # Save failed: report as unchanged.
                 logger.warning("seed_catalog: %s scalar save failed: %s", slug, e)
                 changed = False
+        # Record and flags.
         return dt, False, changed
 
     def _seed_templates(self, dt, t: Dict[str, Any]) -> int:
@@ -1468,56 +1766,71 @@ class DcimMixin:
         Non-destructive: never deletes or re-types existing templates (so
         hand-added ports and already-instantiated devices are safe). Returns
         the number of templates created this run."""
+        # Templates added this run.
         added = 0
+        # Names of existing interface, console and power templates.
         try:
             existing_ifaces = {r.name for r in
                                self.nb.dcim.interface_templates.filter(device_type=dt.id)}
         except Exception:  # noqa: BLE001
+            # Lookup failed: treat as none.
             existing_ifaces = set()
         try:
             existing_console = {r.name for r in
                                 self.nb.dcim.console_port_templates.filter(device_type=dt.id)}
         except Exception:  # noqa: BLE001
+            # Lookup failed: treat as none.
             existing_console = set()
         try:
             existing_power = {r.name for r in
                               self.nb.dcim.power_port_templates.filter(device_type=dt.id)}
         except Exception:  # noqa: BLE001
+            # Lookup failed: treat as none.
             existing_power = set()
 
         def _add_iface(name, itype, mgmt_only=False):
+            """Create one interface template unless it already exists."""
             nonlocal added
+            # Already present.
             if name in existing_ifaces:
                 return
+            # Create and record it.
             self.nb.dcim.interface_templates.create(
                 device_type=dt.id, name=name, type=itype, mgmt_only=mgmt_only)
             existing_ifaces.add(name)
             added += 1
 
+        # Numbered port ranges.
         for p in t.get("ports", []) or []:
             prefix = p.get("prefix", "")
             itype = p.get("type", "1000base-t")
             start = int(p.get("start", 1))
             for i in range(int(p.get("count", 0))):
                 _add_iface(f"{prefix}{start + i}", itype)
+        # Management port.
         mg = t.get("mgmt")
         if mg:
             _add_iface(mg.get("name", "mgmt"), mg.get("type", "1000base-t"), mgmt_only=True)
+        # Console port.
         con = t.get("console")
         if con:
             cn = con.get("name", "Console")
+            # Create if missing.
             if cn not in existing_console:
                 self.nb.dcim.console_port_templates.create(
                     device_type=dt.id, name=cn, type=con.get("type", "rj-45"))
                 existing_console.add(cn)
                 added += 1
+        # Power ports.
         for pw in t.get("power", []) or []:
             pn = pw.get("name", "PSU1")
+            # Create if missing.
             if pn not in existing_power:
                 self.nb.dcim.power_port_templates.create(
                     device_type=dt.id, name=pn, type=pw.get("type", "iec-60320-c14"))
                 existing_power.add(pn)
                 added += 1
+        # Templates added.
         return added
 
     def seed_catalog(self) -> Dict[str, Any]:
@@ -1538,32 +1851,44 @@ class DcimMixin:
         Returns ``{status, manufacturers_created, device_types_created,
         device_types_updated, templates_added, errors}``."""
         try:
+            # Load the catalog and set up counters.
             catalog = self._load_seed_catalog()
             types = catalog.get("device_types") or []
             mfrs_created = types_created = types_updated = tpl_added = 0
             errors: List[str] = []
             mfr_cache: Dict[str, Any] = {}
+            # Seed each device type.
             for t in types:
+                # Slug for messages.
                 slug = t.get("slug", "?")
+                # Per-model failures are recorded and skipped.
                 try:
+                    # Manufacturer.
                     mfr, mfr_created = self._seed_manufacturer(t.get("manufacturer", ""), mfr_cache)
+                    # Unresolved manufacturer.
                     if mfr is None:
                         errors.append(f"{slug}: manufacturer unresolved")
                         continue
+                    # Count it if new.
                     if mfr_created:
                         mfrs_created += 1
+                    # Device type, counted if created or updated.
                     dt, created, updated = self._seed_device_type(t, mfr)
                     if created:
                         types_created += 1
                     elif updated:
                         types_updated += 1
+                    # Templates.
                     n = self._seed_templates(dt, t)
+                    # Count templates and log the outcome.
                     tpl_added += n
                     action = "created" if created else ("updated" if updated else "ok")
                     logger.info("seed_catalog: %s %s (+%d templates)", slug, action, n)
                 except Exception as e:  # noqa: BLE001
+                    # This model failed: record it and continue.
                     logger.error("seed_catalog: %s failed: %s", slug, e)
                     errors.append(f"{slug}: {e}")
+            # Totals and errors.
             return {"status": "SUCCESS",
                     "manufacturers_created": mfrs_created,
                     "device_types_created": types_created,
@@ -1571,11 +1896,13 @@ class DcimMixin:
                     "templates_added": tpl_added,
                     "errors": errors}
         except Exception as e:  # noqa: BLE001
+            # Catalog could not be loaded.
             logger.exception("seed_catalog failed")
             return {"status": "ERROR", "message": str(e)}
 
     # ─── Excel rack-layout import ─────────────────────────────────────────────
 
+    # Model-string tokens that carry no series information.
     _NOISE_TOKENS = {"cl", "cl6", "sr", "sr5", "vsf", "stk", "oobm", "f2b", "b2f",
                      "us", "poe", "poE", "g", "t", "c", "y", "q", "mp"}
 
@@ -1585,11 +1912,14 @@ class DcimMixin:
         (e.g. ``3810M-24G`` → ``3810m``; ``8325-32C`` → ``8325``). Used by
         ``_resolve_device_type_slug`` to map messy Excel model strings
         (``"6300M 24SR5 CL6"``, ``"CX8325-32 (F2B)"``) onto catalog slugs."""
+        # Cached index.
         idx = getattr(self, "_dt_index_cache", None)
         if idx is not None:
             return idx
+        # Build the index; a failure leaves it empty.
         idx: Dict[str, List[Dict[str, Any]]] = {}
         try:
+            # Group catalog entries by stem.
             for t in self._load_seed_catalog().get("device_types", []) or []:
                 model = (t.get("model") or "").strip()
                 stem, port = self._model_stem_port(model)
@@ -1597,7 +1927,9 @@ class DcimMixin:
                     idx.setdefault(stem, []).append(
                         {"slug": t["slug"], "model": model, "port": port})
         except Exception as e:  # noqa: BLE001
+            # Build failed.
             logger.warning("device-type catalog index build failed: %s", e)
+        # Cache and return.
         self._dt_index_cache = idx
         return idx
 
@@ -1607,10 +1939,13 @@ class DcimMixin:
 
         ``3810M-24G`` → (``3810m``, 24); ``8325-32C`` → (``8325``, 32);
         ``QFX5120-48Y`` → (``qfx5120``, 48); ``3810M`` → (``3810m``, None)."""
+        # Split on spaces, dashes and slashes.
         toks = re.split(r"[\s\-/]+", (model or "").strip().lower())
         toks = [t for t in toks if t]
+        # Empty model.
         if not toks:
             return "", None
+        # First token is the stem; leading digits of the second are the port count.
         stem = toks[0]
         port = None
         if len(toks) > 1:
@@ -1619,7 +1954,9 @@ class DcimMixin:
                 try:
                     port = int(m.group(1))
                 except ValueError:
+                    # Unparseable port count.
                     port = None
+        # Stem and port count.
         return stem, port
 
     def _resolve_device_type_slug(self, model: str) -> Dict[str, Any]:
@@ -1636,37 +1973,45 @@ class DcimMixin:
            error; **never** auto-creates a junk type).
 
         Returns ``{resolved:bool, slug|None, id|None, ambiguous:bool, match:str}``."""
+        # Normalise: drop parentheticals and collapse whitespace and punctuation.
         raw = (model or "").strip()
         norm = re.sub(r"\([^)]*\)", "", raw).strip()          # drop "(B2F)"
         norm = re.sub(r"\s+", " ", norm).strip()
         norm_nopunc = re.sub(r"[^a-z0-9]+", " ", norm.lower()).strip()
+        # Catalog index.
         catalog = self._dt_index()
         # 1. exact model match
         for entries in catalog.values():
             for e in entries:
                 if e["model"].lower() == norm.lower() or e["model"].lower() == norm_nopunc.replace(" ", "-"):
+                    # Exact model: confirm the type exists in NetBox.
                     try:
                         dt = self.nb.dcim.device_types.get(slug=e["slug"])
                         if dt:
                             return {"resolved": True, "slug": e["slug"], "id": dt.id,
                                     "ambiguous": False, "match": "catalog-exact"}
                     except Exception:  # noqa: BLE001
+                        # Lookup failed: keep looking.
                         pass
         # 2. stem match + port-hint disambiguation
         stem, port_hint = self._model_stem_port(norm_nopunc)
+        # Also try the stem without a vendor prefix.
         candidate_stems = {stem}
         for pre in ("cx", "a", "j"):  # "CX8325-32" → also try "8325"
             if stem.startswith(pre) and len(stem) > len(pre) + 2:
                 candidate_stems.add(stem[len(pre):])
+        # Catalog entries for every candidate stem.
         matches: List[Dict[str, Any]] = []
         for s in candidate_stems:
             matches.extend(catalog.get(s, []))
         # de-dup by slug preserving order
         seen = set()
         uniq = []
+        # Keep the first entry per slug.
         for m in matches:
             if m["slug"] not in seen:
                 seen.add(m["slug"]); uniq.append(m)
+        # One match: confirm it in NetBox.
         if len(uniq) == 1:
             try:
                 dt = self.nb.dcim.device_types.get(slug=uniq[0]["slug"])
@@ -1674,13 +2019,16 @@ class DcimMixin:
                     return {"resolved": True, "slug": uniq[0]["slug"], "id": dt.id,
                             "ambiguous": False, "match": "catalog-stem"}
             except Exception:  # noqa: BLE001
+                # Lookup failed: fall through.
                 pass
         elif len(uniq) > 1:
+            # Several matches: pick by port count, else the first.
             pick = None
             if port_hint:
                 pick = next((m for m in uniq if m.get("port") == port_hint), None)
             if pick is None:
                 pick = uniq[0]  # catalog order; flag ambiguous
+            # Confirm it in NetBox.
             try:
                 dt = self.nb.dcim.device_types.get(slug=pick["slug"])
                 if dt:
@@ -1688,6 +2036,7 @@ class DcimMixin:
                             "ambiguous": port_hint is None and len(uniq) > 1,
                             "match": "catalog-stem"}
             except Exception:  # noqa: BLE001
+                # Lookup failed: fall through.
                 pass
         # 3. live by model
         try:
@@ -1696,6 +2045,7 @@ class DcimMixin:
                 return {"resolved": True, "slug": dt.slug, "id": dt.id,
                         "ambiguous": False, "match": "live-model"}
         except Exception:  # noqa: BLE001
+            # Lookup failed: fall through.
             pass
         # 4. live by slug
         try:
@@ -1705,7 +2055,9 @@ class DcimMixin:
                 return {"resolved": True, "slug": dt.slug, "id": dt.id,
                         "ambiguous": False, "match": "live-slug"}
         except Exception:  # noqa: BLE001
+            # Lookup failed: fall through.
             pass
+        # Nothing matched.
         return {"resolved": False, "slug": None, "id": None,
                 "ambiguous": False, "match": "unresolved", "model": raw}
 
@@ -1724,23 +2076,29 @@ class DcimMixin:
         skips every create/save — returning would-be counts. Tenant is stamped
         on both rack and devices (mirrors add_rack/claim_device); an unresolvable
         tenant skips that rack."""
+        # Running counters and errors.
         racks_created = racks_updated = 0
         devices_created = devices_updated = 0
         interfaces_created = ips_assigned = 0
         errors: List[Dict[str, Any]] = []
         skipped_devices = 0
 
+        # Process each selected rack.
         for entry in selected or []:
+            # Rack name, site, tenant and height.
             rack_name = entry.get("rack_name") or entry.get("sheet") or ""
             site_slug = entry.get("site_slug")
             tenant_slug = entry.get("tenant_slug")
             u_height = int(entry.get("u_height") or 0) or 42
+            # Any failure for this rack is recorded and the next rack is processed.
             try:
+                # Resolve the site; skip the rack if it is missing.
                 site = self.nb.dcim.sites.get(slug=site_slug) if site_slug else None
                 if not site:
                     errors.append({"rack": rack_name, "message":
                                    f"Site '{site_slug}' not found — rack skipped"})
                     continue
+                # Resolve the tenant; skip the rack if a named one is missing.
                 tenant = None
                 if tenant_slug:
                     tenant = self.nb.tenancy.tenants.get(slug=tenant_slug)
@@ -1756,42 +2114,55 @@ class DcimMixin:
                         default_role = self.nb.dcim.device_roles.get(slug=dr_slug)
                     except Exception:  # noqa: BLE001
                         default_role = None
+                # Default status.
                 default_status = (entry.get("default_status") or "active").strip().lower() or "active"
 
                 # ── rack get-or-create (idempotent) ───────────────────────────
                 rack = None
+                # Look for the rack at this site.
                 try:
                     rack = self.nb.dcim.racks.get(name=rack_name, site_id=site.id)
                 except Exception:  # noqa: BLE001
+                    # Lookup failed: treat as missing.
                     rack = None
+                # Existing rack: update height and tenant.
                 if rack:
                     if not dry_run:
                         r = self.update_rack(rack.id, u_height=u_height,
                                              tenant_slug=tenant_slug)
+                        # Update failed.
                         if r.get("status") != "SUCCESS":
                             errors.append({"rack": rack_name, "message":
                                            f"rack update: {r.get('message')}"})
+                    # Count it.
                     racks_updated += 1
                 else:
+                    # New rack: create it.
                     if not dry_run:
                         r = self.add_rack(rack_name, site_slug, u_height=u_height,
                                           tenant_slug=tenant_slug)
+                        # Created: fetch it back.
                         if r.get("status") == "SUCCESS":
                             rack = self.nb.dcim.racks.get(name=rack_name, site_id=site.id)
                         else:
+                            # Create failed: skip this rack.
                             errors.append({"rack": rack_name, "message":
                                            f"rack create: {r.get('message')}"})
                             continue
+                    # Count it.
                     racks_created += 1
 
                 # ── per device ─────────────────────────────────────────────────
                 for dev in entry.get("devices", []) or []:
+                    # Name, serial and a display name for messages.
                     name = (dev.get("name") or "").strip()
                     serial = (dev.get("serial") or "").strip()
                     dname = name or f"<unnamed:{serial or '?'}>"
+                    # Per-device failures are recorded and the next device is processed.
                     try:
                         # device type (required to create)
                         dt_info = self._resolve_device_type_slug(dev.get("device_type") or "")
+                        # Unresolved type: record and skip.
                         if not dt_info.get("resolved"):
                             msg = f"device type '{dev.get('device_type')}' unresolved"
                             if dt_info.get("ambiguous"):
@@ -1800,6 +2171,7 @@ class DcimMixin:
                                            "name": dname, "message": msg})
                             skipped_devices += 1
                             continue
+                        # Resolved type id.
                         dt_id = dt_info["id"]
 
                         # role: per-row override (by slug/name) → default
@@ -1807,24 +2179,31 @@ class DcimMixin:
                         role_val = (dev.get("role") or "").strip()
                         if role_val:
                             try:
+                                # Look up the role by slug, then by name.
                                 r = (self.nb.dcim.device_roles.get(slug=role_val.lower())
                                      or self.nb.dcim.device_roles.get(name=role_val))
                                 if r:
                                     role_id = r.id
                             except Exception:  # noqa: BLE001
+                                # Lookup failed.
                                 role_id = None
+                        # Fall back to the rack's default role.
                         if role_id is None and default_role is not None:
                             role_id = default_role.id
 
+                        # Status for this device.
                         status = (dev.get("status") or default_status).strip().lower()
                         # RU → position (Excel RU 1:1 = NetBox position for 1U).
                         # RU 0 (0U/PDU) → position unset.
+                        # Parse the position.
                         try:
                             pos = int(dev.get("position"))
                         except (TypeError, ValueError):
+                            # Unparseable position.
                             pos = None
                         if pos == 0:
                             pos = None
+                        # Face, asset tag and description.
                         face_raw = (dev.get("face") or "").strip().lower()
                         face = "rear" if face_raw.startswith("r") else "front"
                         asset_tag = (dev.get("asset_tag") or "").strip() or None
@@ -1833,21 +2212,27 @@ class DcimMixin:
                         # idempotent match: by serial (global) else by name in rack
                         existing = None
                         if serial and not dry_run:
+                            # Match by serial.
                             try:
                                 existing = self.nb.dcim.devices.get(serial=serial)
                             except Exception:  # noqa: BLE001
+                                # Lookup failed.
                                 existing = None
+                        # Else match by name in this rack.
                         if not existing and name and rack is not None and not dry_run:
                             try:
                                 existing = self.nb.dcim.devices.get(
                                     rack=rack.id, name=name)
                             except Exception:  # noqa: BLE001
+                                # Lookup failed.
                                 existing = None
 
+                        # Dry run: count as a create and stop here.
                         if dry_run:
                             devices_created += 1
                             continue
 
+                        # Device payload, adding each optional field that is set.
                         payload: Dict[str, Any] = {
                             "device_type": dt_id, "site": site.id, "status": status,
                             "face": face,
@@ -1869,9 +2254,11 @@ class DcimMixin:
                         if desc:
                             payload["description"] = desc
 
+                        # Existing device: update each field that differs.
                         if existing:
                             changed = False
                             for k, v in payload.items():
+                                # Site never changes; device type is handled below.
                                 if k in ("device_type", "site"):
                                     continue
                                 if getattr(existing, k, None) != v:
@@ -1879,65 +2266,82 @@ class DcimMixin:
                             # device_type update separately (idempotent set)
                             if getattr(existing, "device_type", None) != dt_id:
                                 existing.device_type = dt_id; changed = True
+                            # Save if anything changed.
                             if changed:
                                 existing.save()
                             devices_updated += 1
                             device = existing
                         else:
+                            # New device: create it.
                             device = self.nb.dcim.devices.create(**payload)
                             devices_created += 1
 
                         # ── mgmt interface + IP (mirror claim_device) ──────────
                         mgmt_ip = (dev.get("mgmt_ip") or "").strip()
                         if mgmt_ip:
+                            # Address with a mask.
                             ip_str = mgmt_ip.split("/")[0].strip()
                             full = mgmt_ip if "/" in mgmt_ip else f"{ip_str}/{self._mask_for_ip(ip_str, tenant)}"
+                            # Reuse an existing mgmt interface.
                             iface = None
                             try:
                                 ifaces = list(self.nb.dcim.interfaces.filter(
                                     device_id=device.id, name="mgmt"))
                                 iface = ifaces[0] if ifaces else None
                             except Exception:  # noqa: BLE001
+                                # Lookup failed.
                                 iface = None
+                            # Create it if missing.
                             if not iface:
                                 iface = self.nb.dcim.interfaces.create(
                                     device=device.id, name="mgmt", type="other")
                                 interfaces_created += 1
+                            # IP assigned to that interface.
                             ip_kwargs: Dict[str, Any] = {
                                 "address": full,
                                 "assigned_object_type": "dcim.interface",
                                 "assigned_object_id": iface.id,
                             }
+                            # Attribute to the tenant and its VRF.
                             if tenant is not None:
                                 ip_kwargs["tenant"] = tenant.id
                                 _vrf = self._vrf_id_for_tenant(tenant)
                                 if _vrf is not None:
                                     ip_kwargs["vrf"] = _vrf
+                            # Device name as the DNS name.
                             if name:
                                 ip_kwargs["dns_name"] = name
+                            # Create the IP.
                             ip_obj = self.nb.ipam.ip_addresses.create(**ip_kwargs)
                             ips_assigned += 1
+                            # Set the MAC custom field; failure is only logged.
                             mac = (dev.get("mac") or "").strip()
                             if mac:
                                 try:
                                     ip_obj.custom_fields = {"mac_address": mac}
                                     ip_obj.save()
                                 except Exception as e:  # noqa: BLE001
+                                    # Custom field missing.
                                     logger.debug("import_rack_layout: mac_address cf on %s skipped: %s", full, e)
+                            # Make it the device's primary IPv4; failure is only logged.
                             try:
                                 device.primary_ip4 = ip_obj.id
                                 device.save()
                             except Exception as e:  # noqa: BLE001
+                                # Could not set it.
                                 logger.debug("import_rack_layout: primary_ip4 set on %s skipped: %s", name, e)
                     except Exception as e:  # noqa: BLE001
+                        # Device failed: record and continue.
                         logger.error("import_rack_layout: device %s failed: %s", dname, e)
                         errors.append({"sheet": entry.get("sheet"), "rack": rack_name,
                                        "name": dname, "message": str(e)})
                         skipped_devices += 1
             except Exception as e:  # noqa: BLE001
+                # Rack failed: record and continue.
                 logger.error("import_rack_layout: rack %s failed: %s", rack_name, e)
                 errors.append({"rack": rack_name, "message": str(e)})
 
+        # Totals and errors.
         return {"status": "SUCCESS", "dry_run": dry_run,
                 "racks_created": racks_created, "racks_updated": racks_updated,
                 "devices_created": devices_created, "devices_updated": devices_updated,

@@ -4,26 +4,32 @@ Provides synchronization, allocation, and lifecycle management for IP prefixes,
 IP addresses, devices, racks, sites, and multi-tenant assets in NetBox.
 """
 
+# Standard library: logging, async, encoding, hashing, files and timing.
 import logging
 import asyncio
 import base64
 import functools
 import hashlib
+# Async HTTP client for Kea.
 import httpx
 import json
 import os
 import ssl
 import tempfile
 import time
+# Type hints.
 from typing import Dict, Any
+# BaseSpoke lives at the top level when deployed, under core.src in the repo.
 try:
     from base_spoke import BaseSpoke
 except ImportError:
     from core.src.base_spoke import BaseSpoke
+# NetBox API engine and the rack-workbook parser.
 from netbox_engine import NetboxEngine
 from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
                          parse_one_rack_sheet, parse_summary_block_by_name)
 
+# Logger for this spoke.
 logger = logging.getLogger("NetboxSpoke")
 
 # Hub-level system commands handled by BaseControlPlane.handle_system_command
@@ -55,15 +61,19 @@ _NETBOX_INSTALL_CERT_HELPER = "/usr/local/bin/lm-netbox-install-cert"
 
 def _as_bool(val: Any, default: bool = True) -> bool:
     """Coerce env/config string to bool."""
+    # Missing: use the default.
     if val is None:
         return default
+    # Already a bool.
     if isinstance(val, bool):
         return val
+    # Map common true/false strings.
     s = str(val).strip().lower()
     if s in ("1", "true", "yes", "on"):
         return True
     if s in ("0", "false", "no", "off"):
         return False
+    # Anything else: the default.
     return default
 
 
@@ -134,24 +144,31 @@ class NetboxSpoke(BaseSpoke):
 
     def _persist_env(self, key: str, value: str):
         """Update or insert key=value in local .env configuration file."""
+        # Path to the .env file next to the source tree.
         env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
         env_path = os.path.abspath(env_path)
+        # Failures are logged, not raised.
         try:
+            # Read the current lines.
             lines = open(env_path).readlines() if os.path.exists(env_path) else []
             found = False
             new_lines = []
+            # Replace the key's line if present.
             for line in lines:
                 if line.startswith(f"{key}="):
                     new_lines.append(f"{key}={value}\n")
                     found = True
                 else:
                     new_lines.append(line)
+            # Append it if missing.
             if not found:
                 new_lines.append(f"{key}={value}\n")
+            # Write the file back.
             with open(env_path, "w") as f:
                 f.writelines(new_lines)
             logger.info(f"Persisted {key} to .env")
         except Exception as e:
+            # Could not write.
             logger.warning(f"Could not persist {key} to .env: {e}")
 
     # Default gateway used when a NetBox scope carries none — also the value
@@ -160,6 +177,7 @@ class NetboxSpoke(BaseSpoke):
 
     async def start_kea_sync(self):
         """Start the background Kea DHCP periodic scope synchronization task."""
+        # Only start one task.
         if self._sync_task is None:
             # Fresh task → forget pushed state so the first tick pushes
             # everything (Kea may have restarted while the loop was down).
@@ -168,19 +186,25 @@ class NetboxSpoke(BaseSpoke):
 
     async def stop_kea_sync(self):
         """Cancel and stop the background Kea DHCP synchronization task."""
+        # Cancel the running task, if any.
         if self._sync_task:
             self._sync_task.cancel()
             self._sync_task = None
 
     async def _kea_sync_loop(self):
         """Periodically pull DHCP prefixes from NetBox and reconcile Kea subnets."""
+        # Run forever, every 5 minutes.
         while True:
+            # A failed tick is logged and the loop continues.
             try:
+                # Fetch DHCP prefixes and push the changes to Kea.
                 res = await self._run_sync(self.engine.get_dhcp_prefixes)
                 if res.get("status") == "SUCCESS":
                     await self._kea_apply_scopes(res.get("scopes", []))
             except Exception as e:
+                # Tick failed.
                 logger.error(f"KEA sync error: {e}", exc_info=True)
+            # Wait for the next tick.
             await asyncio.sleep(300)
 
     @classmethod
@@ -190,9 +214,11 @@ class NetboxSpoke(BaseSpoke):
         NetBox scope set (prefix → scope dict) and the last-successfully-pushed
         map (prefix → gateway). A scope whose gateway changed appears in BOTH
         lists (delete then re-add). Order-stable for deterministic logs."""
+        # Remove scopes that are gone or whose gateway changed.
         to_remove = [p for p, gw in synced.items()
                      if p not in desired
                      or (desired[p].get("gateway") or cls._KEA_DEFAULT_GATEWAY) != gw]
+        # Add scopes that are new or were just removed for a gateway change.
         removed = set(to_remove)
         to_add = [p for p in desired if p not in synced or p in removed]
         return to_add, to_remove
@@ -206,28 +232,35 @@ class NetboxSpoke(BaseSpoke):
         pushed-state map is cleared so the NEXT tick full-syncs — covering a
         Kea restart that lost its runtime config. The first tick after spoke
         start pushes everything (map starts empty — unchanged behavior)."""
+        # Desired scopes keyed by prefix.
         desired: Dict[str, Dict[str, Any]] = {}
         for scope in (scopes or []):
             p = scope.get("prefix")
             if p:
                 desired[p] = scope
+        # Work out what to add and remove.
         to_add, to_remove = self._kea_scope_diff(desired, self._kea_synced)
         failed = False
         # Removals first so a changed-gateway scope is deleted before re-add.
         for prefix in to_remove:
+            # Remove the scope and forget it.
             if await self._remove_scope_from_kea(prefix):
                 self._kea_synced.pop(prefix, None)
             else:
                 failed = True
         for prefix in to_add:
+            # Add the scope.
             ok = await self._sync_scope_to_kea(desired[prefix])
             if ok is True:
+                # Accepted: remember its gateway.
                 self._kea_synced[prefix] = (desired[prefix].get("gateway")
                                             or self._KEA_DEFAULT_GATEWAY)
             elif ok is False:
+                # Rejected or unreachable.
                 failed = True
             # ok is None → locally-invalid scope (unparsable prefix): logged,
             # never pushable — neither tracked nor a reason to full-resync.
+        # Any failure: clear state so the next tick resyncs everything.
         if failed:
             logger.warning("KEA sync: connection error / unexpected rejection — "
                            "clearing pushed-scope state; next tick full-syncs")
@@ -239,25 +272,33 @@ class NetboxSpoke(BaseSpoke):
         restart and means the scope IS present), False on a connection error or
         unexpected rejection (→ caller full-resyncs next tick), None when the
         scope is locally invalid (unparsable prefix — never pushable)."""
+        # Prefix and gateway (with a default).
         prefix = scope.get("prefix")
         gateway = scope.get("gateway") or self._KEA_DEFAULT_GATEWAY
+        # No prefix: nothing to push.
         if not prefix:
             return None
+        # Derive a pool from .100 to .200 of the subnet.
         try:
             import ipaddress
             net = ipaddress.ip_network(prefix, strict=False)
             pool_range = f"{net.network_address + 100}-{net.network_address + 200}"
         except Exception as e:
+            # Unparseable prefix.
             logger.error(f"Cannot derive KEA pool range from {prefix!r}: {e}")
             return None
+        # subnet4-add arguments.
         arguments = {"subnet4": [{"subnet": prefix,
                                   "pools": [{"pool": pool_range}],
                                   "option-data": [{"name": "routers", "data": gateway}]}]}
+        # Send the command.
         try:
             result_obj = await self._kea_cmd("subnet4-add", arguments)
+            # Accepted.
             if result_obj.get("result") == 0:
                 logger.info(f"KEA synced scope {prefix}")
                 return True
+            # Rejection text.
             text = str(result_obj.get("text") or "")
             if "already" in text.lower() or "duplicate" in text.lower():
                 # Scope already exists in Kea — but we must NOT assume its
@@ -268,20 +309,25 @@ class NetboxSpoke(BaseSpoke):
                 # DESIRED gateway as synced and never correct the stale one.
                 # Force the desired state: delete the existing subnet, then
                 # re-add it with our option-data.
+                # Already present: delete it and re-add with the desired gateway.
                 logger.debug(f"KEA scope {prefix} already present; forcing "
                              f"gateway to {gateway}: {text}")
                 await self._remove_scope_from_kea(prefix)
                 retry = await self._kea_cmd("subnet4-add", arguments)
+                # Re-add accepted.
                 if retry.get("result") == 0:
                     logger.info(f"KEA re-synced scope {prefix} "
                                 f"(forced gateway {gateway})")
                     return True
+                # Re-add failed.
                 logger.warning(f"KEA re-add after forced del failed for "
                                f"{prefix}: {retry.get('text')}")
                 return False
+            # Any other rejection.
             logger.warning(f"KEA rejected scope {prefix}: {text}")
             return False
         except Exception as e:
+            # Kea unreachable.
             logger.error(f"KEA HTTP error for {prefix}: {e}")
             return False
 
@@ -292,24 +338,32 @@ class NetboxSpoke(BaseSpoke):
         is gone (deleted or never there), False on any error (→ caller
         full-resyncs next tick)."""
         try:
+            # List the subnets Kea has.
             listing = await self._kea_cmd("subnet4-list")
+            # Listing failed.
             if listing.get("result") != 0:
                 logger.warning(f"KEA subnet4-list failed: {listing.get('text')}")
                 return False
+            # Find the subnet id for this prefix.
             subnet_id = None
             for sub in (listing.get("arguments") or {}).get("subnets", []):
                 if str(sub.get("subnet") or "") == prefix:
                     subnet_id = sub.get("id")
                     break
+            # Not in Kea: nothing to delete.
             if subnet_id is None:
                 return True   # already gone — the desired end state
+            # Delete by id.
             result_obj = await self._kea_cmd("subnet4-del", {"id": subnet_id})
+            # Deleted.
             if result_obj.get("result") == 0:
                 logger.info(f"KEA removed scope {prefix} (id {subnet_id})")
                 return True
+            # Delete rejected.
             logger.warning(f"KEA subnet4-del {prefix} rejected: {result_obj.get('text')}")
             return False
         except Exception as e:
+            # Kea unreachable.
             logger.error(f"KEA HTTP error removing {prefix}: {e}")
             return False
 
@@ -317,16 +371,20 @@ class NetboxSpoke(BaseSpoke):
         """POST one command to the Kea Control Agent; returns the (first)
         result object. Raises on transport errors (callers map that to a
         full-resync)."""
+        # Command payload for the dhcp4 service.
         payload: Dict[str, Any] = {"command": command, "service": ["dhcp4"]}
         if arguments is not None:
             payload["arguments"] = arguments
+        # POST it and parse the reply.
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.post(f"{self.kea_url.rstrip('/')}/", json=payload)
             body = resp.json()
+        # Kea replies with a list; return the first result.
         return body[0] if isinstance(body, list) and body else body
 
     async def _run_sync(self, fn, *args, **kwargs):
         """Run a synchronous (blocking) function in a thread pool so the event loop stays free."""
+        # Run the function in the default thread pool.
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
@@ -337,10 +395,13 @@ class NetboxSpoke(BaseSpoke):
         download_url + token (mirrors the template-refresh relay). Runs inside
         _run_sync, so a sync httpx client is fine. TLS verify is OFF to match
         the spoke→hub wss permissive model (self-signed hub cert during boot)."""
+        # A download URL is required.
         if not download_url:
             raise RuntimeError("no download_url provided for relayed upload")
+        # Bearer token header and TLS verify setting.
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         verify = str(os.getenv("LM_HUB_TLS_VERIFY", "0")) not in ("1", "true", "True")
+        # Download and return the bytes.
         with httpx.Client(timeout=180.0, verify=verify, follow_redirects=True) as c:
             r = c.get(download_url, headers=headers)
             r.raise_for_status()
@@ -350,6 +411,7 @@ class NetboxSpoke(BaseSpoke):
         """Drop all cached picklist data — call after any mutation that could
         change the dropdown contents (add/update/delete/claim/allocate/release/
         sync, or an UPDATE_CONFIG that repoints NetBox)."""
+        # Clear the cache if it has anything.
         if self._picklist_cache:
             self._picklist_cache.clear()
 
@@ -359,10 +421,12 @@ class NetboxSpoke(BaseSpoke):
         NETBOX_GET_RACKS?site=X) cache separately. Returns a deep-enough copy
         of the cached result (the engine returns plain dicts/lists, so a
         shallow copy is fine — callers don't mutate)."""
+        # Return the cached value while it is fresh.
         import time as _time
         entry = self._picklist_cache.get(key)
         if entry and (_time.time() - entry["ts"]) < self._picklist_ttl:
             return entry["value"]
+        # Otherwise fetch, cache and return it.
         value = await self._run_sync(fn, *args, **kwargs)
         self._picklist_cache[key] = {"ts": _time.time(), "value": value}
         return value
@@ -388,6 +452,7 @@ class NetboxSpoke(BaseSpoke):
         """Fernet keyed off the spoke secret (stable per spoke). Encryption at
         rest for the cached private key; a secret rotation simply invalidates the
         cache (the spoke re-fetches/re-deploys), which is safe."""
+        # Key derived from the spoke secret (or the spoke id).
         from cryptography.fernet import Fernet
         seed = (getattr(self.control_plane, "secret", "") or self.spoke_id
                 or "lm-netbox").encode()
@@ -396,21 +461,26 @@ class NetboxSpoke(BaseSpoke):
     def _persist_cert(self):
         """Persist encrypted TLS certificate material to disk storage."""
         try:
+            # Encrypt the cert material.
             enc = self._cert_fernet().encrypt(json.dumps(self._cert_material).encode())
+            # Make sure the directory exists.
             d = os.path.dirname(self._cert_store)
             if d and not os.path.exists(d):
                 os.makedirs(d, mode=0o700, exist_ok=True)
+            # Write to a temp file with 0600 and swap it in.
             tmp = self._cert_store + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(enc)
             os.chmod(tmp, 0o600)
             os.replace(tmp, self._cert_store)
         except Exception as e:  # noqa: BLE001 - best-effort persist
+            # Persist failed.
             logger.warning("[cert] custodian persist failed: %s", e)
 
     def _load_persisted_cert(self):
         """Load and decrypt stored TLS certificate material from disk."""
         try:
+            # Decrypt and load the stored cert, if any.
             if os.path.exists(self._cert_store):
                 with open(self._cert_store, "rb") as f:
                     self._cert_material = json.loads(
@@ -418,6 +488,7 @@ class NetboxSpoke(BaseSpoke):
                 logger.info("[cert] custodian: restored cached cert for %s",
                             (self._cert_material or {}).get("domain"))
         except Exception as e:  # noqa: BLE001 - corrupt/rotated key → cold
+            # Missing or unreadable: start empty.
             logger.debug("[cert] custodian cache load skipped: %s", e)
             self._cert_material = None
 
@@ -425,12 +496,15 @@ class NetboxSpoke(BaseSpoke):
         """Drive the dumb Agent to install a cert: WRITE_FILE crt + key to 0600
         temps, then RUN_COMMAND the role-provisioned helper (which swaps the live
         nginx cert + reloads). The Agent runs; the spoke holds the sequence."""
+        # Only a control plane that hosts agents can deploy.
         cp = self.control_plane
         if cp is None or not hasattr(cp, "send_to_agent"):
             return {"status": "ERROR", "message": "spoke is not an agent host"}
+        # Unique temp paths on the agent.
         ts = str(int(time.time() * 1000))
         crt_tmp, key_tmp = f"/tmp/lm-netbox-{ts}.crt.pem", f"/tmp/lm-netbox-{ts}.key.pem"
         try:
+            # Write the cert and key, then run the install helper.
             await cp.send_to_agent("WRITE_FILE", {"path": crt_tmp, "content": fullchain,
                                                   "mode": 0o600}, agent_id=agent_id, timeout=20.0)
             await cp.send_to_agent("WRITE_FILE", {"path": key_tmp, "content": privkey,
@@ -439,8 +513,10 @@ class NetboxSpoke(BaseSpoke):
             res = await cp.send_to_agent("RUN_COMMAND", {"command": cmd, "allow_shell": True,
                                                          "timeout": 30}, agent_id=agent_id, timeout=40.0)
         except Exception as e:  # noqa: BLE001
+            # Deploy failed.
             return {"status": "ERROR", "message": f"deploy to agent {agent_id}: {e}"}
         finally:
+            # Always remove the temp files on the agent.
             try:
                 await cp.send_to_agent("RUN_COMMAND",
                                        {"command": f"rm -f {crt_tmp} {key_tmp}",
@@ -448,12 +524,15 @@ class NetboxSpoke(BaseSpoke):
                                        agent_id=agent_id, timeout=15.0)
             except Exception:  # noqa: BLE001 - cleanup best-effort
                 pass
+        # Read the helper's result.
         runner = (res or {}).get("result", {}) if isinstance(res, dict) else {}
         out = (runner.get("stdout") or "").strip()
+        # Helper reported OK.
         if runner.get("rc") == 0 and out.startswith("OK"):
             logger.info("[cert] %s → netbox agent %s: installed — %s",
                         domain, agent_id, out[2:].strip() or out)
             return {"status": "SUCCESS", "message": out[2:].strip() or "installed on netbox"}
+        # Anything else is a failure.
         msg = (runner.get("stderr") or out or (res or {}).get("message")
                or "cert helper failed on agent")
         logger.warning("[cert] %s → netbox agent %s: FAILED — %s", domain, agent_id, msg)
@@ -462,9 +541,11 @@ class NetboxSpoke(BaseSpoke):
     async def deploy_cached_cert_to_agent(self, agent_id):
         """Deploy the currently-cached cert to a newly-connected agent (called from
         NetboxControlPlane._on_agent_registered)."""
+        # Nothing cached: nothing to deploy.
         c = self._cert_material
         if not c:
             return
+        # Deploy the cached cert.
         logger.info("[cert] deploying cached cert (%s) to newly-connected agent %s",
                     c.get("domain"), agent_id)
         await self._deploy_cert_to_agent(agent_id, c.get("fullchain", ""),
@@ -472,55 +553,69 @@ class NetboxSpoke(BaseSpoke):
 
     async def _handle_install_cert(self, data):
         """Validate → persist → deploy to all connected agents (cert custodian)."""
+        # Read the cert material.
         domain = data.get("domain", "") or ""
         fullchain = data.get("fullchain", "") or ""
         privkey = data.get("privkey", "") or ""
+        # Both parts must be present and look like PEM.
         if not fullchain or not privkey:
             return {"status": "ERROR", "message": "missing cert material"}
         if "BEGIN CERTIFICATE" not in fullchain or "PRIVATE KEY" not in privkey:
             return {"status": "ERROR", "message": "fullchain/privkey not PEM"}
         # Validate the pair in-process (throwaway ssl ctx via 0600 temps) before
         # it can reach any live host — same guard the hub uses.
+        # Temp files are always removed afterwards.
         crt_tmp = key_tmp = None
         try:
+            # Write the cert and key to temp files.
             with tempfile.NamedTemporaryFile("w", suffix=".crt.pem", delete=False) as cf:
                 cf.write(fullchain); crt_tmp = cf.name
             with tempfile.NamedTemporaryFile("w", suffix=".key.pem", delete=False) as kf:
                 kf.write(privkey); key_tmp = kf.name
             os.chmod(crt_tmp, 0o600); os.chmod(key_tmp, 0o600)
+            # Load them into a throwaway TLS context to check they match.
             try:
                 ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(crt_tmp, key_tmp)
             except Exception as e:
+                # Invalid pair.
                 return {"status": "ERROR", "message": f"cert validation failed: {e}"}
         finally:
+            # Remove the temp files.
             for p in (crt_tmp, key_tmp):
                 if p:
                     try: os.unlink(p)
                     except OSError: pass
 
         # Custody: persist (encrypted) so a restart / late-connecting agent gets it.
+        # Cache and persist the cert.
         self._cert_material = {"domain": domain, "fullchain": fullchain, "privkey": privkey}
         self._persist_cert()
 
+        # Connected agents.
         cp = self.control_plane
         agents = list(getattr(cp, "connected_agents", {}).keys()) if cp else []
+        # None connected: deploy later on connect.
         if not agents:
             logger.info("[cert] %s → netbox: cached (no agent connected yet — will "
                         "deploy on connect)", domain)
             return {"status": "SUCCESS",
                     "message": "cert cached; no NetBox-host agent connected yet — "
                                "it will deploy automatically when one connects"}
+        # Deploy to each agent.
         results = [await self._deploy_cert_to_agent(a, fullchain, privkey, domain)
                    for a in agents]
+        # Success if any agent installed it.
         ok = sum(1 for r in results if r.get("status") == "SUCCESS")
         if ok:
             return {"status": "SUCCESS",
                     "message": f"deployed to {ok}/{len(agents)} NetBox-host agent(s)"}
+        # All failed: return the first error.
         return {"status": "ERROR",
                 "message": (results[0].get("message") if results else "deploy failed")}
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming NetBox DCIM/IPAM commands to corresponding engine methods."""
+        # Normalise and log the command name.
         normalized = command_type.upper()
         logger.info(f"NetBox command: {normalized}")
 
@@ -530,10 +625,13 @@ class NetboxSpoke(BaseSpoke):
         if normalized in self._PICKLIST_MUTATIONS:
             self._picklist_invalidate()
 
+        # Spoke version.
         if normalized == "GET_VERSION":
             return {"status": "SUCCESS", "version": self.get_version()}
 
+        # Config push: repoint NetBox and/or Kea.
         if normalized == "UPDATE_CONFIG":
+            # New URL and token, if sent.
             url = data.get("netbox_url") or data.get("url")
             token = data.get("api_token")
             # TLS-verify toggle — reconnect when it (or url/token) changes so the
@@ -541,6 +639,7 @@ class NetboxSpoke(BaseSpoke):
             verify_ssl = None
             if "netbox_verify_ssl" in data:
                 verify_ssl = _as_bool(data.get("netbox_verify_ssl"), default=self.engine.verify_ssl)
+            # Reconnect when anything changed, then self-heal custom fields and persist.
             if url or token or verify_ssl is not None:
                 self.engine.reconnect(
                     url or self.engine.url,
@@ -555,43 +654,54 @@ class NetboxSpoke(BaseSpoke):
                 # Request Timeouts from lm-svcs/lm-svcs-dhcp/lm-svcs-dns (the
                 # shared-loop stall). _run_sync runs it in the executor.
                 await self._run_sync(self.engine._ensure_custom_fields)
+                # Save the changed values to .env.
                 if token:
                     self._persist_env("NETBOX_API_TOKEN", token)
                 if url:
                     self._persist_env("NETBOX_URL", url)
                 if verify_ssl is not None:
                     self._persist_env("NETBOX_VERIFY_SSL", "1" if verify_ssl else "0")
+            # Repoint Kea.
             if data.get("kea_ctrl_url"):
                 if data["kea_ctrl_url"] != self.kea_url:
                     # Repointed Kea — the pushed-scope state belongs to the old
                     # server; forget it so the next tick full-syncs the new one.
                     self._kea_synced.clear()
                 self.kea_url = data["kea_ctrl_url"]
+            # Merge the rest of the config.
             self.config.update(data)
             # Repointing NetBox (or KEA) makes any cached picklist data stale.
             self._picklist_invalidate()
             return {"status": "SUCCESS", "message": "NetBox config updated"}
 
+        # Self-update: git pull, then restart the service.
         if normalized == "SPOKE_UPDATE":
+            # Any failure becomes an ERROR result.
             try:
                 import subprocess
                 result = subprocess.run(
                     ["git", "pull", "--rebase", "--autostash"],
                     capture_output=True, text=True, cwd=os.getcwd()
                 )
+                # Pulled: restart and report.
                 if result.returncode == 0:
                     subprocess.Popen(["sudo", "systemctl", "restart", "lm-netbox"])
                     return {"status": "SUCCESS", "message": result.stdout.strip()}
+                # Pull failed.
                 return {"status": "ERROR", "message": result.stderr.strip()}
             except Exception as e:
+                # Could not run git.
                 return {"status": "ERROR", "message": str(e)}
 
+        # NetBox health check.
         if normalized == "NETBOX_HEALTH":
             return await self._run_sync(self.engine.get_system_health)
 
+        # Site picklist (cached).
         if normalized == "NETBOX_GET_SITES":
             return await self._run_picklist("GET_SITES", self.engine.get_sites)
 
+        # Rack picklist (cached per filter).
         if normalized == "NETBOX_GET_RACKS":
             return await self._run_picklist(
                 f"GET_RACKS|site={data.get('site')}|tenant={data.get('tenant')}"
@@ -600,6 +710,7 @@ class NetboxSpoke(BaseSpoke):
                 site=data.get("site"), tenant=data.get("tenant"),
                 tenant_group=data.get("tenant_group"))
 
+        # Add a rack.
         if normalized == "NETBOX_ADD_RACK":
             return await self._run_sync(
                 self.engine.add_rack,
@@ -610,6 +721,7 @@ class NetboxSpoke(BaseSpoke):
                 tenant_slug=data.get("tenant"),
             )
 
+        # Update a rack.
         if normalized == "NETBOX_UPDATE_RACK":
             return await self._run_sync(
                 self.engine.update_rack,
@@ -620,17 +732,21 @@ class NetboxSpoke(BaseSpoke):
                 tenant_slug=data.get("tenant"),
             )
 
+        # Delete a rack.
         if normalized == "NETBOX_DELETE_RACK":
             return await self._run_sync(self.engine.delete_rack, int(data.get("rack_id", 0)))
 
+        # List devices.
         if normalized == "NETBOX_GET_DEVICES":
             return await self._run_sync(self.engine.get_devices, site=data.get("site"),
                                         rack=data.get("rack"), tenant=data.get("tenant"),
                                         tenant_group=data.get("tenant_group"))
 
+        # List cables.
         if normalized == "NETBOX_GET_CABLES":
             return await self._run_sync(self.engine.get_cables, site=data.get("site"))
 
+        # Create or update one cable.
         if normalized == "NETBOX_SYNC_CABLE":
             return await self._run_sync(
                 self.engine.sync_cable,
@@ -641,6 +757,7 @@ class NetboxSpoke(BaseSpoke):
                 status=data.get("status", "connected"),
             )
 
+        # Sync LLDP links to cables, then normalise device names.
         if normalized == "NETBOX_SYNC_LLDP":
             # The hub's merged topology links (LLDP-confirmed, both ports
             # known) -> NetBox cables; unknown ends are created as discovered
@@ -651,16 +768,19 @@ class NetboxSpoke(BaseSpoke):
                 tenant_slug=data.get("tenant_slug", ""),
                 create_missing=bool(data.get("create_missing", True)),
             )
+            # Optionally upper-case device names afterwards.
             if data.get("normalize_names", True) and isinstance(res, dict):
                 norm = await self._run_sync(self.engine.normalize_device_names)
                 res["names"] = norm.get("message") if isinstance(norm, dict) else norm
             return res
 
+        # Upper-case device names.
         if normalized == "NETBOX_NORMALIZE_DEVICE_NAMES":
             return await self._run_sync(
                 self.engine.normalize_device_names,
                 tenant_slug=data.get("tenant_slug", ""))
 
+        # Add a device to a rack.
         if normalized == "NETBOX_ADD_DEVICE":
             return await self._run_sync(
                 self.engine.add_device_to_rack,
@@ -674,9 +794,11 @@ class NetboxSpoke(BaseSpoke):
                 status=data.get("status", "active"),
             )
 
+        # Device form options (cached).
         if normalized == "NETBOX_GET_DEVICE_FORM_OPTIONS":
             return await self._run_picklist("GET_DEVICE_FORM_OPTIONS", self.engine.get_device_form_options)
 
+        # Rack elevation view.
         if normalized == "NETBOX_GET_RACK_ELEVATION":
             # WebUI "View" rack-elevation button (IPAM → Racks). Read-only
             # render model (front+rear unit lists + 0U tray) — NOT a picklist
@@ -685,6 +807,7 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine.get_rack_elevation,
                                         int(data.get("rack_id", 0)))
 
+        # Claim a device for a tenant.
         if normalized == "NETBOX_CLAIM_DEVICE":
             return await self._run_sync(
                 self.engine.claim_device,
@@ -700,9 +823,11 @@ class NetboxSpoke(BaseSpoke):
                 dns_name=data.get("dns_name", ""),
             )
 
+        # Delete a device.
         if normalized == "NETBOX_DELETE_DEVICE":
             return await self._run_sync(self.engine.delete_device, int(data.get("device_id", 0)))
 
+        # Update a device.
         if normalized == "NETBOX_UPDATE_DEVICE":
             return await self._run_sync(
                 self.engine.update_device,
@@ -713,11 +838,13 @@ class NetboxSpoke(BaseSpoke):
                 rack_unit=int(data["rack_unit"]) if data.get("rack_unit") not in (None, "") else None,
             )
 
+        # List prefixes.
         if normalized == "NETBOX_GET_PREFIXES":
             return await self._run_sync(self.engine.get_prefixes, site=data.get("site"),
                                         tenant=data.get("tenant"),
                                         tenant_group=data.get("tenant_group"))
 
+        # Allocate a child prefix.
         if normalized == "NETBOX_ALLOCATE_PREFIX":
             return await self._run_sync(
                 self.engine.allocate_prefix,
@@ -731,13 +858,16 @@ class NetboxSpoke(BaseSpoke):
                 custom_fields=data.get("custom_fields"),
             )
 
+        # Find free subnets near a reference.
         if normalized == "NETBOX_FIND_AVAILABLE_PREFIXES":
             # Size may be given as a mask or as a host count (smallest mask that
             # fits). prefix_length wins when both are supplied.
             prefix_length = data.get("prefix_length")
+            # No mask given: derive it from the host count.
             if prefix_length in (None, ""):
                 hosts = int(data.get("hosts", 0) or 0)
                 prefix_length = self.engine._mask_for_hosts(hosts) if hosts else 24
+            # Search.
             return await self._run_sync(
                 self.engine.find_available_prefixes,
                 near=data.get("near", ""),
@@ -748,6 +878,7 @@ class NetboxSpoke(BaseSpoke):
                 tenant_slug=data.get("tenant"),
             )
 
+        # Claim a free subnet for a tenant.
         if normalized == "NETBOX_CLAIM_PREFIX":
             return await self._run_sync(
                 self.engine.claim_prefix,
@@ -759,6 +890,7 @@ class NetboxSpoke(BaseSpoke):
                 custom_fields=data.get("custom_fields"),
             )
 
+        # Update a prefix.
         if normalized == "NETBOX_UPDATE_PREFIX":
             return await self._run_sync(
                 self.engine.update_prefix,
@@ -769,9 +901,11 @@ class NetboxSpoke(BaseSpoke):
                 custom_fields=data.get("custom_fields"),
             )
 
+        # Delete a prefix.
         if normalized == "NETBOX_DELETE_PREFIX":
             return await self._run_sync(self.engine.delete_prefix, int(data.get("prefix_id", 0)))
 
+        # List IP addresses.
         if normalized == "NETBOX_GET_IPS":
             return await self._run_sync(
                 self.engine.get_ip_addresses,
@@ -781,6 +915,7 @@ class NetboxSpoke(BaseSpoke):
                 tenant_group=data.get("tenant_group"),
             )
 
+        # Allocate an IP from a prefix.
         if normalized == "NETBOX_ALLOCATE_IP":
             return await self._run_sync(
                 self.engine.allocate_ip,
@@ -792,9 +927,11 @@ class NetboxSpoke(BaseSpoke):
                 tenant_slug=data.get("tenant_slug") or data.get("tenant"),
             )
 
+        # Release (delete) an IP.
         if normalized == "NETBOX_RELEASE_IP":
             return await self._run_sync(self.engine.release_ip, int(data.get("ip_id", 0)))
 
+        # Update an IP's attributes.
         if normalized == "NETBOX_UPDATE_IP_ADDR":
             return await self._run_sync(
                 self.engine.update_ip_address,
@@ -805,10 +942,12 @@ class NetboxSpoke(BaseSpoke):
                 custom_fields=data.get("custom_fields"),
             )
 
+        # Update a device's primary IP.
         if normalized == "NETBOX_UPDATE_IP":
             return await self._run_sync(self.engine.update_device_ip,
                                         data.get("device", ""), data.get("ip", ""))
 
+        # Document a VM as a placeholder device.
         if normalized == "NETBOX_DOC_VM":
             return await self._run_sync(
                 self.engine.create_vm_entry,
@@ -816,13 +955,16 @@ class NetboxSpoke(BaseSpoke):
                 data.get("vcpus", 2), data.get("ram", 4096),
             )
 
+        # Tenant picklist (cached).
         if normalized == "NETBOX_GET_TENANTS":
             return await self._run_picklist("GET_TENANTS", self.engine.get_tenants)
 
+        # Tenant group picklist (cached).
         if normalized == "NETBOX_GET_TENANT_GROUPS":
             return await self._run_picklist("GET_TENANT_GROUPS",
                                             self.engine.get_tenant_groups)
 
+        # Move assets from one tenant to another.
         if normalized == "NETBOX_MIGRATE_TENANT":
             return await self._run_sync(
                 self.engine.migrate_tenant,
@@ -832,10 +974,12 @@ class NetboxSpoke(BaseSpoke):
                 create_target=_as_bool(data.get("create_target"), default=False),
             )
 
+        # Start the Kea DHCP sync loop.
         if normalized == "NETBOX_SYNC_DHCP":
             await self.start_kea_sync()
             return {"status": "SUCCESS", "message": "DHCP sync triggered"}
 
+        # Hypervisor VM sync.
         if normalized == "NETBOX_SYNC_VMS":
             # Hypervisor → NetBox VM sync. The hub relays a tenant's Proxmox VM
             # set (pulled from the pxmx spoke) here for an authoritative replace
@@ -852,6 +996,7 @@ class NetboxSpoke(BaseSpoke):
                 source_of_truth=data.get("source_of_truth", "external"),
             )
 
+        # Discovered device sync.
         if normalized == "NETBOX_SYNC_DEVICES":
             # Discovery-source → NetBox device sync. The hub relays a tenant's
             # discovered devices (OPNsense DHCP leases + ARP for the firewall
@@ -875,6 +1020,7 @@ class NetboxSpoke(BaseSpoke):
                 source_of_truth=data.get("source_of_truth", "external"),
             )
 
+        # Single polled network device sync.
         if normalized == "NETBOX_SYNC_NW_DEVICE":
             # Network Devices POLL NOW inventory sync. The hub relays a single
             # polled switch/gateway (SNMP/CLI/REST) here for an upsert into a
@@ -891,6 +1037,7 @@ class NetboxSpoke(BaseSpoke):
                 source=data.get("source", "Network Devices"),
             )
 
+        # ClearPass session sync.
         if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
             # Realtime NAC→IPAM reverse sync. The hub relays a tenant's recent
             # ClearPass Access Tracker / session records (CPPM_GET_RECENT_SESSIONS,
@@ -909,6 +1056,7 @@ class NetboxSpoke(BaseSpoke):
                 source_of_truth=data.get("source_of_truth", "netbox"),
             )
 
+        # Staleness sweep, followed by an automatic dedupe.
         if normalized == "NETBOX_STALENESS_SWEEP":
             # Cluster-wide staleness sweep: devices/VMs/IPs not seen for
             # ``stale_days`` → offline + decommissioned_at; offline + aged past
@@ -923,14 +1071,17 @@ class NetboxSpoke(BaseSpoke):
             )
             # Merge duplicate devices on the same schedule, so NetBox heals
             # itself without an operator running the dedupe by hand.
+            # Merge duplicates as well.
             dd = await self._run_sync(self.engine.dedupe_devices, apply=True)
             logger.info("auto-dedupe: %s", dd.get("message"))
+            # Fold dedupe results into the sweep result.
             if isinstance(res, dict):
                 res["dedupe_merged"] = dd.get("merged", 0)
                 res["errors"] = int(res.get("errors") or 0) + int(dd.get("errors") or 0)
                 res["message"] = f"{res.get('message') or 'sweep complete'}; dedupe: {dd.get('message')}"
             return res
 
+        # Find or merge duplicate devices.
         if normalized == "NETBOX_DEDUPE_DEVICES":
             # Find (and, when apply=True, merge) duplicate devices that share a
             # serial or MAC — the pre-existing duplicates the unified sync ladder
@@ -943,12 +1094,14 @@ class NetboxSpoke(BaseSpoke):
                 apply=bool(data.get("apply", False)),
             )
 
+        # Global search.
         if normalized == "NETBOX_SEARCH":
             return await self._run_sync(self.engine.search,
                                         query=data.get("q", ""),
                                         tenant=data.get("tenant"),
                                         is_admin=bool(data.get("is_admin")))
 
+        # Tenant VMID range.
         if normalized == "NETBOX_TENANT_VMID_RANGE":
             # LM hub VMID auto-allocation knob: read a tenant's
             # vmid_start/vmid_end custom-field range + the proxmox_vmid values
@@ -958,6 +1111,7 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine.get_tenant_vmid_range,
                                         tenant_slug=data.get("tenant_slug", ""))
 
+        # Provision custom fields (forced).
         if normalized == "NETBOX_PROVISION_CUSTOM_FIELDS":
             # WebUI "Apply schema changes" button (Setup/IPAM → edit/add a
             # NetBox instance). force=True re-runs the full idempotent
@@ -968,6 +1122,7 @@ class NetboxSpoke(BaseSpoke):
             return await self._run_sync(self.engine._ensure_custom_fields,
                                         force=True)
 
+        # Seed the device-type catalog.
         if normalized == "NETBOX_SEED_CATALOG":
             # WebUI "Seed catalog" button (Setup → Module Management). Loads the
             # bundled Aruba/HPE/Juniper device-type catalog and idempotently
@@ -977,6 +1132,7 @@ class NetboxSpoke(BaseSpoke):
             # clamp; _run_sync offloads the blocking pynetbox calls to a thread.
             return await self._run_sync(self.engine.seed_catalog)
 
+        # Rack import, step 1: detect sheets.
         if normalized == "NETBOX_IMPORT_RACK_DETECT":
             # WebUI "Import .xlsx" step 1: the hub saved the uploaded workbook
             # to a scratch dir and sent a token-gated download_url. Fetch it,
@@ -986,12 +1142,16 @@ class NetboxSpoke(BaseSpoke):
             # mutation (the COMMIT arm below is). _run_sync offloads openpyxl.
             def _detect():
                 """Download Excel workbook and detect rack layout sheets."""
+                # Download and parse the workbook.
                 raw = self._fetch_upload_bytes(
                     data.get("download_url", ""), data.get("token", ""))
                 wb = load_workbook_from_bytes(raw)
+                # Detected rack sheets.
                 return {"status": "SUCCESS", "racks": detect_rack_sheets(wb)}
+            # Run it off the event loop.
             return await self._run_sync(_detect)
 
+        # Rack import, step 2: commit selected sheets.
         if normalized == "NETBOX_IMPORT_RACK_COMMIT":
             # Step 2: re-fetch the workbook, re-parse the SELECTED sheets with
             # the user's column maps (full device rows — the detect step only
@@ -1000,25 +1160,33 @@ class NetboxSpoke(BaseSpoke):
             # errors are isolated. ``sheets`` = [{sheet, rack_name, site_slug,
             # u_height, tenant_slug, shape, column_map, default_role_slug,
             # default_status}]; ``dry_run`` resolves but skips every create.
+            # Selected sheets and dry-run flag.
             sheets = data.get("sheets") or []
             dry_run = bool(data.get("dry_run"))
 
             def _commit():
                 """Parse mapped sheets and commit rack/device layouts to NetBox."""
+                # Download and parse the workbook.
                 raw = self._fetch_upload_bytes(
                     data.get("download_url", ""), data.get("token", ""))
                 wb = load_workbook_from_bytes(raw)
+                # Worksheets by title.
                 ws_by_title = {ws.title: ws for ws in wb.worksheets}
                 selected = []
+                # Parse each selected sheet with its shape and column map.
                 for s in sheets:
                     shape = s.get("shape", "one-rack")
+                    # Multi-rack summary block.
                     if shape == "summary":
                         parsed = parse_summary_block_by_name(wb, s.get("rack_name", ""))
                     else:
+                        # One rack per sheet.
                         ws = ws_by_title.get(s.get("sheet", ""))
                         parsed = parse_one_rack_sheet(ws, s.get("column_map") or {}) if ws else None
+                    # Skip sheets that parsed to nothing.
                     if not parsed:
                         continue
+                    # Add the rack with its overrides.
                     selected.append({
                         "sheet": s.get("sheet"),
                         "rack_name": s.get("rack_name") or parsed.get("rack_name"),
@@ -1029,9 +1197,12 @@ class NetboxSpoke(BaseSpoke):
                         "default_status": s.get("default_status"),
                         "devices": parsed.get("devices") or [],
                     })
+                # Create or update the racks and devices.
                 return self.engine.import_rack_layout(selected, dry_run=dry_run)
+            # Run it off the event loop.
             return await self._run_sync(_commit)
 
+        # Install a TLS cert on the NetBox host.
         if normalized == "INSTALL_CERT":
             # Cert custodian (tiered Hub→Spoke→Agent): the SPOKE holds ALL the
             # logic — validate the pair, persist it (Fernet-encrypted), and deploy
@@ -1041,6 +1212,7 @@ class NetboxSpoke(BaseSpoke):
             # the cached cert automatically (_on_agent_registered → deploy).
             return await self._handle_install_cert(data)
 
+        # System command that a stale core did not handle: ack success.
         if command_type in _SYSTEM_COMMANDS:
             # Stale /opt/lm/core: this system command should have been
             # intercepted by handle_system_command but wasn't (core predates
@@ -1051,6 +1223,7 @@ class NetboxSpoke(BaseSpoke):
                         "to clear.", command_type)
             return {"status": "SUCCESS",
                     "message": f"{command_type} not applied — spoke core stale, update needed"}
+        # Unknown command.
         logger.warning(f"Unknown NetBox command: {command_type}")
         return {"status": "ERROR", "message": f"Unknown command: {command_type}"}
 
@@ -1060,6 +1233,7 @@ class NetboxSpoke(BaseSpoke):
         # thread so the spoke's asyncio loop stays free to heartbeats / inbound
         # commands while NetBox (or its DB) is slow to answer.
         health = await self._run_sync(self.engine.get_system_health)
+        # Status with API health and Kea loop state.
         return {
             "spoke_id": self.spoke_id,
             "module": "netbox",
@@ -1071,8 +1245,10 @@ class NetboxSpoke(BaseSpoke):
     def get_version(self) -> str:
         """Read and return version string from VERSION file."""
         try:
+            # VERSION file next to the source tree.
             vp = os.path.join(os.path.dirname(__file__), "../VERSION")
             with open(vp) as f:
                 return f.read().strip()
         except Exception:
+            # Unreadable: unknown.
             return "unknown"
