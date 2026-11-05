@@ -10,6 +10,7 @@ import pynetbox
 from types import SimpleNamespace
 
 from custom_fields_spec import FALLBACK_SITE_SLUG
+from netbox_profile import guess_role
 
 logger = logging.getLogger("NetboxEngine")
 
@@ -386,7 +387,7 @@ class SyncMixin:
             if r:
                 return r
             return self.nb.dcim.device_roles.create(
-                name=slug.capitalize(), slug=slug, color="9e9e9e")
+                name=slug.replace("-", " ").title(), slug=slug, color="9e9e9e")
         except Exception as e:
             # WARNING (not debug): a None role cascades into per-device create
             # failures (device_type/role unresolved), so surface the reason.
@@ -1042,6 +1043,9 @@ class SyncMixin:
         * ``model``/``manufacturer`` — discovered hardware, used to place a NEW
           device under its real device_type instead of 'discovered'.
         * ``role`` — per-record device role, applied on CREATE only.
+        * ``profile`` — what the host answered a probe with (sysDescr, HTTP
+          title/server, SSH banner); with the hostname it lets
+          ``netbox_profile.guess_role`` type a device no feed identified.
         * ``custom_fields`` — free-form per-record fields (TrueNAS product/
           version/…), stringified; only provisioned names are written later
           (``_device_cf_whitelist``)."""
@@ -1070,6 +1074,8 @@ class SyncMixin:
             rec["role"] = role
         if isinstance(dev.get("spec"), dict):
             rec["spec"] = dev["spec"]
+        if isinstance(dev.get("profile"), dict) and dev["profile"]:
+            rec["profile"] = dev["profile"]
         rec_cfs = dev.get("custom_fields")
         if isinstance(rec_cfs, dict) and rec_cfs:
             rec["custom_fields"] = {str(k): ("" if v is None else str(v))
@@ -1390,7 +1396,8 @@ class SyncMixin:
         'Discovered' even after the console/poll learned its model.
         Best-effort."""
         model = d.rec.get("model", "")
-        rec_role = d.rec.get("role", "")
+        rec_role = d.rec.get("role", "") or guess_role(
+            d.hostname if d.has_hostname else row.get("name", ""), d.rec.get("profile"))
         if not (model or rec_role):
             return
         mfr = d.rec.get("manufacturer", "")
@@ -1588,6 +1595,9 @@ class SyncMixin:
         3. stamp ownership + ``last_seen`` + MAC + switch + per-record cfs;
         4. with a real IP: ``mgmt`` interface + IP + ``primary_ip4``.
         """
+        if d.real_ip and self._ip_on_vm(d.real_ip):
+            run.skipped += 1  # the hypervisor sync owns VM addresses
+            return
         name = self._claim_create_name(run, d, d.default_name)
         # A prior create already 400'd on a missing site — the same 400 hits
         # every record, so stop attempting creates (count once each, one
@@ -1627,6 +1637,17 @@ class SyncMixin:
                           note=f"IP {d.real_ip}/{mask} → {name}")
             self._stamp_last_seen(ipobj)
         run.pushed += 1
+
+    def _ip_on_vm(self, ip: str) -> bool:
+        """True when NetBox has ``ip`` (any VRF) on a VM interface: a sighting
+        of a VM must not mint a device copy of it. Best-effort: False on error."""
+        try:
+            rows = self._api_get_all("/api/ipam/ip-addresses/", {"address": ip})
+        except Exception as e:
+            logger.debug("sync_devices: VM-IP lookup %s failed: %s", ip, e)
+            return False
+        return any(r.get("assigned_object_type") == "virtualization.vminterface"
+                   for r in rows or [] if isinstance(r, dict))
 
     def _claim_create_name(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                            name: str) -> str:
@@ -1695,6 +1716,8 @@ class SyncMixin:
         if d.serial:
             kwargs["serial"] = d.serial
         rec_role = d.rec.get("role")
+        if not rec_role and _ref_slug(run.role) in ("", _GENERIC_SLUG):
+            rec_role = guess_role(d.hostname if d.has_hostname else "", d.rec.get("profile"))
         create_role = self._ensure_device_role(rec_role) if rec_role else run.role
         if create_role:
             kwargs["role"] = create_role.id
