@@ -1392,6 +1392,15 @@ NGINX
         ok "HTTPS :443 enabled (self-signed)"
     fi
 
+    # Compress API JSON: nginx's default gzip_types is text/html only, so the
+    # spoke's 500-row device pages (~1 MB each) crossed the WAN uncompressed.
+    cat > /etc/nginx/conf.d/lm-gzip.conf <<'GZIP'
+gzip_types application/json;
+gzip_proxied any;
+gzip_min_length 1024;
+gzip_comp_level 5;
+GZIP
+
     ln -sf /etc/nginx/sites-available/netbox /etc/nginx/sites-enabled/netbox
     # Remove the distro default site — it owns :80 as default_server and would
     # serve the "Welcome to nginx" page over NetBox. Cover both possible locations.
