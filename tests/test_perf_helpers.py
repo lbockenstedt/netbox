@@ -199,3 +199,46 @@ def test_begin_prefix_prefetch_failure_leaves_fallback():
     eng._api_get_all = MagicMock(side_effect=Exception("boom"))
     eng._begin_prefix_prefetch()
     assert eng._prefix_prefetch is None       # → per-IP API path everywhere
+
+
+# ── _add_global_identities: the global listing is reused within the TTL ──────
+
+def test_global_identity_listing_is_cached_between_calls(monkeypatch):
+    import netbox_sync
+
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._api_get_all = MagicMock(return_value=[
+        {"id": 1, "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:01"}, "serial": "S1"}])
+
+    first, second = {}, {}
+    eng._add_global_identities(first, {})
+    eng._add_global_identities(second, {})
+    assert eng._api_get_all.call_count == 1
+    assert first == second and first
+
+    # Once the cache is older than the TTL the listing is fetched again.
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_IDENTITY_TTL_S", 0)
+    eng._add_global_identities({}, {})
+    assert eng._api_get_all.call_count == 2
+
+
+def test_nw_store_submits_dedupes_and_tracks_due(tmp_path):
+    from netbox_nw_store import NwInventoryStore
+    path = str(tmp_path / "nw.json")
+    store = NwInventoryStore(path)
+    rec = {"device": {"id": "d1", "name": "sw1"},
+           "interfaces": [{"name": "1/1", "mac": "aa", "rx_bytes": 5}]}
+    assert store.submit(rec) is True
+    assert [k for k, _ in store.due()] == ["d1"]
+    store.mark_applied("d1", store.entries["d1"]["sig"], {"site": "s"})
+    assert store.due() == []
+    # Counters are not part of the signature; same inventory is not a change.
+    rec2 = {**rec, "interfaces": [{"name": "1/1", "mac": "aa", "rx_bytes": 9}]}
+    assert store.submit(rec2) is False
+    # A real change makes it due again and keeps the last result for the ack.
+    rec3 = {**rec, "interfaces": [{"name": "1/1", "mac": "bb"}]}
+    assert store.submit(rec3) is True
+    assert [k for k, _ in store.due()] == ["d1"]
+    assert store.last_result("d1") == {"site": "s"}
+    # Survives a restart.
+    assert NwInventoryStore(path).entries["d1"]["sig"] == store.entries["d1"]["sig"]
