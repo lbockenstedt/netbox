@@ -3,6 +3,8 @@
 import ipaddress
 # re matches placeholder names, MAC formats and DNS-name validity.
 import re
+# json serialises the NW push signature.
+import json
 # time.monotonic ages the global-identity device listing cache.
 import time
 # logging reports sync progress and best-effort failures.
@@ -29,6 +31,8 @@ logger = logging.getLogger("NetboxEngine")
 
 # How long a global device listing is reused for the MAC/serial identity index.
 _GLOBAL_IDENTITY_TTL_S = 60
+# An unchanged NW device inventory is re-pushed to NetBox at most this often.
+_NW_PUSH_REFRESH_S = 3600
 
 
 # Auto-generated names the create branch mints when a record has no hostname
@@ -2274,6 +2278,23 @@ class SyncMixin:
             if not name:
                 name = f"nw-{nw_id[:8]}" if nw_id else "nw-device"
 
+            # Delta: the hub pushes on every poll, but only these fields reach
+            # NetBox. Unchanged since the last good push (and still inside the
+            # refresh window, which heals manual drift) → no NetBox traffic.
+            push_sig = json.dumps(
+                [{k: dev.get(k) for k in ("id", "name", "serial", "mac", "base_mac",
+                                          "address", "object_type", "model", "firmware")},
+                 spec, tenant_slug, defaults, source_tag,
+                 sorted([ifc.get(k) for k in ("name", "mac", "status", "speed", "ip", "vlan")]
+                        for ifc in interfaces or [] if isinstance(ifc, dict))],
+                sort_keys=True, default=str)
+            push_key = nw_id or name
+            last_push = self.__dict__.setdefault("_nw_push_cache", {}).get(push_key)
+            if (last_push and last_push["sig"] == push_sig
+                    and time.monotonic() - last_push["at"] < _NW_PUSH_REFRESH_S):
+                return {**last_push["result"], "pushed": 0, "skipped": 1,
+                        "message": f"nw device {name} unchanged since last push"}
+
             # Case-insensitive tenant resolve (slug OR name → canonical slug),
             # mirroring sync_vms' lookup so a mixed-case/none tenant still lands.
             tenant = None
@@ -2632,12 +2653,15 @@ class SyncMixin:
             else:
                 logger.info("sync_nw_device: %s", msg)
             # Success envelope, including the device's site for the caller.
-            return {"status": "SUCCESS", "pushed": pushed, "errors": errors,
-                    "skipped": skipped, "deleted": deleted,
-                    "interfaces_total": len(interfaces or []),
-                    "device_id": dev_id, "message": msg,
-                    "site": self._device_site_ref(devobj)}
-        # Unexpected failure: log it and return what was achieved so far.
+            result = {"status": "SUCCESS", "pushed": pushed, "errors": errors,
+                      "skipped": skipped, "deleted": deleted,
+                      "interfaces_total": len(interfaces or []),
+                      "device_id": dev_id, "message": msg,
+                      "site": self._device_site_ref(devobj)}
+            if not errors:
+                self._nw_push_cache[push_key] = {
+                    "sig": push_sig, "at": time.monotonic(), "result": result}
+            return result
         except Exception as e:
             logger.error("sync_nw_device failed: %s", e)
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
