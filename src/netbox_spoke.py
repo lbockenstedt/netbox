@@ -26,6 +26,7 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 # NetBox API engine and the rack-workbook parser.
 from netbox_engine import NetboxEngine
+from netbox_nw_store import NwInventoryStore, device_key, signature
 from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
                          parse_one_rack_sheet, parse_summary_block_by_name)
 
@@ -113,6 +114,9 @@ class NetboxSpoke(BaseSpoke):
         # fails to bind and the sync loop POSTs the hub → 405 "rejected scope").
         self.kea_url = config.get("kea_ctrl_url", os.getenv("KEA_CTRL_URL", "http://localhost:8760"))
         self._sync_task = None
+        self._nw_flush_task = None
+        self._nw_store = NwInventoryStore(
+            os.getenv("LM_NETBOX_NW_STORE", "/var/lib/lm/netbox/nw_inventory.json"))
         # perf FIX B: prefix → gateway of every scope last SUCCESSFULLY pushed
         # to Kea. Each tick diffs the NetBox scope set against this map and
         # only add/removes the deltas — the old loop re-POSTed subnet4-add for
@@ -183,6 +187,47 @@ class NetboxSpoke(BaseSpoke):
             # everything (Kea may have restarted while the loop was down).
             self._kea_synced.clear()
             self._sync_task = asyncio.create_task(self._kea_sync_loop())
+
+    async def start_nw_flush(self):
+        """Start the scheduled NW inventory -> NetBox flush (idempotent)."""
+        if not self._nw_flush_task:
+            self._nw_flush_task = asyncio.create_task(self._nw_flush_loop())
+
+    async def stop_nw_flush(self):
+        """Cancel the NW flush task."""
+        if self._nw_flush_task:
+            self._nw_flush_task.cancel()
+            self._nw_flush_task = None
+
+    async def _nw_apply(self, key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Write one stored device to NetBox; mark it applied when it had no errors."""
+        sig = signature(payload)
+        res = await self._run_sync(
+            self.engine.sync_nw_device,
+            device=payload.get("device", {}),
+            interfaces=payload.get("interfaces", []),
+            tenant_slug=payload.get("tenant_slug", ""),
+            defaults=payload.get("defaults", {}),
+            source=payload.get("source", "Network Devices"),
+        )
+        if res.get("status") == "SUCCESS" and not res.get("errors"):
+            self._nw_store.mark_applied(key, sig, {
+                k: res[k] for k in ("site", "device_id") if k in res})
+        return res
+
+    async def _nw_flush_loop(self):
+        """Every LM_NETBOX_NW_FLUSH_S seconds, write changed/stale devices to NetBox."""
+        interval = float(os.getenv("LM_NETBOX_NW_FLUSH_S", "900"))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                due = self._nw_store.due()
+                for key, payload in due:
+                    await self._nw_apply(key, payload)
+                if due:
+                    logger.info("nw flush: applied %d device(s) to NetBox", len(due))
+            except Exception as e:
+                logger.error(f"NW flush error: {e}", exc_info=True)
 
     async def stop_kea_sync(self):
         """Cancel and stop the background Kea DHCP synchronization task."""
@@ -1030,14 +1075,17 @@ class NetboxSpoke(BaseSpoke):
             # device itself becomes the NetBox record (distinct from the
             # ARP-neighbor→endpoint NETBOX_SYNC_DEVICES flow). ``defaults`` carry
             # the role/device_type/site slugs required to create the device.
-            return await self._run_sync(
-                self.engine.sync_nw_device,
-                device=data.get("device", {}),
-                interfaces=data.get("interfaces", []),
-                tenant_slug=data.get("tenant_slug", ""),
-                defaults=data.get("defaults", {}),
-                source=data.get("source", "Network Devices"),
-            )
+            # The inventory is held on disk and written to NetBox by the
+            # scheduled _nw_flush_loop (only what changed); the hub gets an
+            # immediate ack carrying the last known site/device_id. A caller
+            # that needs the write now sets ``immediate``.
+            key = device_key(data)
+            changed = self._nw_store.submit(data)
+            if data.get("immediate"):
+                return await self._nw_apply(key, data)
+            res = dict(self._nw_store.last_result(key))
+            res.update(status="SUCCESS", queued=True, changed=changed)
+            return res
 
         # ClearPass session sync.
         if normalized == "NETBOX_SYNC_ACCESS_TRACKER":
