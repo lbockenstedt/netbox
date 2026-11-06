@@ -426,9 +426,11 @@ class NetboxSpoke(BaseSpoke):
         entry = self._picklist_cache.get(key)
         if entry and (_time.time() - entry["ts"]) < self._picklist_ttl:
             return entry["value"]
-        # Otherwise fetch, cache and return it.
+        # Otherwise fetch, cache and return it. Errors are not cached, so a
+        # NetBox hiccup doesn't leave every picklist empty for the full TTL.
         value = await self._run_sync(fn, *args, **kwargs)
-        self._picklist_cache[key] = {"ts": _time.time(), "value": value}
+        if not (isinstance(value, dict) and value.get("status") == "ERROR"):
+            self._picklist_cache[key] = {"ts": _time.time(), "value": value}
         return value
 
     # Commands that change NetBox state and so could stale a cached picklist.
