@@ -3,6 +3,8 @@
 import ipaddress
 # re matches placeholder names, MAC formats and DNS-name validity.
 import re
+# time.monotonic ages the global-identity device listing cache.
+import time
 # logging reports sync progress and best-effort failures.
 import logging
 # dataclass/field build the per-batch state container _DeviceSyncRun.
@@ -24,6 +26,9 @@ from netbox_profile import guess_role
 
 # Shared logger name so these messages land with the rest of the NetBox engine's logs.
 logger = logging.getLogger("NetboxEngine")
+
+# How long a global device listing is reused for the MAC/serial identity index.
+_GLOBAL_IDENTITY_TTL_S = 60
 
 
 # Auto-generated names the create branch mints when a record has no hostname
@@ -778,8 +783,15 @@ class SyncMixin:
         raises: matching without global identities creates cross-tenant
         duplicates, so the sync must fail and retry instead."""
         # Fetch every device (all tenants) unless the caller already has the listing.
+        # Reuse a listing fetched in the last _GLOBAL_IDENTITY_TTL_S seconds: every
+        # NW device push calls this, and each fetch is ~1 MB per 500 devices.
         if rows is None:
-            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+            cached = getattr(self, "_global_devices_cache", None)
+            if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
+                rows = cached[1]
+            else:
+                rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+                self._global_devices_cache = (time.monotonic(), rows)
         # Walk every device row and index it by MAC and by serial.
         for row in rows or []:
             # Normalised MAC from the custom field; existing (tenant-scoped) entries are kept.

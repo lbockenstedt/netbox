@@ -199,3 +199,24 @@ def test_begin_prefix_prefetch_failure_leaves_fallback():
     eng._api_get_all = MagicMock(side_effect=Exception("boom"))
     eng._begin_prefix_prefetch()
     assert eng._prefix_prefetch is None       # → per-IP API path everywhere
+
+
+# ── _add_global_identities: the global listing is reused within the TTL ──────
+
+def test_global_identity_listing_is_cached_between_calls(monkeypatch):
+    import netbox_sync
+
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._api_get_all = MagicMock(return_value=[
+        {"id": 1, "custom_fields": {"mac_address": "aa:bb:cc:dd:ee:01"}, "serial": "S1"}])
+
+    first, second = {}, {}
+    eng._add_global_identities(first, {})
+    eng._add_global_identities(second, {})
+    assert eng._api_get_all.call_count == 1
+    assert first == second and first
+
+    # Once the cache is older than the TTL the listing is fetched again.
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_IDENTITY_TTL_S", 0)
+    eng._add_global_identities({}, {})
+    assert eng._api_get_all.call_count == 2
