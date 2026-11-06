@@ -188,3 +188,22 @@ def test_spoke_accepts_tenant_alias():
                           "tenant": "lrb"})
     assert res["status"] == "SUCCESS", res
     assert _created_payload(eng).get("tenant") == 42
+
+
+def test_picklist_errors_are_not_cached():
+    """A NetBox error must not be served from the picklist cache for the full
+    TTL (it left the Claim Device dropdowns empty)."""
+    spoke = NetboxSpoke.__new__(NetboxSpoke)
+    spoke._picklist_cache = {}
+    spoke._picklist_ttl = 60.0
+    replies = [{"status": "ERROR", "message": "timeout"}, {"status": "SUCCESS", "sites": [1]}]
+
+    async def _run_sync(fn, *a, **kw):
+        return fn()
+
+    spoke._run_sync = _run_sync
+    run = lambda: asyncio.get_event_loop().run_until_complete(
+        spoke._run_picklist("K", lambda: replies.pop(0)))
+    assert run()["status"] == "ERROR"
+    assert run()["status"] == "SUCCESS"
+    assert run()["status"] == "SUCCESS"     # now cached
