@@ -137,6 +137,8 @@ class NetboxControlPlane(AgentHostingControlPlane):
         self.register_module("netbox", netbox_spoke)
         # Start the background NetBox -> KEA DHCP reservation sync.
         await netbox_spoke.start_kea_sync()
+        # Scheduled NW inventory -> NetBox apply (inventory is held on disk).
+        await netbox_spoke.start_nw_flush()
         # Agent host: serve /ws/agent so the NetBox-host Agent dials us (Style 1
         # remote wss / Style 2 loopback). Gated by AGENT_LISTENER_OPT_IN + the env.
         if self._agent_listener_enabled():
@@ -147,6 +149,7 @@ class NetboxControlPlane(AgentHostingControlPlane):
             await super().run()
         finally:
             await netbox_spoke.stop_kea_sync()
+            await netbox_spoke.stop_nw_flush()
 
     async def _on_agent_registered(self, agent_id: str):
         """New-device-connect trigger: when the NetBox-host Agent connects+approves,
