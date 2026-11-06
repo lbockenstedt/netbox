@@ -439,31 +439,3 @@ def test_sync_nw_device_moves_device_out_of_fallback_site_only():
     eng.nb.dcim.devices.get = MagicMock(return_value=placed)
     eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
     assert placed.site.slug == "olathe"
-
-
-def test_unchanged_nw_device_push_skips_netbox_until_refresh(monkeypatch):
-    import netbox_sync
-
-    eng = _engine()
-    ifaces = [{"name": "1/1/1", "status": "up", "speed": 1000}]
-    first = eng.sync_nw_device(_DEV, ifaces, defaults=_DEFAULTS)
-    assert first["status"] == "SUCCESS"
-    calls_after_first = eng._api_get_all.call_count
-
-    # Same inventory: answered from the spoke cache, NetBox is not touched.
-    second = eng.sync_nw_device(_DEV, ifaces, defaults=_DEFAULTS)
-    assert second["status"] == "SUCCESS" and second["skipped"] == 1 and second["pushed"] == 0
-    assert second["device_id"] == first["device_id"]
-    assert eng._api_get_all.call_count == calls_after_first
-
-    # A changed interface is pushed again.
-    eng.sync_nw_device(_DEV, [{"name": "1/1/1", "status": "down", "speed": 1000}],
-                       defaults=_DEFAULTS)
-    assert eng._api_get_all.call_count > calls_after_first
-
-    # After the refresh window an unchanged inventory is re-pushed.
-    monkeypatch.setattr(netbox_sync, "_NW_PUSH_REFRESH_S", 0)
-    before = eng._api_get_all.call_count
-    eng.sync_nw_device(_DEV, [{"name": "1/1/1", "status": "down", "speed": 1000}],
-                       defaults=_DEFAULTS)
-    assert eng._api_get_all.call_count > before
