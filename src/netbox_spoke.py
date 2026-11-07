@@ -226,6 +226,9 @@ class NetboxSpoke(BaseSpoke):
                     await self._nw_apply(key, payload)
                 if due:
                     logger.info("nw flush: applied %d device(s) to NetBox", len(due))
+                # Re-evaluate rack placement after devices changed (names/serials/links).
+                if due and os.getenv("LM_NETBOX_AUTORACK", "1") != "0":
+                    await self._run_sync(self.engine.autorack_sweep)
             except Exception as e:
                 logger.error(f"NW flush error: {e}", exc_info=True)
 
@@ -488,7 +491,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
-        "NETBOX_DEDUPE_DEVICES",
+        "NETBOX_DEDUPE_DEVICES", "NETBOX_AUTORACK_SWEEP",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
         "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP", "NETBOX_NORMALIZE_DEVICE_NAMES",
@@ -1066,6 +1069,18 @@ class NetboxSpoke(BaseSpoke):
                 source=data.get("source", "opnsense"),
                 source_of_truth=data.get("source_of_truth", "external"),
             )
+
+        # Auto-rack: place/re-rack devices from their names. ``report`` only
+        # returns the last sweep's conflicts / cannot-auto-rack list.
+        if normalized == "NETBOX_AUTORACK_SWEEP":
+            if data.get("report"):
+                return dict(getattr(self.engine, "_autorack_last", None)
+                            or {"status": "SUCCESS", "conflicts": [], "cannot": []})
+            return await self._run_sync(
+                self.engine.autorack_sweep,
+                tenant_slug=data.get("tenant", ""),
+                dry_run=bool(data.get("dry_run")),
+                online=data.get("online") or None)
 
         # Single polled network device sync.
         if normalized == "NETBOX_SYNC_NW_DEVICE":
