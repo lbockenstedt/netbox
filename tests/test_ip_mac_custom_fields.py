@@ -170,3 +170,22 @@ def test_spoke_passes_none_when_no_custom_fields():
     called = _dispatch({"ip_id": 7, "description": "d"})
 
     assert called.call_args.kwargs["custom_fields"] is None
+
+
+def test_nw_device_push_starts_the_flush_loop_when_hosted_by_the_agent():
+    """The agent builds the spoke without control_plane.py, so nothing else
+    starts the loop that writes stored NW inventory to NetBox."""
+    spoke = object.__new__(NetboxSpoke)
+    spoke._nw_store = MagicMock()
+    spoke._nw_store.submit.return_value = True
+    spoke._nw_store.last_result.return_value = {}
+    spoke._nw_flush_task = None
+    spoke._picklist_invalidate = MagicMock()
+
+    async def _push():
+        await spoke.handle_command("NETBOX_SYNC_NW_DEVICE", {"device": {"id": "d1"}})
+        task = spoke._nw_flush_task
+        await spoke.stop_nw_flush()
+        return task
+
+    assert asyncio.run(_push()) is not None
