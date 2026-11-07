@@ -183,3 +183,16 @@ def test_adopt_real_name_rules():
     # A bare-IP name takes the short real hostname; the index follows.
     assert eng._adopt_real_name(d, "vpnc1.example.com", by_name)
     assert d.name == "VPNC1" and by_name["vpnc1"]["id"] == 2
+
+
+def test_adopt_real_name_force_renames_human_name_but_never_steals():
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._journal = MagicMock()
+    by_name = {"core-sw": {"id": 1}, "taken": {"id": 7}}
+    d = _rec(1, "core-sw")
+    # A hardware-matched box renamed on the device follows its new hostname.
+    assert eng._adopt_real_name(d, "MIPBE-SSPLM-N31-R45-VPNC1.mip.example.com", by_name, force=True)
+    assert d.name == "MIPBE-SSPLM-N31-R45-VPNC1"
+    assert "core-sw" not in by_name and by_name["mipbe-ssplm-n31-r45-vpnc1"]["id"] == 1
+    # Even when forced, a name held by another device is kept off limits.
+    assert not eng._adopt_real_name(d, "taken", by_name, force=True)
