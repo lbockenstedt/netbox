@@ -65,7 +65,28 @@ _SWITCH_CF_KEYS = ("switch_name", "switch_ip", "switch_port")
 _GENERIC_SLUG = "discovered"
 
 # nw poll ``object_type`` -> (device role slug, manufacturer).
+# Roles a management controller (iLO/iDRAC) record carries. Such a record shares
+# its server's chassis serial, so it must never be matched to, or renamed from,
+# the server's record (and vice versa) — they are linked, not merged.
+_MGMT_ROLE_SLUGS = frozenset({"bmc", "ipmi", "management-controller"})
+
+
+def _row_role_slug(row: Any) -> str:
+    """Role slug of a device listing row (NetBox 4 ``role`` / 3 ``device_role``)."""
+    if isinstance(row, dict):
+        ref = row.get("role") or row.get("device_role") or {}
+    else:
+        ref = getattr(row, "role", None) or getattr(row, "device_role", None) or {}
+    return _ref_slug(ref).lower()
+
+
+def _is_mgmt_row(row: Any) -> bool:
+    """True when a device listing row is a management controller."""
+    return _row_role_slug(row) in _MGMT_ROLE_SLUGS
+
+
 _NW_OBJECT_TYPE_IDENTITY = {
+    "ipmi": ("bmc", ""),
     "aos_switch": ("switch", "Aruba"),
     "cx_switch": ("switch", "Aruba"),
     "ex_switch": ("switch", "Juniper"),
@@ -771,7 +792,8 @@ class SyncMixin:
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
-                               rows: Optional[list] = None) -> None:
+                               rows: Optional[list] = None,
+                               by_serial_mgmt: Optional[Dict[str, dict]] = None) -> None:
         """Fill MAC / serial indexes from EVERY tenant (setdefault: rows already
         indexed from the caller's tenant-scoped listing win).
 
@@ -801,8 +823,10 @@ class SyncMixin:
                 by_mac.setdefault(rmac, row)
             # Serial (lower-cased) when the caller wants a serial index too.
             rserial = str(row.get("serial") or "").strip()
-            if rserial and by_serial is not None:
+            if rserial and by_serial is not None and not _is_mgmt_row(row):
                 by_serial.setdefault(rserial.lower(), row)
+            if rserial and by_serial_mgmt is not None and _is_mgmt_row(row):
+                by_serial_mgmt.setdefault(rserial.lower(), row)
 
     def _index_existing_devices(self, rows) -> Dict[str, Dict[str, dict]]:
         """Index existing NetBox device rows for the canonical reconciliation
@@ -817,6 +841,7 @@ class SyncMixin:
         duplicate per feeder."""
         # One empty index per identity type.
         by_serial: Dict[str, dict] = {}
+        by_serial_mgmt: Dict[str, dict] = {}
         by_mac: Dict[str, dict] = {}
         by_nw: Dict[str, dict] = {}
         by_ip: Dict[str, dict] = {}
@@ -830,7 +855,7 @@ class SyncMixin:
             # By lower-cased serial number.
             rserial = str(row.get("serial") or "").strip()
             if rserial:
-                by_serial.setdefault(rserial.lower(), row)
+                (by_serial_mgmt if _is_mgmt_row(row) else by_serial).setdefault(rserial.lower(), row)
             # By normalised MAC from the mac_address custom field.
             cf = row.get("custom_fields") or {}
             rmac = self._norm_mac(cf.get("mac_address", ""))
@@ -847,17 +872,22 @@ class SyncMixin:
             if addr:
                 by_ip.setdefault(addr, row)
         # Hand back all five indexes keyed by name.
-        return {"by_serial": by_serial, "by_mac": by_mac, "by_nw": by_nw,
-                "by_ip": by_ip, "by_name": by_name}
+        return {"by_serial": by_serial, "by_serial_mgmt": by_serial_mgmt, "by_mac": by_mac,
+                "by_nw": by_nw, "by_ip": by_ip, "by_name": by_name}
 
     def _adopt_real_name(self, devobj, hostname: str, by_name: dict,
-                         source: str = "sync", force: bool = False) -> bool:
+                         source: str = "sync", force: bool = False,
+                         expect_mgmt: Optional[bool] = None) -> bool:
         """Rename a device still carrying an auto name (see ``_is_auto_name``)
         to a real hostname learned by another feeder (LLDP system name, polled
         hostname). Never renames a human-chosen name unless ``force`` (the
         caller matched the device by hardware identity, so a changed hostname
         is a rename of the same box) and never takes a name another device
         already holds. Returns True iff renamed."""
+        # A feed never renames a record of a different kind (a controller's
+        # hostname is not its server's, even when they share a serial).
+        if expect_mgmt is not None and _is_mgmt_row(devobj) != expect_mgmt:
+            return False
         # Current device name and the candidate hostname, trimmed.
         cur = str(getattr(devobj, "name", "") or "").strip()
         host = str(hostname or "").strip()
@@ -1346,7 +1376,7 @@ class SyncMixin:
                 run.by_mac.setdefault(rmac, row)
             # Serial index: survives IP/hostname churn.
             rserial = str(row.get("serial") or "").strip()
-            if rserial:
+            if rserial and not _is_mgmt_row(row):
                 run.by_serial.setdefault(rserial.lower(), row)
             # Only rows with a primary IP go into the IP index.
             addr = _primary_addr(row)
@@ -2305,13 +2335,21 @@ class SyncMixin:
             # Index them, and add global MAC/serial identities when tenant-scoped.
             idx = self._index_existing_devices(rows)
             if tenant:
-                self._add_global_identities(idx["by_mac"], idx["by_serial"])
+                self._add_global_identities(idx["by_mac"], idx["by_serial"],
+                                            by_serial_mgmt=idx["by_serial_mgmt"])
+            # A management controller shares its server's serial: it only ever
+            # matches other controller records by serial, never the server.
+            is_mgmt = ident_role in _MGMT_ROLE_SLUGS
             # Walk the canonical ladder to find an existing device for this box.
             existing = self._resolve_existing_device(
                 serial=serial, mac=base_mac, nw_device_id=nw_id, ip=mgmt_ip,
-                hostname=name, by_serial=idx["by_serial"], by_mac=idx["by_mac"],
-                by_nw=idx["by_nw"],
+                hostname=name,
+                by_serial=idx["by_serial_mgmt"] if is_mgmt else idx["by_serial"],
+                by_mac=idx["by_mac"], by_nw=idx["by_nw"],
                 by_ip=idx["by_ip"], by_name=idx["by_name"])
+            # Whatever tier matched, a controller and a server are different objects.
+            if existing is not None and _is_mgmt_row(existing) != is_mgmt:
+                existing = None
 
             # ── Create the device if missing (defaults required) ────────────────
             if existing is None:
@@ -2464,7 +2502,7 @@ class SyncMixin:
                                 or (base_mac and self._norm_mac(cfs.get("mac_address", "")) == base_mac))
                     self._adopt_real_name(devobj, str(dev.get("name") or ""),
                                           idx["by_name"], source="nw-poll",
-                                          force=bool(same_box))
+                                          force=bool(same_box), expect_mgmt=is_mgmt)
                 except Exception as e:
                     logger.debug("sync_nw_device: adopt name skipped: %s", e)
 
@@ -2631,6 +2669,13 @@ class SyncMixin:
                         logger.debug("sync_nw_device: delete stale iface %s failed: %s",
                                      ifname_l, e)
 
+            # Stitch this controller to its server's record (hardware-serial match).
+            if is_mgmt:
+                try:
+                    self._link_host_device(devobj, dev.get("linked_host"), idx, serial)
+                except Exception as e:
+                    logger.warning("sync_nw_device: link host for %s skipped: %s", name, e)
+
             # Summary line for this device.
             msg = (f"nw device {name} upserted: {pushed} interface(s), "
                    f"{deleted} deleted, {skipped} skipped, {errors} errors")
@@ -2652,6 +2697,87 @@ class SyncMixin:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "interfaces_total": len(interfaces or []), "device_id": None}
+
+    def _link_host_device(self, devobj: Any, linked_host: Any, idx: dict,
+                          serial: str = "") -> None:
+        """Link a management controller's NetBox device to its host server's.
+
+        The hub matched the two by hardware serial and sends the host's name.
+        Both stay separate records: the controller gets the native serial and a
+        ``linked_device`` pointing at the host; when the host already exists in
+        NetBox it gets the reverse pointer and its ``oob_ip`` set to the
+        controller's address, and a racked host's rack (and U position when that
+        slot is free) is copied to the controller. A host with no NetBox device
+        yet is never invented - only the controller side is recorded."""
+        host_name = str((linked_host or {}).get("name") or "").strip() if isinstance(linked_host, dict) else ""
+        if not host_name:
+            return
+        host_serial = str((linked_host or {}).get("serial") or serial or "").strip()
+        # The controller side: native serial (fill-gap only) and the pointer.
+        cf = dict(devobj.custom_fields or {})
+        changed = False
+        if cf.get("linked_device") != host_name:
+            cf["linked_device"] = host_name
+            devobj.custom_fields = cf
+            changed = True
+        if host_serial and not str(getattr(devobj, "serial", "") or "").strip():
+            devobj.serial = host_serial
+            changed = True
+        # The host's NetBox record: non-controller device with that serial, else that name.
+        row = (idx["by_serial"].get(host_serial.lower()) if host_serial else None) \
+            or (idx["by_name"].get(self._nb_name(host_name.split(".", 1)[0]).lower())
+                or idx["by_name"].get(host_name.lower()))
+        if row is not None and _is_mgmt_row(row):
+            row = None
+        if row is None or row.get("id") == getattr(devobj, "id", None):
+            if changed:
+                devobj.save()
+            return
+        host = self.nb.dcim.devices.get(row["id"])
+        if not host:
+            if changed:
+                devobj.save()
+            return
+        # Racked host: put the controller in the same rack (and U when free).
+        host_rack = getattr(host, "rack", None)
+        if host_rack and not getattr(devobj, "rack", None):
+            attempts = [{"rack": host_rack.id, "site": host.site.id,
+                         "position": getattr(host, "position", None),
+                         "face": getattr(getattr(host, "face", None), "value", None)},
+                        {"rack": host_rack.id, "site": host.site.id}]
+            saved = False
+            for kw in attempts:
+                if kw.get("position") is None:
+                    kw = {k: v for k, v in kw.items() if k not in ("position", "face")}
+                before = {k: getattr(devobj, k, None) for k in kw}
+                try:
+                    for k, v in kw.items():
+                        setattr(devobj, k, v)
+                    devobj.save()
+                    saved = True
+                    break
+                except Exception as e:
+                    logger.info("netbox: rack %s for %s refused (%s)", kw, devobj.name, e)
+                    for k, v in before.items():
+                        setattr(devobj, k, v)
+            changed = changed and not saved
+        if changed:
+            devobj.save()
+        # The host side: reverse pointer and out-of-band IP.
+        hcf = dict(host.custom_fields or {})
+        hchanged = False
+        if hcf.get("linked_device") != devobj.name:
+            hcf["linked_device"] = devobj.name
+            host.custom_fields = hcf
+            hchanged = True
+        oob = getattr(devobj, "primary_ip4", None)
+        if oob and not getattr(host, "oob_ip", None):
+            host.oob_ip = getattr(oob, "id", oob)
+            hchanged = True
+        if hchanged:
+            host.save()
+            self._journal("dcim.device", host.id, "nw-poll",
+                          note=f"linked to controller {devobj.name} by serial")
 
     def _resolve_tenant_ci(self, slug: str) -> Any:
         """Case-insensitive tenant resolve: lower(slug) ∪ lower(name) → tenant
