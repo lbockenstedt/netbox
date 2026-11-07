@@ -242,3 +242,13 @@ def test_nw_store_submits_dedupes_and_tracks_due(tmp_path):
     assert store.last_result("d1") == {"site": "s"}
     # Survives a restart.
     assert NwInventoryStore(path).entries["d1"]["sig"] == store.entries["d1"]["sig"]
+
+
+def test_nw_store_due_lists_changed_before_stale_refreshes(tmp_path):
+    from netbox_nw_store import NwInventoryStore
+    store = NwInventoryStore(str(tmp_path / "nw.json"), refresh_s=0)
+    for k in ("a", "b"):
+        store.submit({"device": {"id": k, "name": k}, "interfaces": []})
+        store.mark_applied(k, store.entries[k]["sig"], {})
+    store.submit({"device": {"id": "b", "name": "b-renamed"}, "interfaces": []})
+    assert [k for k, _ in store.due()] == ["b", "a"]
