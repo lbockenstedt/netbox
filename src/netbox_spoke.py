@@ -1081,6 +1081,9 @@ class NetboxSpoke(BaseSpoke):
             # that needs the write now sets ``immediate``.
             key = device_key(data)
             changed = self._nw_store.submit(data)
+            # Agent-hosted spokes are built without control_plane.py, so the
+            # flush loop is started here on the first stored push (idempotent).
+            await self.start_nw_flush()
             if data.get("immediate"):
                 return await self._nw_apply(key, data)
             res = dict(self._nw_store.last_result(key))
