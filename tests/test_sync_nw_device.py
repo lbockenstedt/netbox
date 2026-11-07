@@ -290,6 +290,31 @@ def test_sync_nw_device_renames_auto_named_match_to_polled_hostname():
     eng.nb.dcim.devices.create.assert_not_called()
 
 
+def test_sync_nw_device_follows_hostname_changed_on_the_box():
+    # Matched by serial; the box was renamed on the device -> NetBox follows.
+    row = {"id": 70, "name": "MIPBE-SSPLM-N31-VPNC1", "serial": "SN-1",
+           "custom_fields": {"discovered_from": "Network Devices"}}
+    eng = _engine(existing_devices=[row])
+    rec = _Obj(id=70, name="MIPBE-SSPLM-N31-VPNC1", custom_fields={})
+    rec.serial = "SN-1"
+    eng.nb.dcim.devices.get = MagicMock(return_value=rec)
+    dev = dict(_DEV, name="mipbe-ssplm-n31-r45-vpnc1", serial="SN-1")
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert rec.name == "MIPBE-SSPLM-N31-R45-VPNC1"
+
+
+def test_sync_nw_device_name_match_only_never_renames_human_name():
+    # Matched by name only (no serial/MAC/nw id in common) -> name untouched.
+    row = {"id": 71, "name": "core-sw", "serial": "", "custom_fields": {}}
+    eng = _engine(existing_devices=[row])
+    rec = _Obj(id=71, name="core-sw", custom_fields={})
+    eng.nb.dcim.devices.get = MagicMock(return_value=rec)
+    dev = dict(_DEV, name="core-sw", serial="", mac="")
+    eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert rec.name == "core-sw"
+
+
 def test_sync_nw_device_keeps_auto_name_when_poll_has_only_ip_name():
     other = {"id": 66, "name": "DEVICE-001A1E042F00", "serial": "",
              "custom_fields": {"mac_address": "00:1a:1e:04:2f:00"}}

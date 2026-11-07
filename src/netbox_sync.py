@@ -851,17 +851,19 @@ class SyncMixin:
                 "by_ip": by_ip, "by_name": by_name}
 
     def _adopt_real_name(self, devobj, hostname: str, by_name: dict,
-                         source: str = "sync") -> bool:
+                         source: str = "sync", force: bool = False) -> bool:
         """Rename a device still carrying an auto name (see ``_is_auto_name``)
         to a real hostname learned by another feeder (LLDP system name, polled
-        hostname). Never renames a human-chosen name and never takes a name
-        another device already holds. Returns True iff renamed."""
+        hostname). Never renames a human-chosen name unless ``force`` (the
+        caller matched the device by hardware identity, so a changed hostname
+        is a rename of the same box) and never takes a name another device
+        already holds. Returns True iff renamed."""
         # Current device name and the candidate hostname, trimmed.
         cur = str(getattr(devobj, "name", "") or "").strip()
         host = str(hostname or "").strip()
         # Only rename when the new name is real and the current name is an auto placeholder.
         if not host or host.lower() == "unknown" or _is_auto_name(host) \
-                or not _is_auto_name(cur):
+                or not (force or _is_auto_name(cur)):
             return False
         # Use the short (first DNS label) hostname in canonical upper case; skip if unchanged.
         new = self._nb_name(host.split(".", 1)[0])
@@ -2453,9 +2455,16 @@ class SyncMixin:
                 # Matched a device another feeder auto-named (DEVICE-<mac> from
                 # ARP, or a bare IP): the polled hostname is the real name. Only
                 # the fleet's own name counts, never the nw-<id> fallback.
+                # A box matched by hardware identity that now reports a new
+                # hostname was renamed on the device: follow it.
                 try:
+                    cfs = existing.get("custom_fields") or {}
+                    same_box = ((nw_id and str(cfs.get("nw_device_id") or "") == nw_id)
+                                or (serial and str(existing.get("serial") or "") == serial)
+                                or (base_mac and self._norm_mac(cfs.get("mac_address", "")) == base_mac))
                     self._adopt_real_name(devobj, str(dev.get("name") or ""),
-                                          idx["by_name"], source="nw-poll")
+                                          idx["by_name"], source="nw-poll",
+                                          force=bool(same_box))
                 except Exception as e:
                     logger.debug("sync_nw_device: adopt name skipped: %s", e)
 
