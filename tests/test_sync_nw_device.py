@@ -464,3 +464,82 @@ def test_sync_nw_device_moves_device_out_of_fallback_site_only():
     eng.nb.dcim.devices.get = MagicMock(return_value=placed)
     eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
     assert placed.site.slug == "olathe"
+
+
+# ── hardware-serial stitching: controller (iLO) vs host server ──────────────
+_ILO = {"id": "nw-ilo", "name": "mipbe-n31-ilo-tnas", "address": "10.0.0.15",
+        "serial": "2M292101K3", "object_type": "ipmi"}
+
+
+def test_ipmi_never_matches_or_renames_the_server_sharing_its_serial():
+    server = {"id": 60, "name": "MIPBE-N31-TNAS", "serial": "2M292101K3",
+              "role": {"slug": "storage"}, "custom_fields": {}}
+    eng = _engine(existing_devices=[server])
+    created = _Obj(id=61, name="MIPBE-N31-ILO-TNAS")
+    eng.nb.dcim.devices.create = MagicMock(return_value=created)
+    srv_rec = _Obj(id=60, name="MIPBE-N31-TNAS")
+    eng.nb.dcim.devices.get = MagicMock(return_value=srv_rec)
+    res = eng.sync_nw_device(device=_ILO, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS" and res["device_id"] == 61, res
+    eng.nb.dcim.devices.create.assert_called_once()
+    assert srv_rec.name == "MIPBE-N31-TNAS"
+
+
+def test_server_feed_never_matches_the_controller_by_serial():
+    ilo = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "serial": "2M292101K3",
+           "role": {"slug": "bmc"}, "custom_fields": {}}
+    eng = _engine(existing_devices=[ilo])
+    idx = eng._index_existing_devices([ilo])
+    assert "2m292101k3" not in idx["by_serial"] and "2m292101k3" in idx["by_serial_mgmt"]
+
+
+def test_adopt_real_name_refuses_across_kinds():
+    eng = _engine()
+    rec = _Obj(id=1, name="device-aabbccddeeff")
+    rec.role = MagicMock(slug="storage")
+    assert eng._adopt_real_name(rec, "MIPBE-N31-ILO-TNAS", {}, force=True, expect_mgmt=True) is False
+    assert rec.name == "device-aabbccddeeff"
+
+
+def test_ipmi_links_host_racks_it_and_sets_oob_ip():
+    ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "role": {"slug": "bmc"},
+               "custom_fields": {"nw_device_id": "nw-ilo"}}
+    host_row = {"id": 60, "name": "MIPBE-N31-TNAS", "serial": "2M292101K3",
+                "role": {"slug": "storage"}, "custom_fields": {}}
+    eng = _engine(existing_devices=[ilo_row, host_row])
+    ilo = _Obj(id=61, name="MIPBE-N31-ILO-TNAS")
+    ilo.rack = None
+    ilo.role = MagicMock(slug="bmc")
+    host = _Obj(id=60, name="MIPBE-N31-TNAS")
+    host.rack = MagicMock(id=3)
+    host.site = MagicMock(id=501)
+    host.position = 20
+    host.face = MagicMock(value="front")
+    host.oob_ip = None
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda i: {61: ilo, 60: host}[i])
+    ifaces = [{"name": "mgmt", "ip": "10.0.0.15", "status": "up"}]
+    eng.nb.dcim.interfaces.create = MagicMock(return_value=_Obj(id=700))
+    dev = dict(_ILO, linked_host={"kind": "truenas", "name": "MIPBE-N31-TNAS",
+                                  "serial": "2M292101K3"})
+    res = eng.sync_nw_device(device=dev, interfaces=ifaces, tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert ilo.custom_fields["linked_device"] == "MIPBE-N31-TNAS"
+    assert (ilo.rack, ilo.position) == (3, 20)
+    assert host.custom_fields["linked_device"] == "MIPBE-N31-ILO-TNAS"
+    assert host.oob_ip == 9000
+    assert host.name == "MIPBE-N31-TNAS"
+
+
+def test_ipmi_link_without_host_device_only_marks_the_controller():
+    ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "role": {"slug": "bmc"},
+               "custom_fields": {"nw_device_id": "nw-ilo"}}
+    eng = _engine(existing_devices=[ilo_row])
+    ilo = _Obj(id=61, name="MIPBE-N31-ILO-TNAS")
+    ilo.role = MagicMock(slug="bmc")
+    eng.nb.dcim.devices.get = MagicMock(return_value=ilo)
+    dev = dict(_ILO, linked_host={"kind": "truenas", "name": "MIPBE-N31-TNAS", "serial": "2M292101K3"})
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert ilo.custom_fields["linked_device"] == "MIPBE-N31-TNAS"
+    assert ilo.serial == "2M292101K3"
+    eng.nb.dcim.devices.create.assert_not_called()

@@ -58,6 +58,9 @@ CUSTOM_FIELDS_SPEC = [
     # and marks dcim.interfaces the nw sync created (so replace-delete only ever
     # touches our interfaces, never manually-created ones).
     ("nw_device_id", "text", "NW device id", "dcim.device"),
+    # Hardware-serial stitching: a server and its management controller (iLO/iDRAC)
+    # are two records of one machine; each names the other here.
+    ("linked_device", "text", "Linked device", "dcim.device"),
     ("nw_managed", "text", "NW managed", "dcim.interface"),
     # MAC-keyed matching shared by the NAC↔IPAM (ClearPass access tracker) and
     # firewall discovery syncs. Attached to both ipam.ipaddress and dcim.device.
