@@ -87,10 +87,15 @@ class NwInventoryStore:
         return (self.entries.get(key) or {}).get("result") or {}
 
     def due(self) -> List[Tuple[str, Dict[str, Any]]]:
-        """Records that need writing to NetBox: changed, or past the refresh age."""
+        """Records that need writing to NetBox: changed, or past the refresh age.
+        Changed records (renames, new data) come first so a routine hourly refresh
+        of thousands of unchanged devices never delays them."""
         now = time.time()
-        return [(key, e["payload"]) for key, e in self.entries.items()
-                if e["sig"] != e["applied_sig"] or now - e["applied_at"] >= self.refresh_s]
+        changed = [(k, e["payload"]) for k, e in self.entries.items()
+                   if e["sig"] != e["applied_sig"]]
+        stale = [(k, e["payload"]) for k, e in self.entries.items()
+                 if e["sig"] == e["applied_sig"] and now - e["applied_at"] >= self.refresh_s]
+        return changed + stale
 
     def mark_applied(self, key: str, sig: str, result: Dict[str, Any]) -> None:
         """Record that ``sig`` was written to NetBox for ``key`` with ``result``."""
