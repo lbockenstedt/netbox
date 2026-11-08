@@ -120,3 +120,26 @@ def test_report_entries_carry_tenant_and_slots():
     assert c[1]["tenant"] == "ssplm" and c[1]["wanted"] == "N31 U20 front" and c[1]["current"] == "unracked"
     assert c[2]["current"] == "N31 U20 front" and not c[2]["mismatch"]
     assert res["named"] == 2 and res["racked"] == 1
+
+
+def test_two_half_width_devices_share_one_u_on_opposite_faces():
+    from netbox_autorack import plan
+    racks = [{"id": 1, "name": "N31", "site_id": 1, "tenant_id": None, "u_height": 48}]
+    base = {"site_id": 1, "tenant_id": None, "rack_id": None, "position": None, "face": None,
+            "online": True, "height": 1, "full_depth": False, "half_width": True}
+    devs = [dict(base, id=1, name="MIPBE-SSPLM-N31-R10-A"), dict(base, id=2, name="MIPBE-SSPLM-N31-R10-B")]
+    res = plan(devs, racks)
+    assert res["report"] == []
+    faces = sorted(a["to"][2] for a in res["actions"])
+    assert faces == ["front", "rear"]
+    again = [dict(d, rack_id=1, position=10, face=a["to"][2]) for d, a in zip(devs, res["actions"])]
+    assert plan(again, racks)["actions"] == []
+
+
+def test_two_normal_devices_in_one_u_still_conflict():
+    from netbox_autorack import plan
+    racks = [{"id": 1, "name": "N31", "site_id": 1, "tenant_id": None, "u_height": 48}]
+    base = {"site_id": 1, "tenant_id": None, "rack_id": None, "position": None, "face": None,
+            "online": True, "height": 1, "full_depth": False}
+    devs = [dict(base, id=1, name="MIPBE-SSPLM-N31-R10-A"), dict(base, id=2, name="MIPBE-SSPLM-N31-R10-B")]
+    assert plan(devs, racks)["report"]

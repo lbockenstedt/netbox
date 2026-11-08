@@ -45,6 +45,16 @@ def parse_rack_name(name: str) -> Optional[Dict[str, Any]]:
             "device": m.group("device")}
 
 
+_HALF_WIDTH_RE = re.compile(r"half[- ]?width|\b9004\b", re.I)
+
+
+def is_half_width(model: Any, comments: Any = "") -> bool:
+    """A chassis that shares a U with a second one (e.g. Aruba CX 9004): the
+    device type is marked '[half-width]' in its comments (the LLM spec writes
+    it) or is a known half-width model."""
+    return bool(_HALF_WIDTH_RE.search(f"{model or ''} {comments or ''}"))
+
+
 def _cells(rack_id, pos, face, height, full_depth) -> List[Tuple[Any, int, str]]:
     faces = ("front", "rear") if full_depth else (face,)
     return [(rack_id, u, f) for u in range(int(pos), int(pos) + max(int(height), 1)) for f in faces]
@@ -155,7 +165,8 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
         if state.get(did):
             return state[did] == "ok"
         w = want[did]
-        if cur[did] == w:
+        half = bool(d.get("half_width"))
+        if cur[did] == w or (half and cur[did] and w and cur[did][:2] == w[:2]):
             state[did] = "ok"
             return True
         if depth > max_depth or did in stack:
@@ -164,6 +175,17 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
         stack = stack | {did}
         h_ = d.get("height") or 1
         fd = d.get("full_depth", True)
+        if half:
+            # Two half-width chassis share a U; NetBox can only hold that as one
+            # per face, so the second takes the other face of the same U.
+            fd = False
+            other = "rear" if w[2] == "front" else "front"
+            mine = [occ.get(c) for c in _cells(*w, h_, False)]
+            holder = next((by_id[x] for x in mine if x is not None and x != did), None)
+            if holder is not None and holder.get("half_width"):
+                alt = [occ.get(c) for c in _cells(w[0], w[1], other, h_, False)]
+                if all(x is None or x == did for x in alt):
+                    w = (w[0], w[1], other)
         for _ in range(max_depth + 1):
             holders = []
             for c in _cells(*w, h_, fd):
@@ -254,6 +276,7 @@ class AutoRackMixin:
             dt = types.get((r.get("device_type") or {}).get("id"), {})
             nm = str(r.get("name") or "")
             up = online.get(nm.lower().split(".", 1)[0])
+            half = is_half_width(dt.get("model"), dt.get("comments"))
             devices.append({
                 "id": r["id"], "name": nm,
                 "tenant": (r.get("tenant") or {}).get("slug") or "",
@@ -263,8 +286,11 @@ class AutoRackMixin:
                 "position": r.get("position"), "face": _val(r.get("face")) or None,
                 "online": up if up is not None else _val(r.get("status")) in ONLINE_STATUSES,
                 "height": int(float(dt.get("u_height") or 0)),
-                "full_depth": bool(dt.get("is_full_depth", True))})
+                "full_depth": False if half else bool(dt.get("is_full_depth", True)),
+                "half_width": half, "type_id": dt.get("id"),
+                "type_full": bool(dt.get("is_full_depth", True))})
         result = plan(devices, racks)
+        dev_by_id = {d["id"]: d for d in devices}
         rack_site = {r["id"]: r["site_id"] for r in racks}
         counts = {"placed": 0, "moved": 0, "unracked": 0}
         failed = []
@@ -280,6 +306,15 @@ class AutoRackMixin:
                     obj.face = None
                 else:
                     rack_id, pos, face = a["to"]
+                    dv = dev_by_id.get(a["id"]) or {}
+                    if dv.get("half_width") and dv.get("type_full") and dv.get("type_id"):
+                        # NetBox only lets two chassis share a U when neither is full depth.
+                        dtobj = self.nb.dcim.device_types.get(dv["type_id"])
+                        dtobj.is_full_depth = False
+                        dtobj.save()
+                        for x in devices:
+                            if x.get("type_id") == dv["type_id"]:
+                                x["type_full"] = False
                     obj.site = rack_site[rack_id]
                     obj.rack = rack_id
                     obj.position = pos
