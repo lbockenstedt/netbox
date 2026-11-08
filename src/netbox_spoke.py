@@ -1076,7 +1076,10 @@ class NetboxSpoke(BaseSpoke):
             if data.get("report"):
                 last = getattr(self.engine, "_autorack_last", None)
                 if last is None:
-                    last = await self._run_sync(self.engine.autorack_sweep, dry_run=True)
+                    # Nothing yet: answer at once and build the first report in the background.
+                    asyncio.ensure_future(self._run_sync(self.engine.autorack_sweep, dry_run=True))
+                    return {"status": "SUCCESS", "pending": True, "ts": None,
+                            "conflicts": [], "cannot": []}
                 return dict(last)
             return await self._run_sync(
                 self.engine.autorack_sweep,
