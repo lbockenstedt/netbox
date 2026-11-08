@@ -16,6 +16,7 @@ real conflict. Chains are capped so swaps and cycles are reported, not looped.
 
 import logging
 import re
+import time as _time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("netbox.autorack")
@@ -255,6 +256,7 @@ class AutoRackMixin:
             up = online.get(nm.lower().split(".", 1)[0])
             devices.append({
                 "id": r["id"], "name": nm,
+                "tenant": (r.get("tenant") or {}).get("slug") or "",
                 "site_id": (r.get("site") or {}).get("id"),
                 "tenant_id": (r.get("tenant") or {}).get("id"),
                 "rack_id": (r.get("rack") or {}).get("id"),
@@ -291,7 +293,26 @@ class AutoRackMixin:
                 failed.append({"id": a["id"], "name": a["name"], "kind": "cannot",
                                "reason": f"NetBox refused: {e}"})
         report = result["report"] + failed
-        out = {"status": "SUCCESS", "dry_run": dry_run, **counts,
+        rack_name = {r["id"]: r["name"] for r in racks}
+        by_id = {d["id"]: d for d in devices}
+
+        def label(slot):
+            if not slot:
+                return "unracked"
+            return f"{rack_name.get(slot[0], slot[0])} U{slot[1]} {slot[2]}"
+
+        for x in report:
+            d = by_id.get(x["id"], {})
+            p = parse_rack_name(x["name"])
+            cur = x.get("current")
+            x["tenant"] = d.get("tenant", "")
+            x["wanted"] = (f"{p['rack']} U{p['ru']} {p['face']}" if p else "")
+            x["current"] = label(cur)
+            x["mismatch"] = bool(cur and p and x["current"] != x["wanted"])
+        out = {"status": "SUCCESS", "dry_run": dry_run, "ts": int(_time.time()),
+               "racked": sum(1 for d in devices if d["rack_id"]),
+               "named": sum(1 for d in devices if parse_rack_name(d["name"])),
+               **counts,
                "noop": result["settled"] - counts["placed"] - counts["moved"],
                "conflicts": [x for x in report if x["kind"] == "conflict"],
                "cannot": [x for x in report if x["kind"] != "conflict"],
