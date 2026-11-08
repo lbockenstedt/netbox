@@ -106,3 +106,17 @@ def test_sweep_applies_placement_and_reports_dry_run():
     assert res["placed"] == 1 and res["cannot"] == []
     assert (obj.site, obj.rack, obj.position, obj.face) == (10, 1, 45, "rear")
     obj.save.assert_called_once()
+
+
+def test_report_entries_carry_tenant_and_slots():
+    rows = [{"id": 1, "name": "MIPBE-SSPLM-N31-R20-A", "site": {"id": 10}, "tenant": {"id": 4, "slug": "ssplm"},
+             "device_type": {"id": 5}, "status": {"value": "active"}},
+            {"id": 2, "name": "MIPBE-SSPLM-N31-R20-B", "site": {"id": 10}, "tenant": {"id": 4, "slug": "ssplm"},
+             "device_type": {"id": 5}, "status": {"value": "active"}, "rack": {"id": 1}, "position": 20,
+             "face": {"value": "front"}}]
+    eng = _engine(rows, [{"id": 5, "u_height": 1}], [{"id": 1, "name": "N31", "u_height": 48, "site": {"id": 10}}])
+    res = eng.autorack_sweep(dry_run=True)
+    c = {x["id"]: x for x in res["conflicts"]}
+    assert c[1]["tenant"] == "ssplm" and c[1]["wanted"] == "N31 U20 front" and c[1]["current"] == "unracked"
+    assert c[2]["current"] == "N31 U20 front" and not c[2]["mismatch"]
+    assert res["named"] == 2 and res["racked"] == 1
