@@ -806,6 +806,8 @@ class DcimMixin:
             "primary_ip": primary_ip.get("address") if isinstance(primary_ip, dict) else "",
             "tenant": tenant.get("name") if isinstance(tenant, dict) else "",
             "face": d.get("face"),
+            "half_width": (dt.get("id") in getattr(self, "_half_type_ids", ())
+                           or bool(re.search(r"half[- ]?width|\b9004\b", dt.get("model") or "", re.I))),
         }
 
     def get_rack_elevation(self, rack_id: int) -> Dict[str, Any]:
@@ -900,6 +902,13 @@ class DcimMixin:
                 # Sorted units.
                 return out
 
+            # Device types marked half-width (two chassis share a U).
+            try:
+                self._half_type_ids = {
+                    t["id"] for t in self._api_get_all("/api/dcim/device-types/")
+                    if re.search(r"half[- ]?width", t.get("comments") or "", re.I)}
+            except Exception:  # noqa: BLE001 - marker lookup is best-effort
+                self._half_type_ids = set()
             # Both faces.
             front = _units("front")
             rear = _units("rear")
