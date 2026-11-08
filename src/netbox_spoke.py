@@ -1074,8 +1074,10 @@ class NetboxSpoke(BaseSpoke):
         # returns the last sweep's conflicts / cannot-auto-rack list.
         if normalized == "NETBOX_AUTORACK_SWEEP":
             if data.get("report"):
-                return dict(getattr(self.engine, "_autorack_last", None)
-                            or {"status": "SUCCESS", "conflicts": [], "cannot": []})
+                last = getattr(self.engine, "_autorack_last", None)
+                if last is None:
+                    last = await self._run_sync(self.engine.autorack_sweep, dry_run=True)
+                return dict(last)
             return await self._run_sync(
                 self.engine.autorack_sweep,
                 tenant_slug=data.get("tenant", ""),
