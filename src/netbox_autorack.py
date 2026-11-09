@@ -6,6 +6,8 @@ Name grammar (domain suffix ignored)::
     MIPBE-SSPLM-N31-R45-VPNC1   -> rack N31, RU 45, front
     MIPBE-SSPLM-N31-R45R-VPNC1  -> rack N31, RU 45, rear
     MIPBE-SSPLM-PXMX01-N31-R18-ILO -> rack N31, RU 18 (device before the rack)
+    MIPBE-SSPLM-N31-R43H-GW01   -> half width: GW01 and GW02 of N31-R43H share
+                                   one U, the lower-numbered name on the left
 
 A server whose name has no rack takes it from its management controller's name
 (iLO/iDRAC/BMC, recorded on the server as ``linked_device`` once the two are
@@ -29,12 +31,12 @@ logger = logging.getLogger("netbox.autorack")
 
 _NAME_RE = re.compile(
     r"^(?P<site>[A-Za-z0-9]{3})(?P<net>[A-Za-z]{0,3})-(?P<tenant>[A-Za-z0-9]+)-"
-    r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)-(?P<device>.+)$",
+    r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)(?P<half>H?)-(?P<device>.+)$",
     re.IGNORECASE)
 # Device first, rack after: MIPBE-SSPLM-PXMX01-N31-R18-ILO.
 _NAME_RE_DEVICE_FIRST = re.compile(
     r"^(?P<site>[A-Za-z0-9]{3})(?P<net>[A-Za-z]{0,3})-(?P<tenant>[A-Za-z0-9]+)-(?P<pre>.+?)-"
-    r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)(?:-(?P<post>.+))?$",
+    r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)(?P<half>H?)(?:-(?P<post>.+))?$",
     re.IGNORECASE)
 
 ONLINE_STATUSES = {"active", "staged"}
@@ -58,7 +60,11 @@ def parse_rack_name(name: str) -> Optional[Dict[str, Any]]:
     return {"site": m.group("site").upper(), "net": m.group("net").upper(),
             "tenant": m.group("tenant").upper(), "rack": m.group("rack").upper(),
             "ru": ru, "face": "rear" if m.group("rear") else "front",
-            "device": device}
+            "half": bool(m.group("half")), "device": device}
+
+
+def _natural_key(name: Any) -> List[Any]:
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(name or ""))]
 
 
 _HALF_WIDTH_RE = re.compile(r"half[- ]?width|\b9004\b", re.I)
@@ -131,6 +137,7 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
 
     want: Dict[Any, Optional[Tuple[Any, int, str]]] = {}
     refused: Dict[Any, str] = {}
+    halves: Dict[Tuple[Any, int], List[Dict[str, Any]]] = {}
     for d in devices:
         parsed, clash = rack_request(d)
         want[d["id"]] = None
@@ -150,6 +157,17 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
                                 f"{rack['name']} ({rack.get('u_height')}U)")
         else:
             want[d["id"]] = (rack["id"], parsed["ru"], parsed["face"])
+            if parsed.get("half"):
+                halves.setdefault((rack["id"], parsed["ru"]), []).append(d)
+
+    # Name-declared half width (R43H): the lower-numbered device takes the left
+    # lane (front face), the next the right (rear face) — NetBox holds two
+    # non-full-depth chassis in one U only as one per face.
+    for (rid, ru), grp in halves.items():
+        grp.sort(key=lambda x: _natural_key(x["name"]))
+        for i, d in enumerate(grp):
+            d["half_width"], d["full_depth"], d["half_named"] = True, False, True
+            want[d["id"]] = (rid, ru, "front" if i == 0 else "rear")
 
     actions: List[Dict[str, Any]] = []
     report: List[Dict[str, Any]] = []
@@ -199,7 +217,8 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
             return state[did] == "ok"
         w = want[did]
         half = bool(d.get("half_width"))
-        if cur[did] == w or (half and cur[did] and w and cur[did][:2] == w[:2]):
+        if cur[did] == w or (half and not d.get("half_named")
+                             and cur[did] and w and cur[did][:2] == w[:2]):
             state[did] = "ok"
             return True
         if depth > max_depth or did in stack:
