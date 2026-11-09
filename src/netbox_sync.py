@@ -2806,6 +2806,22 @@ class SyncMixin:
             self._global_devices_cache = None
         return merged
 
+    def _host_row_for(self, linked_host: Any, idx: dict, serial: str = "") -> Optional[dict]:
+        """The host server's NetBox row for a serial-linked controller: the
+        non-controller device with that serial, else that name; None if absent."""
+        if not isinstance(linked_host, dict):
+            return None
+        host_name = str(linked_host.get("name") or "").strip()
+        if not host_name:
+            return None
+        host_serial = str(linked_host.get("serial") or serial or "").strip()
+        row = (idx["by_serial"].get(host_serial.lower()) if host_serial else None) \
+            or (idx["by_name"].get(self._nb_name(host_name.split(".", 1)[0]).lower())
+                or idx["by_name"].get(host_name.lower()))
+        if row is None or _is_mgmt_row(row):
+            return None
+        return row
+
     def _link_host_device(self, devobj: Any, linked_host: Any, idx: dict,
                           serial: str = "") -> None:
         """Link a management controller's NetBox device to its host server's.
@@ -2831,12 +2847,7 @@ class SyncMixin:
         if host_serial and not str(getattr(devobj, "serial", "") or "").strip():
             devobj.serial = host_serial
             changed = True
-        # The host's NetBox record: non-controller device with that serial, else that name.
-        row = (idx["by_serial"].get(host_serial.lower()) if host_serial else None) \
-            or (idx["by_name"].get(self._nb_name(host_name.split(".", 1)[0]).lower())
-                or idx["by_name"].get(host_name.lower()))
-        if row is not None and _is_mgmt_row(row):
-            row = None
+        row = self._host_row_for(linked_host, idx, serial)
         if row is None or row.get("id") == getattr(devobj, "id", None):
             if changed:
                 devobj.save()
