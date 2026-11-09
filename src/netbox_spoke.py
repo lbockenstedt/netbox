@@ -26,6 +26,7 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 # NetBox API engine and the rack-workbook parser.
 from netbox_engine import NetboxEngine
+from netbox_autorack import parse_rack_name
 from netbox_nw_store import NwInventoryStore, device_key, signature
 from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
                          parse_one_rack_sheet, parse_summary_block_by_name)
@@ -222,12 +223,23 @@ class NetboxSpoke(BaseSpoke):
             await asyncio.sleep(interval)
             try:
                 due = self._nw_store.due()
-                for key, payload in due:
+                # Rack-named devices go first and are racked right after, so a
+                # rename is not queued behind the rest of a long fleet flush.
+                named = [(k, p) for k, p in due
+                         if parse_rack_name((p.get("device") or {}).get("name"))]
+                named_keys = {k for k, _ in named}
+                rest = [(k, p) for k, p in due if k not in named_keys]
+                due = named + rest
+                for key, payload in named:
+                    await self._nw_apply(key, payload)
+                if named and os.getenv("LM_NETBOX_AUTORACK", "1") != "0":
+                    await self._run_sync(self.engine.autorack_sweep)
+                for key, payload in rest:
                     await self._nw_apply(key, payload)
                 if due:
                     logger.info("nw flush: applied %d device(s) to NetBox", len(due))
                 # Re-evaluate rack placement after devices changed (names/serials/links).
-                if due and os.getenv("LM_NETBOX_AUTORACK", "1") != "0":
+                if rest and os.getenv("LM_NETBOX_AUTORACK", "1") != "0":
                     await self._run_sync(self.engine.autorack_sweep)
             except Exception as e:
                 logger.error(f"NW flush error: {e}", exc_info=True)
