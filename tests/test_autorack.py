@@ -186,3 +186,16 @@ def test_sweep_server_racks_from_ilo_and_ilo_gives_up_the_u():
     assert res["cannot"] == [] and res["conflicts"] == [] and res["named"] == 1
     assert (objs[1].rack, objs[1].position) == (1, 44)
     assert objs[2].position is None and objs[2].rack is not None  # stays in the rack
+
+
+def test_half_name_flag_puts_lower_numbered_device_left_front_and_next_right_rear():
+    from netbox_autorack import plan, parse_rack_name
+    assert parse_rack_name("MIPBE-SSPLM-N31-R43H-GW01")["half"] is True
+    assert parse_rack_name("MIPBE-SSPLM-N31-R43-GW01")["half"] is False
+    racks = [{"id": 1, "name": "N31", "site_id": 1, "tenant_id": None, "u_height": 48}]
+    base = {"site_id": 1, "tenant_id": None, "rack_id": None, "position": None, "face": None,
+            "online": True, "height": 1, "full_depth": True, "half_width": False}
+    devs = [dict(base, id=2, name="MIPBE-SSPLM-N31-R43H-GW02"),
+            dict(base, id=1, name="MIPBE-SSPLM-N31-R43H-GW01")]
+    to = {a["id"]: a["to"] for a in plan(devs, racks)["actions"]}
+    assert to == {1: (1, 43, "front"), 2: (1, 43, "rear")}

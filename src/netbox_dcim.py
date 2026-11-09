@@ -808,7 +808,8 @@ class DcimMixin:
             "tenant": tenant.get("name") if isinstance(tenant, dict) else "",
             "face": d.get("face"),
             "half_width": (dt.get("id") in getattr(self, "_half_type_ids", ())
-                           or bool(re.search(r"half[- ]?width|\b9004\b", dt.get("model") or "", re.I))),
+                           or bool(re.search(r"half[- ]?width|\b9004\b", dt.get("model") or "", re.I))
+                           or bool(re.search(r"-R\d{1,3}R?H(-|$)", d.get("name") or "", re.I))),
         }
 
     def get_rack_elevation(self, rack_id: int) -> Dict[str, Any]:
