@@ -575,6 +575,38 @@ def test_ipmi_link_finds_a_host_outside_the_controller_tenant():
     assert host.custom_fields["linked_device"] == ilo.name
 
 
+def _linked_host_case(host_type_slug):
+    ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-PX1", "role": {"slug": "bmc"},
+               "custom_fields": {"nw_device_id": "nw-ilo"}}
+    host_row = {"id": 60, "name": "MIPBE-SSPLM-PXMX01", "serial": "",
+                "role": {"slug": "hypervisor"}, "custom_fields": {}}
+    eng = _engine(existing_devices=[ilo_row, host_row])
+    ilo = _Obj(id=61, name="MIPBE-N31-ILO-PX1")
+    ilo.rack = None
+    ilo.role = MagicMock(slug="bmc")
+    host = _Obj(id=60, name="MIPBE-SSPLM-PXMX01")
+    host.rack = None
+    host.serial = ""
+    host.oob_ip = None
+    host.device_type = MagicMock(slug=host_type_slug)
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda i: {61: ilo, 60: host}[i])
+    eng._identified_device_type = MagicMock(
+        return_value=(MagicMock(id=77, slug="hpe-proliant-dl380-gen10"), {"discovered"}))
+    dev = dict(_ILO, host_model="ProLiant DL380 Gen10",
+               linked_host={"kind": "agent", "name": "mipbe-ssplm-pxmx01", "serial": "2M284302GR"})
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    return host
+
+
+def test_ipmi_link_gives_a_generic_host_the_server_model_type():
+    assert _linked_host_case("discovered").device_type == 77
+
+
+def test_ipmi_link_keeps_a_host_type_someone_set():
+    assert _linked_host_case("dell-r740").device_type.slug == "dell-r740"
+
+
 def test_ipmi_link_without_host_device_only_marks_the_controller():
     ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "role": {"slug": "bmc"},
                "custom_fields": {"nw_device_id": "nw-ilo"}}
