@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from pathlib import Path
 # Type hints.
@@ -847,7 +848,7 @@ class DcimMixin:
                 "tenant": self._name_of(getattr(rack, "tenant", None)),
             }
 
-            def _units(face: str) -> List[Dict[str, Any]]:
+            def _units(face: str, data: Any) -> List[Dict[str, Any]]:
                 # Follow NetBox's pagination ``next`` links so we get EVERY rack
                 # unit. The elevation endpoint is paginated and honours the
                 # deployment's page-size cap (MAX_PAGE_SIZE) — with a small cap
@@ -855,8 +856,6 @@ class DcimMixin:
                 # 42U rack would silently stop at unit 18. ``_api_get_all`` walks
                 # every page, guaranteeing the full elevation regardless of cap.
                 """Every unit on one face, top to bottom, with its device summary."""
-                data = self._api_get_all(
-                    f"/api/dcim/racks/{rack_id}/elevation/", {"face": face})
                 # ``_api_get_all`` already returns a flat list; defensively accept
                 # a paginated {results: [...]} shape too.
                 if isinstance(data, dict):
@@ -902,21 +901,35 @@ class DcimMixin:
                 # Sorted units.
                 return out
 
-            # Device types marked half-width (two chassis share a U).
-            try:
-                self._half_type_ids = {
-                    t["id"] for t in self._api_get_all("/api/dcim/device-types/")
-                    if re.search(r"half[- ]?width", t.get("comments") or "", re.I)}
-            except Exception:  # noqa: BLE001 - marker lookup is best-effort
-                self._half_type_ids = set()
-            # Both faces.
-            front = _units("front")
-            rear = _units("rear")
+            # The five NetBox reads are independent and each is slow (the
+            # elevation endpoint renders every unit), so run them concurrently.
+            def _half_types() -> set:
+                cached = getattr(self, "_half_types_cache", None)
+                if cached and time.time() - cached[0] < 300:
+                    return cached[1]
+                try:
+                    ids = {t["id"] for t in self._api_get_all("/api/dcim/device-types/")
+                           if re.search(r"half[- ]?width", t.get("comments") or "", re.I)}
+                except Exception:  # noqa: BLE001 - marker lookup is best-effort
+                    return getattr(self, "_half_type_ids", set())
+                self._half_types_cache = (time.time(), ids)
+                return ids
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                f_front = pool.submit(self._api_get_all,
+                                      f"/api/dcim/racks/{rack_id}/elevation/", {"face": "front"})
+                f_rear = pool.submit(self._api_get_all,
+                                     f"/api/dcim/racks/{rack_id}/elevation/", {"face": "rear"})
+                f_devs = pool.submit(self._api_get_all, "/api/dcim/devices/", {"rack_id": rack_id})
+                f_types = pool.submit(_half_types)
+                self._half_type_ids = f_types.result()
+                front = _units("front", f_front.result())
+                rear = _units("rear", f_rear.result())
+                all_devs = f_devs.result()
             # Devices already placed in a unit.
             positioned_ids = {u["device"]["id"] for u in (front + rear)
                               if u.get("device")}
             # 0U / side devices: position null or 0, not in the elevation units.
-            all_devs = self._api_get_all("/api/dcim/devices/", {"rack_id": rack_id})
             zero_u = []
             # Collect devices with no rack position that were not placed above.
             for d in all_devs:
