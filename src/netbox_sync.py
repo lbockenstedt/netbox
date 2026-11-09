@@ -2575,7 +2575,7 @@ class SyncMixin:
                     # Not in NetBox: create it with status, MAC and speed.
                     if match is None:
                         ik: Dict[str, Any] = {"device": dev_id, "name": ifname,
-                                              "type": "other", "status": status}
+                                              "type": "other"}
                         if mac:
                             ik["mac_address"] = mac
                         if speed_kbps > 0:
@@ -2595,10 +2595,10 @@ class SyncMixin:
                     else:
                         iface_obj = match
                         changed = False
-                        if getattr(iface_obj, "status", None) != status:
-                            iface_obj.status = status
-                            changed = True
-                        if mac and str(getattr(iface_obj, "mac_address", "") or "") != mac:
+                        # NetBox interfaces have no ``status`` field: setting one made every
+                        # interface look changed and PATCHed it on every poll.
+                        # NetBox returns MACs upper-case, so compare normalised.
+                        if mac and self._norm_mac(str(getattr(iface_obj, "mac_address", "") or "")) != mac:
                             iface_obj.mac_address = mac
                             changed = True
                         if speed_kbps > 0 and int(getattr(iface_obj, "speed", 0) or 0) != speed_kbps:
