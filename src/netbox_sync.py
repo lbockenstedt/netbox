@@ -2841,8 +2841,8 @@ class SyncMixin:
         The hub matched the two by hardware serial and sends the host's name.
         Both stay separate records: the controller gets the native serial and a
         ``linked_device`` pointing at the host; when the host already exists in
-        NetBox it gets the reverse pointer and its ``oob_ip`` set to the
-        controller's address, and a racked host's rack (and U position when that
+        NetBox it gets the reverse pointer (not ``oob_ip``: NetBox only accepts
+        an IP on the host's own interfaces), and a racked host's rack (and U position when that
         slot is free) is copied to the controller. A host with no NetBox device
         yet is never invented - only the controller side is recorded."""
         host_name = str((linked_host or {}).get("name") or "").strip() if isinstance(linked_host, dict) else ""
@@ -2894,16 +2894,12 @@ class SyncMixin:
             changed = changed and not saved
         if changed:
             devobj.save()
-        # The host side: reverse pointer and out-of-band IP.
+        # The host side: reverse pointer.
         hcf = dict(host.custom_fields or {})
         hchanged = False
         if hcf.get("linked_device") != devobj.name:
             hcf["linked_device"] = devobj.name
             host.custom_fields = hcf
-            hchanged = True
-        oob = getattr(devobj, "primary_ip4", None)
-        if oob and not getattr(host, "oob_ip", None):
-            host.oob_ip = getattr(oob, "id", oob)
             hchanged = True
         # The chassis serial the host's agent reported (fill-gap only).
         if host_serial and not str(getattr(host, "serial", "") or "").strip():
