@@ -503,7 +503,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_DOC_VM", "NETBOX_SYNC_DHCP", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_ACCESS_TRACKER",
         "NETBOX_STALENESS_SWEEP", "NETBOX_PROVISION_CUSTOM_FIELDS",
-        "NETBOX_DEDUPE_DEVICES", "NETBOX_AUTORACK_SWEEP",
+        "NETBOX_DEDUPE_DEVICES", "NETBOX_AUTORACK_SWEEP", "NETBOX_MERGE_STUB",
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
         "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP", "NETBOX_NORMALIZE_DEVICE_NAMES",
@@ -1084,6 +1084,13 @@ class NetboxSpoke(BaseSpoke):
 
         # Auto-rack: place/re-rack devices from their names. ``report`` only
         # returns the last sweep's conflicts / cannot-auto-rack list.
+        if normalized == "NETBOX_LIST_STUBS":
+            return await self._run_sync(self.engine.list_stub_devices)
+        if normalized == "NETBOX_MERGE_STUB":
+            return await self._run_sync(
+                self.engine.merge_stub_device, data.get("stub_id"),
+                str(data.get("nw_device_id") or ""), str(data.get("serial") or ""))
+
         if normalized == "NETBOX_AUTORACK_SWEEP":
             if data.get("report"):
                 last = getattr(self.engine, "_autorack_last", None)

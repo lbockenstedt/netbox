@@ -567,3 +567,17 @@ def test_sync_nw_device_merges_sibling_mac_stub_into_the_polled_device():
     stub_obj.delete.assert_called_once()
     assert stub_ip.assigned_object_id == 555
     assert stub_obj.primary_ip4 is None
+
+
+def test_merge_stub_device_refuses_stub_with_different_serial():
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[{"id": 7, "custom_fields": {"nw_device_id": "nw-1"}}])
+    stub = _Obj(id=8, name="STUB")
+    stub.serial = "OTHER"
+    eng.nb.dcim.devices.get = MagicMock(return_value=stub)
+    eng._merge_device_into = MagicMock()
+    assert eng.merge_stub_device(8, "nw-1", "SN1")["status"] == "ERROR"
+    eng._merge_device_into.assert_not_called()
+    stub.serial = ""
+    eng._merge_device_into.return_value = True
+    assert eng.merge_stub_device(8, "nw-1", "SN1") == {"status": "SUCCESS", "merged": True}
