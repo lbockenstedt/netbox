@@ -5,6 +5,7 @@ Name grammar (domain suffix ignored)::
     <SITE3><NET>-<TENANTGROUP>-<RACK>-R<RU>[R]-<DEVICE>
     MIPBE-SSPLM-N31-R45-VPNC1   -> rack N31, RU 45, front
     MIPBE-SSPLM-N31-R45R-VPNC1  -> rack N31, RU 45, rear
+    MIPBE-SSPLM-PXMX01-N31-R18-ILO -> rack N31, RU 18 (device before the rack)
 
 A server whose name has no rack takes it from its management controller's name
 (iLO/iDRAC/BMC, recorded on the server as ``linked_device`` once the two are
@@ -30,6 +31,11 @@ _NAME_RE = re.compile(
     r"^(?P<site>[A-Za-z0-9]{3})(?P<net>[A-Za-z]{0,3})-(?P<tenant>[A-Za-z0-9]+)-"
     r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)-(?P<device>.+)$",
     re.IGNORECASE)
+# Device first, rack after: MIPBE-SSPLM-PXMX01-N31-R18-ILO.
+_NAME_RE_DEVICE_FIRST = re.compile(
+    r"^(?P<site>[A-Za-z0-9]{3})(?P<net>[A-Za-z]{0,3})-(?P<tenant>[A-Za-z0-9]+)-(?P<pre>.+?)-"
+    r"(?P<rack>[A-Za-z]{1,3}\d{1,3})-R(?P<ru>\d{1,3})(?P<rear>R?)(?:-(?P<post>.+))?$",
+    re.IGNORECASE)
 
 ONLINE_STATUSES = {"active", "staged"}
 MAX_DEPTH = 6
@@ -39,15 +45,20 @@ def parse_rack_name(name: str) -> Optional[Dict[str, Any]]:
     """Rack, RU and face a device name asks for; None when it carries none."""
     short = str(name or "").strip().split(".", 1)[0]
     m = _NAME_RE.match(short)
-    if not m:
-        return None
+    if m:
+        device = m.group("device")
+    else:
+        m = _NAME_RE_DEVICE_FIRST.match(short)
+        if not m:
+            return None
+        device = "-".join(x for x in (m.group("pre"), m.group("post")) if x)
     ru = int(m.group("ru"))
     if ru < 1:
         return None
     return {"site": m.group("site").upper(), "net": m.group("net").upper(),
             "tenant": m.group("tenant").upper(), "rack": m.group("rack").upper(),
             "ru": ru, "face": "rear" if m.group("rear") else "front",
-            "device": m.group("device")}
+            "device": device}
 
 
 _HALF_WIDTH_RE = re.compile(r"half[- ]?width|\b9004\b", re.I)

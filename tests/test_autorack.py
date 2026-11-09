@@ -24,6 +24,10 @@ def test_parse_name():
     assert parse_rack_name("mipbe-ssplm-n31-r45r-vpnc1")["face"] == "rear"
     assert parse_rack_name("MIPBE-SSPLM-N31-VPNC1") is None
     assert parse_rack_name("MIPBE-SSPLM-N31-R0-VPNC1") is None
+    p = parse_rack_name("mipbe-ssplm-pxmx01-n31-r18-ilo.mip.example.com")
+    assert (p["rack"], p["ru"], p["face"], p["device"]) == ("N31", 18, "front", "pxmx01-ilo")
+    assert parse_rack_name("MIPBE-SSPLM-PXMX01-N31-R18R")["face"] == "rear"
+    assert parse_rack_name("mipbe-ssplm-pxmx01-ilo") is None
 
 
 def test_places_free_slot_and_noop_when_in_place():
