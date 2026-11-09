@@ -19,6 +19,7 @@ import tempfile
 import time
 # Type hints.
 from typing import Dict, Any
+from concurrent.futures import ThreadPoolExecutor
 # BaseSpoke lives at the top level when deployed, under core.src in the repo.
 try:
     from base_spoke import BaseSpoke
@@ -33,6 +34,9 @@ from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
 
 # Logger for this spoke.
 logger = logging.getLogger("NetboxSpoke")
+
+# Threads for blocking NetBox calls (see NetboxSpoke._run_sync).
+_NETBOX_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="netbox")
 
 # Hub-level system commands handled by BaseControlPlane.handle_system_command
 # (shared /opt/lm/core). A spoke running a STALE core (older than the build that
@@ -444,9 +448,10 @@ class NetboxSpoke(BaseSpoke):
 
     async def _run_sync(self, fn, *args, **kwargs):
         """Run a synchronous (blocking) function in a thread pool so the event loop stays free."""
-        # Run the function in the default thread pool.
+        # Own pool: NetBox calls queue on one HTTP slot, and must not take every
+        # default-pool thread from the base spoke (exec, health, hub replies).
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+        return await loop.run_in_executor(_NETBOX_POOL, functools.partial(fn, *args, **kwargs))
 
     def _fetch_upload_bytes(self, download_url: str, token: str) -> bytes:
         """HTTP-GET a hub-relayed upload file (token-gated GET endpoint) and
@@ -675,36 +680,51 @@ class NetboxSpoke(BaseSpoke):
         return {"status": "ERROR",
                 "message": (results[0].get("message") if results else "deploy failed")}
 
-    # Bulk reads the hub repeats (per tenant, per page, again after a timeout).
-    # NetBox serves one paged read at a time, so duplicates queue behind each
-    # other and fill the command queue: identical requests share one fetch.
-    _COALESCED_READS = frozenset({"NETBOX_GET_PREFIXES", "NETBOX_GET_IPS"})
-    _COALESCE_TTL_S = 10.0
+    # The hub re-sends commands after a timeout, so identical copies stack up
+    # behind NetBox's one-request-at-a-time limit and fill the command queue.
+    # An identical command already running is joined instead of run again.
+    # Reads are also reused for a few seconds; syncs/sweeps only while running.
+    _SHARED_READS = frozenset({
+        "NETBOX_GET_PREFIXES", "NETBOX_GET_IPS", "NETBOX_GET_DEVICES",
+        "NETBOX_GET_RACKS", "NETBOX_GET_TENANTS", "NETBOX_GET_TENANT_GROUPS",
+        "NETBOX_LIST_STUBS"})
+    _SHARED_RUNS = frozenset({
+        "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_AUTORACK_SWEEP",
+        "NETBOX_STALENESS_SWEEP"})
+    _READ_REUSE_S = 10.0
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a command; identical concurrent bulk reads share one NetBox fetch
-        and its result for a few seconds. Any write clears those results."""
+        """Run a command, joining an identical one already running (see above)."""
         normalized = str(command_type or "").upper()
-        if normalized not in self._COALESCED_READS:
-            if not normalized.startswith(("NETBOX_GET_", "NETBOX_LIST_", "GET_", "SPOKE_GET_")):
-                self.__dict__.setdefault("_read_cache", {}).clear()
-            return await self._handle_command(command_type, data)
+        cache = self.__dict__.setdefault("_shared", {})
+
+        def forget_finished():
+            for k in [k for k, (f, _) in cache.items() if f.done()]:
+                cache.pop(k, None)
+        writes = normalized not in self._SHARED_READS and not normalized.startswith(
+            ("NETBOX_GET_", "NETBOX_LIST_", "GET_", "SPOKE_GET_"))
+        if writes:
+            # NetBox may change: drop reads that finished before or during it.
+            forget_finished()
+        if normalized not in self._SHARED_READS and normalized not in self._SHARED_RUNS:
+            try:
+                return await self._handle_command(command_type, data)
+            finally:
+                if writes:
+                    forget_finished()
         key = (normalized, json.dumps(data or {}, sort_keys=True, default=str))
-        cache = self.__dict__.setdefault("_read_cache", {})
         hit = cache.get(key)
-        now = time.monotonic()
         if hit is not None:
             fut, at = hit
-            if not fut.done() or (now - at < self._COALESCE_TTL_S):
-                logger.debug("NetBox command: %s shared with an identical request", normalized)
+            if not fut.done() or time.monotonic() - at < self._READ_REUSE_S:
+                logger.info("NetBox command: %s joined an identical request", normalized)
                 return await asyncio.shield(fut)
         fut = asyncio.get_running_loop().create_future()
-        cache[key] = (fut, now)
-        mine = lambda: (cache.get(key) or (None,))[0] is fut  # noqa: E731 - not cleared by a write
+        cache[key] = (fut, time.monotonic())
         try:
             res = await self._handle_command(command_type, data)
         except BaseException as e:
-            if mine():
+            if (cache.get(key) or (None,))[0] is fut:
                 cache.pop(key, None)
             if isinstance(e, asyncio.CancelledError):
                 fut.cancel()
@@ -713,8 +733,11 @@ class NetboxSpoke(BaseSpoke):
                 fut.exception()  # mark retrieved
             raise
         fut.set_result(res)
-        if mine():
-            if isinstance(res, dict) and str(res.get("status", "")).upper() == "SUCCESS":
+        if writes:
+            forget_finished()
+        if (cache.get(key) or (None,))[0] is fut:
+            ok = isinstance(res, dict) and str(res.get("status", "")).upper() == "SUCCESS"
+            if ok and normalized in self._SHARED_READS:
                 cache[key] = (fut, time.monotonic())
             else:
                 cache.pop(key, None)
