@@ -109,17 +109,21 @@ def test_sync_nw_device_adopts_interface_the_listing_missed():
                     "custom_fields": {"nw_device_id": "nw-1"}}
     eng = _engine(existing_devices=[existing_row])
     eng.nb.dcim.devices.get = MagicMock(return_value=_Obj(id=7, name="sw1"))
-    vlan1 = _Obj(name="vlan1", status="planned")
+    vlan1 = _Obj(name="vlan1", mac_address="AA:BB:CC:DD:EE:01")
     eng.nb.dcim.interfaces.get = MagicMock(return_value=vlan1)
 
     res = eng.sync_nw_device(device=_DEV,
-                             interfaces=[{"name": "vlan1", "status": "up"}],
+                             interfaces=[{"name": "vlan1", "status": "up",
+                                          "mac": "aa-bb-cc-dd-ee-01"}],
                              tenant_slug="", defaults=_DEFAULTS)
 
     assert res["errors"] == 0, res
     eng.nb.dcim.interfaces.create.assert_not_called()
     eng.nb.dcim.interfaces.get.assert_called_with(device_id=7, name="vlan1")
-    assert vlan1.status == "active"
+    # The MAC matches case-insensitively and interfaces have no status field,
+    # so nothing but the one-time nw_managed marker is written.
+    assert vlan1.status != "active"
+    assert vlan1.mac_address == "AA:BB:CC:DD:EE:01"
 
 
 def test_sync_nw_device_missing_defaults_errors_named():
@@ -164,8 +168,8 @@ def test_sync_nw_device_updates_existing_in_place_no_recreate():
     # Index by device *id* — NetBox's `device` filter matches the name, so
     # filter(device=<id>) returns nothing and every iface re-creates (400).
     eng.nb.dcim.interfaces.filter.assert_called_with(device_id=7)
-    # vlan1 was updated (status → active, mac stamped) + saved.
-    assert vlan1.status == "active"
+    # vlan1 was updated (mac stamped) + saved; status is never written (not an interface field).
+    assert vlan1.status == "planned"
     assert vlan1.mac_address == "aa:bb:cc:dd:ee:01"
     vlan1.save.assert_called()
     # oldport (nw-managed, stale) deleted; manual (not nw-managed) left alone.
