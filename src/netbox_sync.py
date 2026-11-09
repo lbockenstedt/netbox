@@ -2680,7 +2680,9 @@ class SyncMixin:
             # Stitch this controller to its server's record (hardware-serial match).
             if is_mgmt:
                 try:
-                    self._link_host_device(devobj, dev.get("linked_host"), idx, serial)
+                    self._link_host_device(devobj, dev.get("linked_host"), idx, serial,
+                                           host_model=str(dev.get("host_model") or "").strip(),
+                                           spec=spec)
                 except Exception as e:
                     logger.warning("sync_nw_device: link host for %s skipped: %s", name, e)
 
@@ -2835,7 +2837,7 @@ class SyncMixin:
         return row
 
     def _link_host_device(self, devobj: Any, linked_host: Any, idx: dict,
-                          serial: str = "") -> None:
+                          serial: str = "", host_model: str = "", spec: Any = None) -> None:
         """Link a management controller's NetBox device to its host server's.
 
         The hub matched the two by hardware serial and sends the host's name.
@@ -2909,6 +2911,17 @@ class SyncMixin:
             host.save()
             self._journal("dcim.device", host.id, "nw-poll",
                           note=f"linked to controller {devobj.name} by serial")
+        # The controller reports the server's model: a generic host gets its
+        # real type (and height). Saved alone - a taken U must not undo the link.
+        if host_model:
+            dtype, replaceable = self._identified_device_type(host_model, "", spec)
+            if self._upgrade_generic_identity(host, dtype, None, replaceable):
+                try:
+                    host.save()
+                    self._journal("dcim.device", host.id, "nw-poll",
+                                  note=f"device type {host_model} from controller {devobj.name}")
+                except Exception as e:
+                    logger.info("netbox: type %s for %s refused (%s)", host_model, host.name, e)
 
     def _resolve_tenant_ci(self, slug: str) -> Any:
         """Case-insensitive tenant resolve: lower(slug) ∪ lower(name) → tenant
