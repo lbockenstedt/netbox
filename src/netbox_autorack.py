@@ -6,6 +6,11 @@ Name grammar (domain suffix ignored)::
     MIPBE-SSPLM-N31-R45-VPNC1   -> rack N31, RU 45, front
     MIPBE-SSPLM-N31-R45R-VPNC1  -> rack N31, RU 45, rear
 
+A server whose name has no rack takes it from its management controller's name
+(iLO/iDRAC/BMC, recorded on the server as ``linked_device`` once the two are
+matched by serial). When both names carry a slot and they differ, the server
+is reported as unable to rack.
+
 ``plan()`` is pure: it takes normalised device/rack records and returns the
 ordered actions (unrack / place / move) plus the devices that could not be
 placed and why. A slot held by another device is resolved before it is
@@ -55,6 +60,20 @@ def is_half_width(model: Any, comments: Any = "") -> bool:
     return bool(_HALF_WIDTH_RE.search(f"{model or ''} {comments or ''}"))
 
 
+def rack_request(d: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The slot a device asks for: its own name, else its linked controller's
+    (``controller``). A controller whose server is listed (``host``) asks for
+    nothing; the server holds the slot. Returns (parsed, "") or (None, why) when the two disagree."""
+    if d.get("host"):
+        return None, ""
+    own = parse_rack_name(d.get("name"))
+    ctl = parse_rack_name(d.get("controller")) if d.get("controller") else None
+    if own and ctl and (own["rack"], own["ru"], own["face"]) != (ctl["rack"], ctl["ru"], ctl["face"]):
+        return None, (f"name says {own['rack']} U{own['ru']} {own['face']} but controller "
+                      f"{d['controller']} says {ctl['rack']} U{ctl['ru']} {ctl['face']}")
+    return own or ctl, ""
+
+
 def _cells(rack_id, pos, face, height, full_depth) -> List[Tuple[Any, int, str]]:
     faces = ("front", "rear") if full_depth else (face,)
     return [(rack_id, u, f) for u in range(int(pos), int(pos) + max(int(height), 1)) for f in faces]
@@ -83,7 +102,7 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
     """Actions that bring every named device to its slot.
 
     device: {id, name, site_id, tenant_id, rack_id, position, face, online,
-             height, full_depth}; rack: {id, name, site_id, tenant_id, u_height}.
+             height, full_depth, controller}; rack: {id, name, site_id, tenant_id, u_height}.
     ``probe(device)`` may return a fresher {name, online} for a holder (the
     hub's re-poll); without it NetBox's own record is used.
     """
@@ -102,8 +121,11 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
     want: Dict[Any, Optional[Tuple[Any, int, str]]] = {}
     refused: Dict[Any, str] = {}
     for d in devices:
-        parsed = parse_rack_name(d.get("name"))
+        parsed, clash = rack_request(d)
         want[d["id"]] = None
+        if clash:
+            refused[d["id"]] = clash
+            continue
         if not parsed:
             continue
         rack, why = resolve_rack(parsed, racks, d.get("site_id"), d.get("tenant_id"))
@@ -195,6 +217,11 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
             if not holders:
                 break
             h = holders[0]
+            if h.get("host") and h["host"] == d["name"]:
+                # Inside the server: keep the rack, give up the U.
+                unrack(h, f"management controller of {d['name']}")
+                actions[-1]["keep_rack"] = True
+                continue
             newname = fresh(h).get("name")
             if newname and newname != h.get("name"):
                 h = dict(h, name=newname)
@@ -239,6 +266,20 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
             "settled": sum(1 for v in state.values() if v == "ok")}
 
 
+_MGMT_ROLES = {"bmc", "ipmi", "management-controller"}
+
+
+def _is_mgmt(row: Dict[str, Any]) -> bool:
+    """A management controller row (iLO/iDRAC/BMC role)."""
+    ref = row.get("role") or row.get("device_role") or {}
+    return str(ref.get("slug") if isinstance(ref, dict) else ref or "").lower() in _MGMT_ROLES
+
+
+def _short(name: Any) -> str:
+    """Lower-cased hostname without its domain."""
+    return str(name or "").strip().lower().split(".", 1)[0]
+
+
 def _val(x, key="value"):
     return str(x.get(key) if isinstance(x, dict) else x or "").lower()
 
@@ -272,9 +313,12 @@ class AutoRackMixin:
                   "tenant_id": (r.get("tenant") or {}).get("id")} for r in rack_rows]
         online = {str(k).lower(): bool(v) for k, v in (online or {}).items()}
         devices = []
+        listed = {_short(r.get("name")): str(r.get("name") or "") for r in rows}
         for r in rows:
             dt = types.get((r.get("device_type") or {}).get("id"), {})
             nm = str(r.get("name") or "")
+            link = str((r.get("custom_fields") or {}).get("linked_device") or "")
+            mgmt = _is_mgmt(r)
             up = online.get(nm.lower().split(".", 1)[0])
             half = is_half_width(dt.get("model"), dt.get("comments"))
             devices.append({
@@ -288,6 +332,9 @@ class AutoRackMixin:
                 "height": int(float(dt.get("u_height") or 0)),
                 "full_depth": False if half else bool(dt.get("is_full_depth", True)),
                 "half_width": half, "type_id": dt.get("id"),
+                "controller": "" if mgmt else link,
+                # A controller whose server is in NetBox: the server holds the slot.
+                "host": listed.get(_short(link), "") if mgmt and link else "",
                 "type_full": bool(dt.get("is_full_depth", True))})
         result = plan(devices, racks)
         dev_by_id = {d["id"]: d for d in devices}
@@ -301,7 +348,8 @@ class AutoRackMixin:
             try:
                 obj = self.nb.dcim.devices.get(a["id"])
                 if a["op"] == "unrack":
-                    obj.rack = None
+                    if not a.get("keep_rack"):
+                        obj.rack = None
                     obj.position = None
                     obj.face = None
                 else:
@@ -338,7 +386,7 @@ class AutoRackMixin:
 
         for x in report:
             d = by_id.get(x["id"], {})
-            p = parse_rack_name(x["name"])
+            p, _ = rack_request(d) if d else (parse_rack_name(x["name"]), "")
             cur = x.get("current")
             x["tenant"] = d.get("tenant", "")
             x["wanted"] = (f"{p['rack']} U{p['ru']} {p['face']}" if p else "")
@@ -346,7 +394,7 @@ class AutoRackMixin:
             x["mismatch"] = bool(cur and p and x["current"] != x["wanted"])
         out = {"status": "SUCCESS", "dry_run": dry_run, "ts": int(_time.time()),
                "racked": sum(1 for d in devices if d["rack_id"]),
-               "named": sum(1 for d in devices if parse_rack_name(d["name"])),
+               "named": sum(1 for d in devices if rack_request(d)[0]),
                **counts,
                "noop": result["settled"] - counts["placed"] - counts["moved"],
                "conflicts": [x for x in report if x["kind"] == "conflict"],
