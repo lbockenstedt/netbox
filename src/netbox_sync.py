@@ -2815,9 +2815,21 @@ class SyncMixin:
         if not host_name:
             return None
         host_serial = str(linked_host.get("serial") or serial or "").strip()
+        names = list(dict.fromkeys([self._nb_name(host_name.split(".", 1)[0]), host_name]))
         row = (idx["by_serial"].get(host_serial.lower()) if host_serial else None) \
-            or (idx["by_name"].get(self._nb_name(host_name.split(".", 1)[0]).lower())
-                or idx["by_name"].get(host_name.lower()))
+            or next((idx["by_name"][n.lower()] for n in names if n.lower() in idx["by_name"]), None)
+        if row is None:
+            # The index may hold one tenant only; the host can sit in another.
+            for n in names:
+                try:
+                    hits = self._api_get("/api/dcim/devices/", {"name__ie": n, "limit": 5})
+                except Exception as e:
+                    logger.debug("netbox: host lookup %s failed: %s", n, e)
+                    continue
+                row = next((r for r in (hits or {}).get("results") or []
+                            if not _is_mgmt_row(r)), None)
+                if row:
+                    break
         if row is None or _is_mgmt_row(row):
             return None
         return row

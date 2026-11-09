@@ -1,4 +1,4 @@
-"""Identical concurrent bulk reads share one NetBox fetch; writes clear it."""
+"""Identical concurrent commands share one run; reads are briefly reused; writes clear them."""
 import asyncio
 import os
 import sys
@@ -14,7 +14,7 @@ def _spoke(calls):
     async def inner(cmd, data):
         calls.append(cmd)
         n = len(calls)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05 if "GET" in cmd else 0.01)
         return {"status": "SUCCESS", "n": n}
     sp._handle_command = inner
     return sp
@@ -52,3 +52,33 @@ def test_failed_read_is_not_reused():
         await sp.handle_command("NETBOX_GET_IPS", {})
     asyncio.run(run())
     assert len(calls) == 2
+
+
+def test_identical_syncs_join_while_running_but_never_reuse_a_finished_one():
+    calls = []
+    sp = _spoke(calls)
+    body = {"tenant_slug": "dxp", "devices": [{"ip": "10.0.0.1"}]}
+
+    async def run():
+        a, b = await asyncio.gather(sp.handle_command("NETBOX_SYNC_DEVICES", body),
+                                    sp.handle_command("NETBOX_SYNC_DEVICES", body))
+        assert a is b
+        await sp.handle_command("NETBOX_SYNC_DEVICES", body)
+    asyncio.run(run())
+    assert calls == ["NETBOX_SYNC_DEVICES"] * 2
+
+
+def test_a_write_does_not_split_a_read_already_running_but_clears_it_after():
+    calls = []
+    sp = _spoke(calls)
+
+    async def run():
+        first = asyncio.ensure_future(sp.handle_command("NETBOX_GET_PREFIXES", {}))
+        await asyncio.sleep(0)
+        await sp.handle_command("NETBOX_CREATE_PREFIX", {})
+        second = await sp.handle_command("NETBOX_GET_PREFIXES", {})
+        assert second is await first
+        await sp.handle_command("NETBOX_CREATE_PREFIX", {})
+        await sp.handle_command("NETBOX_GET_PREFIXES", {})
+    asyncio.run(run())
+    assert calls.count("NETBOX_GET_PREFIXES") == 2
