@@ -2893,6 +2893,10 @@ class SyncMixin:
         if oob and not getattr(host, "oob_ip", None):
             host.oob_ip = getattr(oob, "id", oob)
             hchanged = True
+        # The chassis serial the host's agent reported (fill-gap only).
+        if host_serial and not str(getattr(host, "serial", "") or "").strip():
+            host.serial = host_serial
+            hchanged = True
         if hchanged:
             host.save()
             self._journal("dcim.device", host.id, "nw-poll",

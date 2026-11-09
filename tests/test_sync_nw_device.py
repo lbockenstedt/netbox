@@ -530,6 +530,28 @@ def test_ipmi_links_host_racks_it_and_sets_oob_ip():
     assert host.name == "MIPBE-N31-TNAS"
 
 
+def test_ipmi_link_fills_the_host_serial_when_the_host_has_none():
+    ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-PX1", "role": {"slug": "bmc"},
+               "custom_fields": {"nw_device_id": "nw-ilo"}}
+    host_row = {"id": 60, "name": "MIPBE-SSPLM-PXMX01", "serial": "",
+                "role": {"slug": "hypervisor"}, "custom_fields": {}}
+    eng = _engine(existing_devices=[ilo_row, host_row])
+    ilo = _Obj(id=61, name="MIPBE-N31-ILO-PX1")
+    ilo.rack = None
+    ilo.role = MagicMock(slug="bmc")
+    host = _Obj(id=60, name="MIPBE-SSPLM-PXMX01")
+    host.rack = None
+    host.serial = ""
+    host.oob_ip = None
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda i: {61: ilo, 60: host}[i])
+    dev = dict(_ILO, linked_host={"kind": "agent", "name": "mipbe-ssplm-pxmx01",
+                                  "serial": "2M284302GR"})
+    res = eng.sync_nw_device(device=dev, interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert host.serial == "2M284302GR"
+    assert host.custom_fields["linked_device"] == ilo.name
+
+
 def test_ipmi_link_without_host_device_only_marks_the_controller():
     ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "role": {"slug": "bmc"},
                "custom_fields": {"nw_device_id": "nw-ilo"}}
