@@ -2706,6 +2706,69 @@ class SyncMixin:
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "interfaces_total": len(interfaces or []), "device_id": None}
 
+    def _merge_device_into(self, devobj: Any, stub_id: int, stub_name: Any,
+                           why: str) -> bool:
+        """Move the stub's IPs onto ``devobj`` (interface ``lm-merged``), journal
+        the merge, and delete the stub. False when the stub no longer exists."""
+        my_id = getattr(devobj, "id", None)
+        stub = self.nb.dcim.devices.get(stub_id)
+        if stub is None or stub_id == my_id:
+            return False
+        iface = self.nb.dcim.interfaces.get(device_id=my_id, name="lm-merged")
+        ips = list(self.nb.ipam.ip_addresses.filter(device_id=stub_id))
+        if ips and iface is None:
+            iface = self.nb.dcim.interfaces.create(
+                device=my_id, name="lm-merged", type="other", status="active")
+        if getattr(stub, "primary_ip4", None):
+            stub.primary_ip4 = None
+            stub.save()
+        for ipo in ips:
+            ipo.assigned_object_type = "dcim.interface"
+            ipo.assigned_object_id = iface.id
+            ipo.save()
+        self._journal("dcim.device", my_id, "nw-poll",
+                      note=f"merged duplicate device {stub_name} (id {stub_id}, {why}) "
+                           f"into this device; {len(ips)} IP(s) moved")
+        stub.delete()
+        logger.info("netbox: merged duplicate %s (id %s) into %s",
+                    stub_name, stub_id, getattr(devobj, "name", my_id))
+        self._global_devices_cache = None
+        return True
+
+    def list_stub_devices(self) -> Dict[str, Any]:
+        """Devices another feeder made that no poll has identified: no serial, a
+        primary IP, not a polled network device, not a management controller."""
+        rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        out = []
+        for r in rows or []:
+            cf = r.get("custom_fields") or {}
+            pip = r.get("primary_ip4")
+            addr = (pip.get("address") or "").split("/")[0] if isinstance(pip, dict) else ""
+            if (r.get("serial") or cf.get("nw_device_id") or not addr or _is_mgmt_row(r)
+                    or str(cf.get("discovered_from") or "") == "Network Devices"):
+                continue
+            out.append({"id": r.get("id"), "name": r.get("name"), "ip": addr})
+        return {"status": "SUCCESS", "stubs": out}
+
+    def merge_stub_device(self, stub_id: int, nw_device_id: str, serial: str) -> Dict[str, Any]:
+        """Fold stub ``stub_id`` into the polled device carrying ``nw_device_id``
+        (the hub verified by a live poll that the stub's IP answers with that
+        device's serial). Refuses a stub that has since gained a different serial."""
+        rows = self._api_get_all("/api/dcim/devices/", {"limit": 500, "cf_nw_device_id": nw_device_id})
+        target = next((r for r in rows or []
+                       if str((r.get("custom_fields") or {}).get("nw_device_id") or "") == nw_device_id), None)
+        if target is None:
+            return {"status": "ERROR", "message": f"no NetBox device for nw id {nw_device_id}"}
+        stub_row = self.nb.dcim.devices.get(int(stub_id))
+        if stub_row is None:
+            return {"status": "SUCCESS", "merged": False, "message": "stub already gone"}
+        if str(getattr(stub_row, "serial", "") or "").strip() not in ("", serial):
+            return {"status": "ERROR", "message": "stub carries a different serial"}
+        devobj = self.nb.dcim.devices.get(target["id"])
+        ok = self._merge_device_into(devobj, int(stub_id), getattr(stub_row, "name", ""),
+                                     f"live poll serial {serial}")
+        return {"status": "SUCCESS", "merged": ok}
+
     def _merge_sibling_stubs(self, devobj: Any, base_mac: str, serial: str,
                              nw_id: str, idx: dict) -> int:
         """Fold stub devices of the same physical box into ``devobj``.
@@ -2737,28 +2800,8 @@ class SyncMixin:
             if str(cf.get("discovered_from") or "") == "Network Devices" or _is_mgmt_row(row):
                 continue
             seen.add(rid)
-            stub = self.nb.dcim.devices.get(rid)
-            if stub is None:
-                continue
-            iface = self.nb.dcim.interfaces.get(device_id=my_id, name="lm-merged")
-            ips = list(self.nb.ipam.ip_addresses.filter(device_id=rid))
-            if ips and iface is None:
-                iface = self.nb.dcim.interfaces.create(
-                    device=my_id, name="lm-merged", type="other", status="active")
-            if getattr(stub, "primary_ip4", None):
-                stub.primary_ip4 = None
-                stub.save()
-            for ipo in ips:
-                ipo.assigned_object_type = "dcim.interface"
-                ipo.assigned_object_id = iface.id
-                ipo.save()
-            self._journal("dcim.device", my_id, "nw-poll",
-                          note=f"merged duplicate device {row.get('name')} (id {rid}, "
-                               f"MAC {key}) into this device; {len(ips)} IP(s) moved")
-            stub.delete()
-            logger.info("netbox: merged duplicate %s (id %s) into %s",
-                        row.get("name"), rid, getattr(devobj, "name", my_id))
-            merged += 1
+            if self._merge_device_into(devobj, rid, row.get("name"), f"MAC {key}"):
+                merged += 1
         if merged:
             self._global_devices_cache = None
         return merged
