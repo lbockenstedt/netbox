@@ -159,6 +159,34 @@ def test_sync_devices_autocreates_site_when_none_exists():
     assert eng.nb.dcim.devices.create.call_args.kwargs["site"] == 777
 
 
+def test_site_for_ip_ignores_other_tenants_prefixes():
+    # A DXP device must not be placed in a MIP/SLR site just because their
+    # subnet contains the address; an untenanted prefix is still usable.
+    eng = _engine_with(existing_rows=[])
+    site = lambda i, slug: {"id": i, "slug": slug, "name": slug}  # noqa: E731
+    eng._api_get_all = lambda path, params=None: [
+        {"prefix": "10.1.0.0/16", "scope_type": "dcim.site", "scope": site(1, "mip"),
+         "tenant": {"id": 5}},
+        {"prefix": "10.2.0.0/16", "scope_type": "dcim.site", "scope": site(3, "any"),
+         "tenant": None},
+    ]
+    dxp = SimpleNamespace(id=9)
+    assert eng._site_for_ip("10.1.2.3", dxp) is None
+    assert eng._site_for_ip("10.1.2.3", SimpleNamespace(id=5))["slug"] == "mip"
+    assert eng._site_for_ip("10.2.2.3", dxp)["slug"] == "any"
+
+
+def test_resolve_site_never_adopts_an_arbitrary_existing_site():
+    # With no configured site the fallback used to be "the first site NetBox
+    # lists" (another tenant's, e.g. Roseville). It must be the neutral one.
+    eng = _engine_with(existing_rows=[])
+    eng.nb.dcim.sites.filter.return_value = [_Obj(id=1)]
+    eng.nb.dcim.sites.get.return_value = None
+    eng.nb.dcim.sites.create.return_value = _Obj(id=777)
+    assert eng._resolve_site("", SimpleNamespace(id=9, slug="dxp")).id == 777
+    assert eng.nb.dcim.sites.create.call_args.kwargs["slug"] == "discovered"
+
+
 def test_sync_devices_creates_with_per_record_role_and_custom_fields():
     # P5: a feeder (e.g. TrueNAS) attaches a per-record role + custom_fields so
     # the device lands under the right dcim.device_role AND carries its
