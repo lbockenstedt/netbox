@@ -675,7 +675,52 @@ class NetboxSpoke(BaseSpoke):
         return {"status": "ERROR",
                 "message": (results[0].get("message") if results else "deploy failed")}
 
+    # Bulk reads the hub repeats (per tenant, per page, again after a timeout).
+    # NetBox serves one paged read at a time, so duplicates queue behind each
+    # other and fill the command queue: identical requests share one fetch.
+    _COALESCED_READS = frozenset({"NETBOX_GET_PREFIXES", "NETBOX_GET_IPS"})
+    _COALESCE_TTL_S = 10.0
+
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a command; identical concurrent bulk reads share one NetBox fetch
+        and its result for a few seconds. Any write clears those results."""
+        normalized = str(command_type or "").upper()
+        if normalized not in self._COALESCED_READS:
+            if not normalized.startswith(("NETBOX_GET_", "NETBOX_LIST_", "GET_", "SPOKE_GET_")):
+                self.__dict__.setdefault("_read_cache", {}).clear()
+            return await self._handle_command(command_type, data)
+        key = (normalized, json.dumps(data or {}, sort_keys=True, default=str))
+        cache = self.__dict__.setdefault("_read_cache", {})
+        hit = cache.get(key)
+        now = time.monotonic()
+        if hit is not None:
+            fut, at = hit
+            if not fut.done() or (now - at < self._COALESCE_TTL_S):
+                logger.debug("NetBox command: %s shared with an identical request", normalized)
+                return await asyncio.shield(fut)
+        fut = asyncio.get_running_loop().create_future()
+        cache[key] = (fut, now)
+        mine = lambda: (cache.get(key) or (None,))[0] is fut  # noqa: E731 - not cleared by a write
+        try:
+            res = await self._handle_command(command_type, data)
+        except BaseException as e:
+            if mine():
+                cache.pop(key, None)
+            if isinstance(e, asyncio.CancelledError):
+                fut.cancel()
+            else:
+                fut.set_exception(e)
+                fut.exception()  # mark retrieved
+            raise
+        fut.set_result(res)
+        if mine():
+            if isinstance(res, dict) and str(res.get("status", "")).upper() == "SUCCESS":
+                cache[key] = (fut, time.monotonic())
+            else:
+                cache.pop(key, None)
+        return res
+
+    async def _handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch incoming NetBox DCIM/IPAM commands to corresponding engine methods."""
         # Normalise and log the command name.
         normalized = command_type.upper()
