@@ -20,8 +20,14 @@ from typing import Any, Dict, Optional
 import requests
 
 # Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
-# when multiple IPAM queries arrive simultaneously.
+# when multiple IPAM queries arrive simultaneously. Whole-fleet listings get
+# their own slot so a quick read (prefixes, one device) never waits behind a
+# many-page device walk: at most two requests run at once.
 _netbox_http_sem = threading.Semaphore(1)
+_netbox_bulk_sem = threading.Semaphore(1)
+_BULK_PATHS = frozenset({"/api/dcim/devices/", "/api/dcim/interfaces/",
+                         "/api/virtualization/virtual-machines/",
+                         "/api/virtualization/interfaces/", "/api/dcim/cables/"})
 
 # Named logger for all engine messages.
 logger = logging.getLogger("NetboxEngine")
@@ -271,8 +277,9 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         results: list = []
         next_url: Optional[str] = None
         # Fetch at most max_pages pages to avoid an endless loop on a bad "next" link.
+        sem = _netbox_bulk_sem if path in _BULK_PATHS else _netbox_http_sem
         for _ in range(max_pages):
-            with _netbox_http_sem:
+            with sem:
                 # Later pages: follow NetBox's absolute "next" URL (already includes offset).
                 if next_url:
                     resp = self.nb.http_session.get(next_url, timeout=_NETBOX_API_TIMEOUT)
