@@ -2669,6 +2669,14 @@ class SyncMixin:
                         logger.debug("sync_nw_device: delete stale iface %s failed: %s",
                                      ifname_l, e)
 
+            # Another feeder (firewall ARP/DHCP) may hold a stub for this same box
+            # under a sibling MAC (an SVI/VLAN MAC next to the base MAC): fold it in.
+            if base_mac and not is_mgmt:
+                try:
+                    self._merge_sibling_stubs(devobj, base_mac, serial, nw_id, idx)
+                except Exception as e:
+                    logger.warning("sync_nw_device: sibling merge for %s skipped: %s", name, e)
+
             # Stitch this controller to its server's record (hardware-serial match).
             if is_mgmt:
                 try:
@@ -2697,6 +2705,63 @@ class SyncMixin:
             return {"status": "ERROR", "message": str(e), "pushed": pushed,
                     "errors": errors, "skipped": skipped, "deleted": deleted,
                     "interfaces_total": len(interfaces or []), "device_id": None}
+
+    def _merge_sibling_stubs(self, devobj: Any, base_mac: str, serial: str,
+                             nw_id: str, idx: dict) -> int:
+        """Fold stub devices of the same physical box into ``devobj``.
+
+        A switch's VLAN/SVI MACs share all but the last octet with its base MAC,
+        so a firewall/ARP feeder files them as a separate device (own name, no
+        serial). A stub qualifies only when it is a different record whose MAC
+        shares the first 5 octets, carries no serial (or the same one), is not
+        itself a polled network device, and is the same kind (controller vs not).
+        Its IPs move onto ``devobj`` (interface ``lm-merged``), a journal entry
+        records the merge, then the stub is deleted. Returns the number merged."""
+        mine = re.sub(r"[^0-9a-f]", "", base_mac.lower())
+        if len(mine) != 12:
+            return 0
+        my_id = getattr(devobj, "id", None)
+        merged = 0
+        seen = set()
+        for key, row in list((idx.get("by_mac") or {}).items()):
+            other = re.sub(r"[^0-9a-f]", "", str(key).lower())
+            rid = row.get("id")
+            if (len(other) != 12 or other == mine or other[:10] != mine[:10]
+                    or rid in (None, my_id) or rid in seen):
+                continue
+            cf = row.get("custom_fields") or {}
+            rserial = str(row.get("serial") or "").strip()
+            rnw = str(cf.get("nw_device_id") or "").strip()
+            if (rserial and rserial != serial) or (rnw and rnw != nw_id):
+                continue
+            if str(cf.get("discovered_from") or "") == "Network Devices" or _is_mgmt_row(row):
+                continue
+            seen.add(rid)
+            stub = self.nb.dcim.devices.get(rid)
+            if stub is None:
+                continue
+            iface = self.nb.dcim.interfaces.get(device_id=my_id, name="lm-merged")
+            ips = list(self.nb.ipam.ip_addresses.filter(device_id=rid))
+            if ips and iface is None:
+                iface = self.nb.dcim.interfaces.create(
+                    device=my_id, name="lm-merged", type="other", status="active")
+            if getattr(stub, "primary_ip4", None):
+                stub.primary_ip4 = None
+                stub.save()
+            for ipo in ips:
+                ipo.assigned_object_type = "dcim.interface"
+                ipo.assigned_object_id = iface.id
+                ipo.save()
+            self._journal("dcim.device", my_id, "nw-poll",
+                          note=f"merged duplicate device {row.get('name')} (id {rid}, "
+                               f"MAC {key}) into this device; {len(ips)} IP(s) moved")
+            stub.delete()
+            logger.info("netbox: merged duplicate %s (id %s) into %s",
+                        row.get("name"), rid, getattr(devobj, "name", my_id))
+            merged += 1
+        if merged:
+            self._global_devices_cache = None
+        return merged
 
     def _link_host_device(self, devobj: Any, linked_host: Any, idx: dict,
                           serial: str = "") -> None:
