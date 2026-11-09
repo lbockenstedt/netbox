@@ -709,6 +709,11 @@ class SyncMixin:
         for net, ptid, site in cache[1]:
             if addr.version != net.version or addr not in net:
                 continue
+            # Another tenant's subnet says nothing about this tenant's device
+            # (overlapping/unrelated address space, e.g. a DXP device must not
+            # land in a MIP site); untenanted prefixes stay eligible.
+            if tid is not None and ptid is not None and ptid != tid:
+                continue
             # Rank by prefix length first, then by tenant match.
             rank = (net.prefixlen, ptid == tid and tid is not None)
             if best is None or rank > best[0]:
@@ -764,14 +769,24 @@ class SyncMixin:
                                   lambda: self.nb.dcim.sites.get(slug=slug))
             if s:
                 return s
-        # Fallback: use the first existing site; errors are logged and we try to create one.
+        # No configured site: a site named after the tenant, else the neutral
+        # 'discovered' site. Never an arbitrary existing site — "the first one"
+        # is whichever tenant's site NetBox lists first (devices of a tenant
+        # with no site ended up in another tenant's site).
         try:
-            sites = list(self.nb.dcim.sites.filter(limit=1))
-            if sites:
-                return sites[0]
+            tslug = str(getattr(tenant, "slug", "") or "").strip().lower()
+            if tslug:
+                ts = self._cached_ref("site", tslug,
+                                      lambda: self.nb.dcim.sites.get(slug=tslug))
+                if ts:
+                    return ts
+            fb = self._cached_ref("site", FALLBACK_SITE_SLUG,
+                                  lambda: self.nb.dcim.sites.get(slug=FALLBACK_SITE_SLUG))
+            if fb:
+                return fb
         except Exception as e:
             # warn so a permissions issue is visible rather than silent.
-            logger.warning("resolve_site first-site fallback failed: %s", e)
+            logger.warning("resolve_site fallback lookup failed: %s", e)
         # Nothing configured and no site exists — auto-create one so device
         # creation (which REQUIRES a site) succeeds instead of 400ing every
         # record (the failure behind "fw-discovery: 183 errors, site required").
