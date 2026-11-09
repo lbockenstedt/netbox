@@ -143,3 +143,42 @@ def test_two_normal_devices_in_one_u_still_conflict():
             "online": True, "height": 1, "full_depth": False}
     devs = [dict(base, id=1, name="MIPBE-SSPLM-N31-R10-A"), dict(base, id=2, name="MIPBE-SSPLM-N31-R10-B")]
     assert plan(devs, racks)["report"]
+
+
+def _host(i, name, ctl, **kw):
+    return dict(dev(i, name, **kw), controller=ctl)
+
+
+def test_server_takes_slot_from_controller_name_when_its_own_has_none():
+    out = plan([_host(1, "tnas", "MIPBE-SSPLM-N31-R44-ILO-TNAS", h=2)], RACKS)
+    assert [(a["op"], a["to"]) for a in out["actions"]] == [("place", (1, 44, "front"))]
+
+
+def test_server_own_name_wins_when_controller_agrees_or_has_none():
+    out = plan([_host(1, "MIPBE-SSPLM-N31-R30-A", "MIPBE-SSPLM-N31-R30-ILO-A"),
+                _host(2, "MIPBE-SSPLM-N31-R31-B", "ilo-b")], RACKS)
+    assert sorted(a["to"][1] for a in out["actions"]) == [30, 31] and out["report"] == []
+
+
+def test_server_and_controller_naming_different_slots_cannot_rack():
+    out = plan([_host(1, "MIPBE-SSPLM-N31-R30-A", "MIPBE-SSPLM-N31-R44-ILO-A")], RACKS)
+    assert out["actions"] == []
+    r = out["report"][0]
+    assert r["kind"] == "cannot" and "U30" in r["reason"] and "U44" in r["reason"]
+
+
+def test_sweep_server_racks_from_ilo_and_ilo_gives_up_the_u():
+    rows = [{"id": 1, "name": "mipbe-ssplm-n31-tnas", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "server"},
+             "custom_fields": {"linked_device": "MIPBE-SSPLM-N31-R44-ILO-TNAS"}},
+            {"id": 2, "name": "MIPBE-SSPLM-N31-R44-ILO-TNAS", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "bmc"}, "rack": {"id": 1}, "position": 44,
+             "face": {"value": "front"},
+             "custom_fields": {"linked_device": "mipbe-ssplm-n31-tnas.mip.example.com"}}]
+    eng = _engine(rows, [{"id": 5, "u_height": 2}], [{"id": 1, "name": "N31", "u_height": 48, "site": {"id": 10}}])
+    objs = {1: MagicMock(), 2: MagicMock()}
+    eng.nb.dcim.devices.get.side_effect = lambda i: objs[i]
+    res = eng.autorack_sweep()
+    assert res["cannot"] == [] and res["conflicts"] == [] and res["named"] == 1
+    assert (objs[1].rack, objs[1].position) == (1, 44)
+    assert objs[2].position is None and objs[2].rack is not None  # stays in the rack
