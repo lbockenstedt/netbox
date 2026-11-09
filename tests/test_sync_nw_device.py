@@ -543,3 +543,27 @@ def test_ipmi_link_without_host_device_only_marks_the_controller():
     assert ilo.custom_fields["linked_device"] == "MIPBE-N31-TNAS"
     assert ilo.serial == "2M292101K3"
     eng.nb.dcim.devices.create.assert_not_called()
+
+
+def test_sync_nw_device_merges_sibling_mac_stub_into_the_polled_device():
+    real = {"id": 7, "name": "SW-OLD", "serial": "SN1",
+            "custom_fields": {"nw_device_id": "nw-1", "mac_address": "ec:50:aa:f4:5b:01"}}
+    stub = {"id": 8, "name": "SW-STUB", "serial": "",
+            "custom_fields": {"discovered_from": "opnsense", "mac_address": "ec:50:aa:f4:5b:00"}}
+    other = {"id": 9, "name": "UNRELATED", "serial": "",
+             "custom_fields": {"discovered_from": "opnsense", "mac_address": "ec:50:aa:11:22:00"}}
+    eng = _engine(existing_devices=[real, stub, other])
+    real_obj, stub_obj = _Obj(id=7, name="SW-OLD"), _Obj(id=8, name="SW-STUB")
+    stub_obj.primary_ip4 = 6828
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda x=None, **k: {7: real_obj, 8: stub_obj}.get(x))
+    stub_ip = _Obj(id=6828)
+    eng.nb.ipam.ip_addresses.filter = MagicMock(return_value=[stub_ip])
+    eng.nb.dcim.interfaces.create = MagicMock(return_value=_Obj(id=555, name="lm-merged"))
+    res = eng.sync_nw_device(
+        device={"id": "nw-1", "name": "SW-OLD", "serial": "SN1", "mac": "ec:50:aa:f4:5b:01",
+                "address": "10.0.0.1", "object_type": "aos_switch"},
+        interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    stub_obj.delete.assert_called_once()
+    assert stub_ip.assigned_object_id == 555
+    assert stub_obj.primary_ip4 is None
