@@ -501,7 +501,7 @@ def test_adopt_real_name_refuses_across_kinds():
     assert rec.name == "device-aabbccddeeff"
 
 
-def test_ipmi_links_host_racks_it_and_sets_oob_ip():
+def test_ipmi_links_host_and_racks_it_without_touching_oob_ip():
     ilo_row = {"id": 61, "name": "MIPBE-N31-ILO-TNAS", "role": {"slug": "bmc"},
                "custom_fields": {"nw_device_id": "nw-ilo"}}
     host_row = {"id": 60, "name": "MIPBE-N31-TNAS", "serial": "2M292101K3",
@@ -526,7 +526,7 @@ def test_ipmi_links_host_racks_it_and_sets_oob_ip():
     assert ilo.custom_fields["linked_device"] == "MIPBE-N31-TNAS"
     assert (ilo.rack, ilo.position) == (3, 20)
     assert host.custom_fields["linked_device"] == "MIPBE-N31-ILO-TNAS"
-    assert host.oob_ip == 9000
+    assert host.oob_ip is None  # NetBox refuses another device's IP
     assert host.name == "MIPBE-N31-TNAS"
 
 
