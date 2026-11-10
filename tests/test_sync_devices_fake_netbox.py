@@ -369,3 +369,20 @@ def test_record_spec_enriches_the_bare_model_type_and_sets_role():
     assert dev["device_type_id"] == 42                       # same model: type enriched in place
     assert f.db["device-types"][42]["comments"] == "Juniper SRX345 firewall"
     assert f.db["device-roles"][dev["role_id"]]["slug"] == "firewall"
+
+
+def test_second_identical_cycle_with_switch_sighting_makes_zero_writes():
+    # fleet-rules 4.8: a feeder re-sending the same sighting (same switch/port)
+    # must not rewrite NetBox; the first cycle creates, the second is free.
+    f, _ = _world()
+    feed = [{"ip": "10.1.0.77", "mac": "aa:bb:cc:00:09:09", "hostname": "newhost",
+             "source_switch_name": "SW-A", "source_switch_ip": "10.0.0.1",
+             "source_switch_port": "Gi1/0/5"}]
+    _, res = _sync(f, feed)
+    assert res["status"] == "SUCCESS", res
+    assert _writes(f), "first cycle should create the device"
+    eng = make_engine(NetboxEngine, f)
+    f.log.clear()
+    res2 = eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
+    assert res2["status"] == "SUCCESS", res2
+    assert _writes(f) == [], _writes(f)
