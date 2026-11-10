@@ -261,7 +261,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         return resp.json()
 
     def _api_get_all(self, path: str, params: dict = None,
-                     max_pages: int = 200) -> list:
+                     max_pages: int = 200, meta: dict = None) -> list:
         """Paginated GET that follows NetBox ``next`` links until exhausted.
 
         Used by ``find_available_prefixes`` which needs the *complete* set of
@@ -298,5 +298,8 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
             # No next link: all pages read.
             if not next_url:
                 break
+        # Report whether a next page was still pending (truncated read).
+        if meta is not None:
+            meta["more"] = bool(next_url)
         # Every row from every page.
         return results
