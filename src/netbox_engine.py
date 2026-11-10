@@ -96,11 +96,12 @@ from netbox_changelog import ChangelogMixin
 from netbox_sync import SyncMixin
 from netbox_staleness import StalenessMixin
 from netbox_dedupe import DedupeMixin
+from netbox_churn import ChurnMixin
 from netbox_tenancy import TenancyMixin
 from netbox_autorack import AutoRackMixin
 
 
-class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, DedupeMixin, TenancyMixin, AutoRackMixin):
+class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, DedupeMixin, TenancyMixin, AutoRackMixin, ChurnMixin):
     """
     NetBox API client. Covers DCIM (devices/racks) and IPAM (prefixes/IPs).
     """
@@ -260,7 +261,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         return resp.json()
 
     def _api_get_all(self, path: str, params: dict = None,
-                     max_pages: int = 200) -> list:
+                     max_pages: int = 200, meta: dict = None) -> list:
         """Paginated GET that follows NetBox ``next`` links until exhausted.
 
         Used by ``find_available_prefixes`` which needs the *complete* set of
@@ -297,5 +298,8 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
             # No next link: all pages read.
             if not next_url:
                 break
+        # Report whether a next page was still pending (truncated read).
+        if meta is not None:
+            meta["more"] = bool(next_url)
         # Every row from every page.
         return results

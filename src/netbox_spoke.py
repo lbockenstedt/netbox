@@ -1299,6 +1299,11 @@ class NetboxSpoke(BaseSpoke):
                 res["message"] = f"{res.get('message') or 'sweep complete'}; dedupe: {dd.get('message')}"
             return res
 
+        # Read-only changelog churn summary for the hub health check.
+        if normalized == "NETBOX_CHURN_REPORT":
+            return await self._run_sync(self.engine.churn_report,
+                                        window_s=int(data.get("window_s") or 1800))
+
         # Find or merge duplicate devices.
         if normalized == "NETBOX_DEDUPE_DEVICES":
             # Find (and, when apply=True, merge) duplicate devices that share a
