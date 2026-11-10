@@ -280,3 +280,21 @@ def test_nw_store_restart_does_not_trigger_an_immediate_heal(tmp_path):
     for k in ("a", "b"):
         store.entries[k]["applied_at"] = clock[0] - 86400 * 3
     assert store.due() == []
+
+
+def _chg(name, pre, post, t="dcim.device", action="update"):
+    return {"changed_object_type": t, "action": {"value": action}, "object_repr": name,
+            "prechange_data": {"custom_fields": pre}, "postchange_data": {"custom_fields": post}}
+
+
+def test_churn_report_detects_flapping_and_rate():
+    from netbox_churn import analyze_changes
+    # newest first, as NetBox returns: A->B, then B->A (flap); other device changes once.
+    rows = [_chg("d1", {"switch_ip": "B"}, {"switch_ip": "A"}),
+            _chg("d1", {"switch_ip": "A"}, {"switch_ip": "B"}),
+            _chg("d2", {"switch_ip": "A"}, {"switch_ip": "B"}),
+            _chg("DEVICE-x", {}, {}, action="create")]
+    r = analyze_changes(rows, 1800)
+    assert r["writes_per_hour"] == 8
+    assert r["flapping"]["objects"] == 1 and r["flapping"]["sample"][0]["name"] == "d1"
+    assert r["top_fields"][0] == ["switch_ip", 3] and r["stub_creates"] == 1
