@@ -252,3 +252,14 @@ def test_nw_store_due_lists_changed_before_stale_refreshes(tmp_path):
         store.mark_applied(k, store.entries[k]["sig"], {})
     store.submit({"device": {"id": "b", "name": "b-renamed"}, "interfaces": []})
     assert [k for k, _ in store.due()] == ["b", "a"]
+
+
+def test_nw_store_unchanged_devices_are_not_rewritten_until_the_weekly_heal(tmp_path):
+    from netbox_nw_store import NwInventoryStore
+    store = NwInventoryStore(str(tmp_path / "nw.json"), stale_batch=2)
+    for k in ("a", "b", "c"):
+        store.submit({"device": {"id": k, "name": k}, "interfaces": []})
+        store.mark_applied(k, store.entries[k]["sig"], {})
+    assert store.due() == []
+    store.refresh_s = 0
+    assert len(store.due()) == 2  # trickled, not all at once

@@ -121,7 +121,8 @@ class NetboxSpoke(BaseSpoke):
         self._sync_task = None
         self._nw_flush_task = None
         self._nw_store = NwInventoryStore(
-            os.getenv("LM_NETBOX_NW_STORE", "/var/lib/lm/netbox/nw_inventory.json"))
+            os.getenv("LM_NETBOX_NW_STORE", "/var/lib/lm/netbox/nw_inventory.json"),
+            refresh_s=float(os.getenv("LM_NETBOX_NW_REFRESH_S", str(7 * 86400))))
         # perf FIX B: prefix → gateway of every scope last SUCCESSFULLY pushed
         # to Kea. Each tick diffs the NetBox scope set against this map and
         # only add/removes the deltas — the old loop re-POSTed subnet4-add for
@@ -140,6 +141,13 @@ class NetboxSpoke(BaseSpoke):
         # UPDATE_CONFIG (token/url change).
         self._picklist_cache: Dict[str, Any] = {}
         self._picklist_ttl = 60.0
+        # Big list reads (devices/prefixes/IPs/racks) the hub polls constantly.
+        # Served from memory for LM_NETBOX_LIST_TTL_S (default 5 min), identical
+        # concurrent reads share one NetBox fetch, and only user-driven writes
+        # drop it -- background syncs would otherwise clear it every few seconds.
+        self._list_cache: Dict[str, Any] = {}
+        self._list_inflight: Dict[str, Any] = {}
+        self._list_ttl = float(os.getenv("LM_NETBOX_LIST_TTL_S", "300"))
         # The custom-field self-heal (_ensure_custom_fields) is intentionally NOT
         # run at construction. A role sub-spoke that has not yet received its
         # UPDATE_CONFIG builds the engine against the localhost:8000 default
@@ -480,6 +488,37 @@ class NetboxSpoke(BaseSpoke):
         if self._picklist_cache:
             self._picklist_cache.clear()
 
+    def _list_invalidate(self):
+        """Drop every cached list read (after a user write or a config change)."""
+        self.__dict__.setdefault("_list_cache", {}).clear()
+
+    async def _run_list(self, key: str, fn, *args, **kwargs):
+        """TTL-cached, single-flight read of a big NetBox list. Errors are
+        never cached."""
+        cache = self.__dict__.setdefault("_list_cache", {})
+        inflight = self.__dict__.setdefault("_list_inflight", {})
+        ttl = self.__dict__.get("_list_ttl", 300.0)
+        entry = cache.get(key)
+        if entry and (time.time() - entry["ts"]) < ttl:
+            return entry["value"]
+        pending = inflight.get(key)
+        if pending is not None:
+            return await asyncio.shield(pending)
+        fut = asyncio.get_running_loop().create_future()
+        inflight[key] = fut
+        try:
+            value = await self._run_sync(fn, *args, **kwargs)
+            if not (isinstance(value, dict) and value.get("status") == "ERROR"):
+                cache[key] = {"ts": time.time(), "value": value}
+            fut.set_result(value)
+            return value
+        except BaseException as e:
+            fut.set_exception(e)
+            fut.exception()  # mark retrieved when nobody else awaited it
+            raise
+        finally:
+            inflight.pop(key, None)
+
     async def _run_picklist(self, key: str, fn, *args, **kwargs):
         """TTL-gated read for picklist commands. ``key`` is a stable string
         encoding the command + its filter args so filtered reads (e.g.
@@ -512,6 +551,15 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
         "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP", "NETBOX_NORMALIZE_DEVICE_NAMES",
+    })
+
+    # Writes the hub/nw/cppm feeders make continuously; they must not flush the
+    # list cache (user edits and config changes still do).
+    _BACKGROUND_MUTATIONS = frozenset({
+        "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_VMS",
+        "NETBOX_SYNC_DHCP", "NETBOX_SYNC_ACCESS_TRACKER", "NETBOX_STALENESS_SWEEP",
+        "NETBOX_AUTORACK_SWEEP", "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP",
+        "NETBOX_NORMALIZE_DEVICE_NAMES",
     })
 
     # ── Cert custodian ──────────────────────────────────────────────────────
@@ -754,6 +802,8 @@ class NetboxSpoke(BaseSpoke):
         # invalidates itself below.)
         if normalized in self._PICKLIST_MUTATIONS:
             self._picklist_invalidate()
+            if normalized not in self._BACKGROUND_MUTATIONS:
+                self._list_invalidate()
 
         # Spoke version.
         if normalized == "GET_VERSION":
@@ -802,6 +852,7 @@ class NetboxSpoke(BaseSpoke):
             self.config.update(data)
             # Repointing NetBox (or KEA) makes any cached picklist data stale.
             self._picklist_invalidate()
+            self._list_invalidate()
             return {"status": "SUCCESS", "message": "NetBox config updated"}
 
         # Self-update: git pull, then restart the service.
@@ -833,7 +884,7 @@ class NetboxSpoke(BaseSpoke):
 
         # Rack picklist (cached per filter).
         if normalized == "NETBOX_GET_RACKS":
-            return await self._run_picklist(
+            return await self._run_list(
                 f"GET_RACKS|site={data.get('site')}|tenant={data.get('tenant')}"
                 f"|tgroup={data.get('tenant_group')}",
                 self.engine.get_racks,
@@ -868,9 +919,12 @@ class NetboxSpoke(BaseSpoke):
 
         # List devices.
         if normalized == "NETBOX_GET_DEVICES":
-            return await self._run_sync(self.engine.get_devices, site=data.get("site"),
-                                        rack=data.get("rack"), tenant=data.get("tenant"),
-                                        tenant_group=data.get("tenant_group"))
+            return await self._run_list(
+                f"GET_DEVICES|{data.get('site')}|{data.get('rack')}|{data.get('tenant')}"
+                f"|{data.get('tenant_group')}",
+                self.engine.get_devices, site=data.get("site"),
+                rack=data.get("rack"), tenant=data.get("tenant"),
+                tenant_group=data.get("tenant_group"))
 
         # List cables.
         if normalized == "NETBOX_GET_CABLES":
@@ -970,9 +1024,11 @@ class NetboxSpoke(BaseSpoke):
 
         # List prefixes.
         if normalized == "NETBOX_GET_PREFIXES":
-            return await self._run_sync(self.engine.get_prefixes, site=data.get("site"),
-                                        tenant=data.get("tenant"),
-                                        tenant_group=data.get("tenant_group"))
+            return await self._run_list(
+                f"GET_PREFIXES|{data.get('site')}|{data.get('tenant')}|{data.get('tenant_group')}",
+                self.engine.get_prefixes, site=data.get("site"),
+                tenant=data.get("tenant"),
+                tenant_group=data.get("tenant_group"))
 
         # Allocate a child prefix.
         if normalized == "NETBOX_ALLOCATE_PREFIX":
@@ -1037,7 +1093,9 @@ class NetboxSpoke(BaseSpoke):
 
         # List IP addresses.
         if normalized == "NETBOX_GET_IPS":
-            return await self._run_sync(
+            return await self._run_list(
+                f"GET_IPS|{data.get('prefix')}|{data.get('device')}|{data.get('tenant')}"
+                f"|{data.get('tenant_group')}",
                 self.engine.get_ip_addresses,
                 prefix=data.get("prefix"),
                 device=data.get("device"),
