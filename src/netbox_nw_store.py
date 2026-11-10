@@ -44,11 +44,11 @@ class NwInventoryStore:
     the last apply is older than ``refresh_s`` (a slow heal of manual NetBox edits).
     """
 
-    def __init__(self, path: str, refresh_s: float = 7 * 86400.0,
+    def __init__(self, path: str, refresh_s: float = 86400.0,
                  stale_batch: int = 200):
         self.path = path
         self.refresh_s = refresh_s
-        # Cap on unchanged devices re-applied per flush, so the weekly heal
+        # Cap on unchanged devices re-applied per flush, so the daily heal
         # trickles through instead of hitting NetBox all at once.
         self.stale_batch = stale_batch
         self.entries: Dict[str, Dict[str, Any]] = {}
