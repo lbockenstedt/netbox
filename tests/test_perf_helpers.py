@@ -1,10 +1,10 @@
 """Unit tests for the perf-fix helpers (pure logic, no NetBox API needed).
 
 FIX A — last_seen quantization: ``_last_seen_stale`` decides whether the
-stored ``last_seen`` custom field needs a rewrite (missing/unparsable/≥1h off)
+stored ``last_seen`` custom field needs a rewrite (missing/unparsable/≥24h off)
 and ``_stamp_last_seen`` skips the save entirely while the stamp is fresh, so
 a no-op sync produces zero PATCHes. The staleness sweep's thresholds are days
-(7d/30d), so hour resolution loses nothing.
+(7d/30d), so day resolution loses nothing.
 """
 import os
 import sys
@@ -41,21 +41,21 @@ def test_last_seen_stale_unparsable_is_stale():
 def test_last_seen_fresh_within_the_hour_is_not_stale():
     stale = NetboxEngine._last_seen_stale
     assert stale(_iso(NOW - timedelta(minutes=5)), now=NOW) is False
-    assert stale(_iso(NOW - timedelta(minutes=59)), now=NOW) is False
+    assert stale(_iso(NOW - timedelta(hours=23)), now=NOW) is False
     assert stale(_iso(NOW), now=NOW) is False
 
 
 def test_last_seen_older_than_an_hour_is_stale():
     stale = NetboxEngine._last_seen_stale
-    assert stale(_iso(NOW - timedelta(hours=1)), now=NOW) is True     # boundary
-    assert stale(_iso(NOW - timedelta(hours=2)), now=NOW) is True
+    assert stale(_iso(NOW - timedelta(hours=24)), now=NOW) is True    # boundary
+    assert stale(_iso(NOW - timedelta(hours=30)), now=NOW) is True
     assert stale(_iso(NOW - timedelta(days=8)), now=NOW) is True
 
 
 def test_last_seen_far_future_is_stale_clock_skew_cant_freeze_it():
     # A clock-skewed FUTURE stamp must not freeze the signal forever.
     stale = NetboxEngine._last_seen_stale
-    assert stale(_iso(NOW + timedelta(hours=2)), now=NOW) is True
+    assert stale(_iso(NOW + timedelta(hours=30)), now=NOW) is True
     assert stale(_iso(NOW + timedelta(minutes=30)), now=NOW) is False
 
 
@@ -65,7 +65,7 @@ def test_last_seen_accepts_offset_and_naive_formats():
     assert stale("2026-07-17T11:30:00+00:00", now=NOW) is False
     # Naive timestamp → treated as UTC.
     assert stale("2026-07-17T11:30:00", now=NOW) is False
-    assert stale("2026-07-17T09:00:00", now=NOW) is True
+    assert stale("2026-07-16T09:00:00", now=NOW) is True
 
 
 # ── _stamp_last_seen: skip the save while fresh ───────────────────────────────
