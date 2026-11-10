@@ -9,14 +9,14 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-_MAX_ROWS = 3000
 
 
 def analyze_changes(rows: List[dict], window_s: int, capped: bool = False) -> Dict[str, Any]:
     """Summarise object-change rows (newest first, as NetBox returns them)."""
     by_kind: Counter = Counter()
     fields: Counter = Counter()
-    seqs: Dict[tuple, List[tuple]] = {}
+    seqs: Dict[Any, List[Any]] = {}
+    names: Dict[Any, str] = {}
     stub_creates = 0
     for r in reversed(rows):
         t = str(r.get("changed_object_type") or "?")
@@ -28,22 +28,31 @@ def analyze_changes(rows: List[dict], window_s: int, capped: bool = False) -> Di
             stub_creates += 1
         if act != "update" or t != "dcim.device":
             continue
-        pre = ((r.get("prechange_data") or {}).get("custom_fields")) or {}
-        post = ((r.get("postchange_data") or {}).get("custom_fields")) or {}
+        pre_d, post_d = r.get("prechange_data"), r.get("postchange_data")
+        pre = pre_d.get("custom_fields") if isinstance(pre_d, dict) else None
+        post = post_d.get("custom_fields") if isinstance(post_d, dict) else None
+        pre = pre if isinstance(pre, dict) else {}
+        post = post if isinstance(post, dict) else {}
+        oid = r.get("changed_object_id")
+        ident = ("id", oid) if oid is not None else ("name", name)
+        absent = "<absent>"
         for k in set(pre) | set(post):
-            if pre.get(k) != post.get(k):
+            a, b = pre.get(k, absent), post.get(k, absent)
+            if a != b:
                 fields[k] += 1
-                seq = seqs.setdefault((name, k), [])
+                names[ident] = name
+                seq = seqs.setdefault((ident, k), [])
                 if not seq:
-                    seq.append(pre.get(k))
-                seq.append(post.get(k))
+                    seq.append(a)
+                seq.append(b)
     flapping: Dict[str, List[str]] = {}
     sample: List[Dict[str, Any]] = []
-    for (name, k), seq in seqs.items():
+    for (ident, k), seq in seqs.items():
+        name = names.get(ident, "")
         # A flap returns to a value the field already held in this window.
-        strs = [str(v) for v in seq]
+        strs = [repr(v) for v in seq]
         if any(strs[i] in strs[:i] for i in range(2, len(strs))):
-            flapping.setdefault(k, []).append(name)
+            flapping.setdefault(k, []).append(ident)
             if len(sample) < 8:
                 sample.append({"name": name, "field": k,
                                "values": [str(v) for v in seq[:6]]})
@@ -61,13 +70,17 @@ def analyze_changes(rows: List[dict], window_s: int, capped: bool = False) -> Di
 
 
 class ChurnMixin:
+    """Engine mixin adding the read-only NetBox changelog churn report."""
+
     def churn_report(self, window_s: int = 1800) -> Dict[str, Any]:
         """Analyse the last ``window_s`` seconds of NetBox changelog (bounded read)."""
         since = datetime.fromtimestamp(time.time() - window_s, timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
+        meta: Dict[str, Any] = {}
         try:
             rows = self._api_get_all("/api/core/object-changes/",
-                                     {"time_after": since, "limit": 1000}, max_pages=3)
+                                     {"time_after": since, "limit": 1000}, max_pages=3,
+                                     meta=meta)
         except Exception as e:  # noqa: BLE001
             return {"status": "ERROR", "message": f"changelog read failed: {e}"}
-        return {"status": "SUCCESS", **analyze_changes(rows, window_s, len(rows) >= _MAX_ROWS)}
+        return {"status": "SUCCESS", **analyze_changes(rows, window_s, bool(meta.get("more")))}

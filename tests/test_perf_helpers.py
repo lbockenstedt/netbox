@@ -282,9 +282,36 @@ def test_nw_store_restart_does_not_trigger_an_immediate_heal(tmp_path):
     assert store.due() == []
 
 
-def _chg(name, pre, post, t="dcim.device", action="update"):
-    return {"changed_object_type": t, "action": {"value": action}, "object_repr": name,
+def _chg(name, pre, post, t="dcim.device", action="update", oid=None):
+    """Build one object-change row for the churn tests."""
+    return {"changed_object_id": oid, "changed_object_type": t, "action": {"value": action}, "object_repr": name,
             "prechange_data": {"custom_fields": pre}, "postchange_data": {"custom_fields": post}}
+
+
+def test_churn_same_name_different_ids_not_flap():
+    from netbox_churn import analyze_changes
+    rows = [_chg("d", {"f": "B"}, {"f": "A"}, oid=2),
+            _chg("d", {"f": "A"}, {"f": "B"}, oid=1)]
+    assert analyze_changes(rows, 1800)["flapping"]["objects"] == 0
+
+
+def test_churn_null_vs_none_string_and_malformed():
+    from netbox_churn import analyze_changes
+    rows = [_chg("d", {"f": "None"}, {"f": None}, oid=1),
+            _chg("d", {"f": None}, {"f": "None"}, oid=1),
+            {"changed_object_type": "dcim.device", "action": "update",
+             "prechange_data": "x", "postchange_data": []}]
+    assert analyze_changes(rows, 1800)["flapping"]["objects"] == 1
+
+
+def test_churn_report_capped_uses_next_link():
+    from netbox_churn import ChurnMixin
+
+    class E(ChurnMixin):
+        def _api_get_all(self, path, params=None, max_pages=200, meta=None):
+            meta["more"] = True
+            return []
+    assert E().churn_report()["capped"] is True
 
 
 def test_churn_report_detects_flapping_and_rate():
