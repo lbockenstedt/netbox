@@ -431,7 +431,7 @@ class VmSyncMixin:
 
         ``vm["interfaces"]`` is ``[{name, mac, ips:[..]}, ...]`` (pxmx agent
         ``_vm_interfaces``). For each interface a vminterface is reused-by-name
-        (or created) carrying the native ``mac_address``; each guest IP becomes
+        (or created) and given its MAC (:meth:`_set_iface_mac`); each guest IP becomes
         an ``ipam.ip_address`` assigned to that vminterface via
         ``_reuse_or_create_ip`` (global-IP uniqueness respected) and tagged with
         the interface MAC. Falls back to a single ``eth0`` vminterface + the
@@ -534,27 +534,19 @@ class VmSyncMixin:
                 # Reuse by name or create a new vminterface.
                 iface = by_name.get(name)
                 if iface is None:
-                    # New interface, with its MAC if known.
+                    # New interface (the MAC is set below).
                     kw: Dict[str, Any] = {"virtual_machine": vm_obj.id, "name": name}
-                    if mac:
-                        kw["mac_address"] = mac
                     # Create and journal it.
                     iface = self.nb.virtualization.interfaces.create(**kw)
                     self._journal("virtualization.vminterface", iface.id,
                                    "hypervisor-vm-sync",
                                    note=f"vminterface {name} for VM "
                                         f"{getattr(vm_obj, 'name', '')}")
-                else:
-                    # Refresh the MAC if the interface exists but is MAC-less.
-                    if mac and not getattr(iface, "mac_address", None):
-                        # Set the MAC; failure is only logged.
-                        try:
-                            iface.mac_address = mac
-                            iface.save()
-                        except Exception as e:
-                            # MAC refresh failed.
-                            logger.debug("assign_vm_primary_ip4: mac refresh %s: %s",
-                                         name, e)
+                # Set the MAC when NetBox doesn't show it yet; failure is only logged.
+                try:
+                    self._set_iface_mac(iface, mac, "virtualization.vminterface")
+                except Exception as e:
+                    logger.debug("assign_vm_primary_ip4: mac refresh %s: %s", name, e)
             except Exception as e:
                 # Record the failure and skip this interface.
                 _record_fail(f"vminterface {name} for VM {vm_name} failed", e)
