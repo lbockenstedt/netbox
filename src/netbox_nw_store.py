@@ -41,12 +41,16 @@ class NwInventoryStore:
 
     Each entry: ``{"payload", "sig", "applied_sig", "applied_at", "result"}``. A device is
     due when its signature differs from the last one applied to NetBox, or when
-    the last apply is older than ``refresh_s`` (heals manual edits in NetBox).
+    the last apply is older than ``refresh_s`` (a slow heal of manual NetBox edits).
     """
 
-    def __init__(self, path: str, refresh_s: float = 3600.0):
+    def __init__(self, path: str, refresh_s: float = 7 * 86400.0,
+                 stale_batch: int = 200):
         self.path = path
         self.refresh_s = refresh_s
+        # Cap on unchanged devices re-applied per flush, so the weekly heal
+        # trickles through instead of hitting NetBox all at once.
+        self.stale_batch = stale_batch
         self.entries: Dict[str, Dict[str, Any]] = {}
         self._load()
 
@@ -93,9 +97,10 @@ class NwInventoryStore:
         now = time.time()
         changed = [(k, e["payload"]) for k, e in self.entries.items()
                    if e["sig"] != e["applied_sig"]]
-        stale = [(k, e["payload"]) for k, e in self.entries.items()
-                 if e["sig"] == e["applied_sig"] and now - e["applied_at"] >= self.refresh_s]
-        return changed + stale
+        stale = sorted(((k, e) for k, e in self.entries.items()
+                        if e["sig"] == e["applied_sig"] and now - e["applied_at"] >= self.refresh_s),
+                       key=lambda ke: ke[1]["applied_at"])[:self.stale_batch]
+        return changed + [(k, e["payload"]) for k, e in stale]
 
     def mark_applied(self, key: str, sig: str, result: Dict[str, Any]) -> None:
         """Record that ``sig`` was written to NetBox for ``key`` with ``result``."""

@@ -82,3 +82,32 @@ def test_a_write_does_not_split_a_read_already_running_but_clears_it_after():
         await sp.handle_command("NETBOX_GET_PREFIXES", {})
     asyncio.run(run())
     assert calls.count("NETBOX_GET_PREFIXES") == 2
+
+
+def test_list_reads_are_cached_and_background_syncs_do_not_flush_them():
+    sp = spoke_mod.NetboxSpoke.__new__(spoke_mod.NetboxSpoke)
+    sp._list_ttl = 300.0
+    calls = []
+
+    def fetch():
+        calls.append(1)
+        return {"status": "SUCCESS", "n": len(calls)}
+
+    async def run():
+        a = await sp._run_list("K", fetch)
+        assert await sp._run_list("K", fetch) is a and len(calls) == 1
+        # a background sync must not drop it; a user write (or config change) does
+        assert "NETBOX_SYNC_NW_DEVICE" in sp._BACKGROUND_MUTATIONS
+        sp._list_invalidate()
+        assert (await sp._run_list("K", fetch))["n"] == 2
+    asyncio.run(run())
+
+
+def test_list_errors_are_not_cached():
+    sp = spoke_mod.NetboxSpoke.__new__(spoke_mod.NetboxSpoke)
+    replies = [{"status": "ERROR"}, {"status": "SUCCESS"}]
+
+    async def run():
+        assert (await sp._run_list("K", lambda: replies.pop(0)))["status"] == "ERROR"
+        assert (await sp._run_list("K", lambda: replies.pop(0)))["status"] == "SUCCESS"
+    asyncio.run(run())
