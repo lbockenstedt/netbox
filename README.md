@@ -4,6 +4,25 @@ The **NetBox Spoke** (`module_type = "ipam"`) provides the authoritative single 
 
 ---
 
+## Repository layout
+
+| Path | What it holds |
+| :--- | :--- |
+| `.claude/` | Fleet-owned skills, synced from lm; edit them in lm. |
+| `.github/` | CI (`workflows/ci.yml`), the thin `promote`/`backmerge` callers, promotion scripts and fleet-owned agents. |
+| `docs/` | This module's docs (copies of the canonical pages in `lm/docs`). |
+| `src/` | The spoke's Python source (entry point, engine, control plane). |
+| `tests/` | pytest suite; CI runs it in the `test` job. |
+| `AGENTS.md` | Orientation for people and AI agents; the fleet rules block is synced from lm. |
+| `API_SPEC.md` | The commands and routes this spoke exposes. |
+| `DEPLOY-AGENT-CERT.md` | How to deploy the agent's TLS certificate. |
+| `install.sh` | Installer (idempotent; safe to re-run). |
+| `install_kea.sh` | Installer for the Kea DHCP companion. |
+| `README.md` | This file. |
+| `requirements.txt` | Runtime Python dependencies. |
+| `setup-agent-host.sh` | Prepares a host to run the NetBox agent. |
+| `VERSION` | Bot-owned version; promotion bumps it. Never edit by hand. |
+
 ## Architecture Overview
 
 The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel (`wss://<hub>:443/ws/spoke`) using the standard push-ack-retry mailbox pattern (`BaseSpoke`). It interfaces with NetBox REST endpoints using `pynetbox` through a thread-pool executor (`_run_sync`) to ensure long-running database operations never block the event loop.
