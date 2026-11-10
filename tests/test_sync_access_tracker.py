@@ -135,12 +135,14 @@ def test_sync_access_tracker_creates_missing_endpoint_with_tag_and_nic_ip():
     assert dev.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
     assert dev.custom_fields.get("last_seen") == "2026-06-30T10:00:00"
     dev.save.assert_called()
-    # NIC interface created with the native MAC.
+    # NIC interface created, and the MAC set as its own dcim MAC record.
     ik = eng.nb.dcim.interfaces.create.call_args.kwargs
     assert ik["device"] == 42
     assert ik["name"] == "eth0"
-    assert ik["mac_address"] == "aa:bb:cc:dd:ee:ff"
     assert ik["type"] == "other"
+    eng.nb.dcim.mac_addresses.create.assert_called_once_with(
+        mac_address="aa:bb:cc:dd:ee:ff", assigned_object_type="dcim.interface",
+        assigned_object_id=100)
     # Framed IP on the NIC + dns_name=username + primary_ip4 set.
     ipk = eng.nb.ipam.ip_addresses.create.call_args.kwargs
     assert ipk["address"] == "10.0.0.5/32"  # no containing prefix → /32
