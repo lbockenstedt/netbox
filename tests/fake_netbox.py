@@ -28,6 +28,9 @@ Modelled NetBox semantics (the ones sync_devices relies on):
   (name, id) for devices and id for everything else.
 * ``?address=`` matches host/prefix exactly when a mask is given, else any
   mask; ``?id=`` may repeat.
+* MACs live in ``dcim/mac-addresses`` (NetBox 4.2+): an interface's
+  ``mac_address`` is read-only (a PATCH of it is ignored) and shows the MAC of
+  its ``primary_mac_address`` record.
 
 Every request is appended to ``log`` as ``(METHOD, path, sorted query, body)``
 so a differential test can compare two implementations call-for-call, and
@@ -51,6 +54,7 @@ _COLLECTIONS = {
     ("dcim", "device-types"), ("dcim", "manufacturers"), ("dcim", "devices"),
     ("dcim", "interfaces"), ("ipam", "ip-addresses"), ("ipam", "prefixes"),
     ("ipam", "vrfs"), ("extras", "journal-entries"), ("extras", "custom-fields"),
+    ("dcim", "mac-addresses"),
 }
 
 
@@ -191,6 +195,14 @@ class FakeNetBox(BaseAdapter):
                 rows = [r for r in rows
                         if (r.get("vrf_id") is None if want is None
                             else str(r.get("vrf_id")) == want)]
+        if coll == "mac-addresses":
+            if one("mac_address") is not None:
+                rows = [r for r in rows if r["mac_address"].lower() == one("mac_address").lower()]
+            for key, kind in (("interface_id", "dcim.interface"),
+                              ("vminterface_id", "virtualization.vminterface")):
+                if one(key) is not None:
+                    rows = [r for r in rows if r["assigned_object_type"] == kind
+                            and str(r["assigned_object_id"]) == one(key)]
         if coll == "prefixes":
             rows = []  # no containing prefixes → sync falls back to /32
         if coll == "devices":
@@ -239,7 +251,8 @@ class FakeNetBox(BaseAdapter):
             if body.get("device") not in self.db["devices"]:
                 raise _Http(400, {"device": ["Invalid pk"]})
             obj = {"device_id": body["device"], "name": body.get("name"),
-                   "type": body.get("type", "other")}
+                   "type": body.get("type", "other"), "speed": body.get("speed"),
+                   "custom_fields": dict(body.get("custom_fields") or {})}
             return self.render(coll, self.add(coll, obj))
         if coll == "ip-addresses":
             obj = {"address": body["address"], "vrf_id": body.get("vrf"),
@@ -249,6 +262,11 @@ class FakeNetBox(BaseAdapter):
                    "assigned_object_id": body.get("assigned_object_id"),
                    "custom_fields": dict(body.get("custom_fields") or {})}
             self._check_ip_unique(obj, None)
+            return self.render(coll, self.add(coll, obj))
+        if coll == "mac-addresses":
+            obj = {"mac_address": str(body["mac_address"]).upper(),
+                   "assigned_object_type": body.get("assigned_object_type"),
+                   "assigned_object_id": body.get("assigned_object_id")}
             return self.render(coll, self.add(coll, obj))
         if coll == "journal-entries":
             obj = {k: body.get(k) for k in ("assigned_object_type",
@@ -278,6 +296,10 @@ class FakeNetBox(BaseAdapter):
                 new["status"] = v.get("value")
             elif k == "assigned_object":
                 continue  # read-only nested view
+            elif coll == "interfaces" and k == "mac_address":
+                continue  # read-only since NetBox 4.2 (MACs are their own records)
+            elif k == "primary_mac_address":
+                new["primary_mac_address_id"] = v.get("id") if isinstance(v, dict) else v
             else:
                 new[k] = v
         if coll == "devices":
@@ -365,9 +387,15 @@ class FakeNetBox(BaseAdapter):
                     "assigned_object_id": obj.get("assigned_object_id"),
                     "custom_fields": copy.deepcopy(obj.get("custom_fields") or {})}
         if coll == "interfaces":
+            mac = self.db["mac-addresses"].get(obj.get("primary_mac_address_id")) or {}
             return {**base, "name": obj.get("name"),
                     "device": self._nested("devices", obj.get("device_id"), "dcim"),
-                    "type": {"value": obj.get("type"), "label": obj.get("type")}}
+                    "type": {"value": obj.get("type"), "label": obj.get("type")},
+                    "speed": obj.get("speed"),
+                    "mac_address": mac.get("mac_address"),
+                    "primary_mac_address": self._nested(
+                        "mac-addresses", obj.get("primary_mac_address_id"), "dcim"),
+                    "custom_fields": copy.deepcopy(obj.get("custom_fields") or {})}
         if coll == "device-types":
             return {**base, "model": obj.get("model"), "slug": obj.get("slug"),
                     "manufacturer": self._nested("manufacturers", obj.get("manufacturer_id"), "dcim")}

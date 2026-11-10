@@ -386,3 +386,26 @@ def test_second_identical_cycle_with_switch_sighting_makes_zero_writes():
     res2 = eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
     assert res2["status"] == "SUCCESS", res2
     assert _writes(f) == [], _writes(f)
+
+
+def test_nw_poll_sets_interface_mac_once_then_makes_zero_writes():
+    # NetBox 4.2+ ignores writes to an interface's mac_address (MACs are their
+    # own records), so the old sync re-PATCHed every polled interface on every
+    # poll. Now the MAC lands as a primary MAC record and a repeat poll is free.
+    f, _ = _world()
+    eng = make_engine(NetboxEngine, f)
+    dev = {"id": "nw-1", "name": "sw1", "address": "10.0.0.1"}
+    ifaces = [{"name": "1/1/1", "mac": "AA-BB-CC-00-00-01", "speed": 1_000_000_000},
+              {"name": "1/1/2", "mac": "aa:bb:cc:00:00:02"}]
+    defaults = {"device_type": "discovered", "role": "discovered", "site": "lab"}
+    res = eng.sync_nw_device(device=dev, interfaces=ifaces, tenant_slug="t1",
+                             defaults=defaults)
+    assert res["errors"] == 0, res
+    macs = {i["name"]: f.render("interfaces", i)["mac_address"]
+            for i in f.db["interfaces"].values()}
+    assert macs == {"1/1/1": "AA:BB:CC:00:00:01", "1/1/2": "AA:BB:CC:00:00:02"}
+    f.log.clear()
+    res2 = eng.sync_nw_device(device=dev, interfaces=ifaces, tenant_slug="t1",
+                              defaults=defaults)
+    assert res2["errors"] == 0, res2
+    assert _writes(f) == [], _writes(f)
