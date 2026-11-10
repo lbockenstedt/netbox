@@ -244,22 +244,39 @@ def test_nw_store_submits_dedupes_and_tracks_due(tmp_path):
     assert NwInventoryStore(path).entries["d1"]["sig"] == store.entries["d1"]["sig"]
 
 
-def test_nw_store_due_lists_changed_before_stale_refreshes(tmp_path):
+def _nightly_store(tmp_path, **kw):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     from netbox_nw_store import NwInventoryStore
-    store = NwInventoryStore(str(tmp_path / "nw.json"), refresh_s=0)
+    clock = [datetime(2026, 11, 9, 20, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()]
+    store = NwInventoryStore(str(tmp_path / "nw.json"), clock=lambda: clock[0], **kw)
     for k in ("a", "b"):
         store.submit({"device": {"id": k, "name": k}, "interfaces": []})
         store.mark_applied(k, store.entries[k]["sig"], {})
+        store.entries[k]["applied_at"] = clock[0]
+    return store, clock
+
+
+def test_nw_store_due_lists_changed_before_nightly_heal(tmp_path):
+    store, clock = _nightly_store(tmp_path)
     store.submit({"device": {"id": "b", "name": "b-renamed"}, "interfaces": []})
+    clock[0] += 8 * 3600  # past 03:00 Pacific next day
     assert [k for k, _ in store.due()] == ["b", "a"]
 
 
-def test_nw_store_unchanged_devices_are_not_rewritten_until_the_daily_heal(tmp_path):
-    from netbox_nw_store import NwInventoryStore
-    store = NwInventoryStore(str(tmp_path / "nw.json"), stale_batch=2)
-    for k in ("a", "b", "c"):
-        store.submit({"device": {"id": k, "name": k}, "interfaces": []})
-        store.mark_applied(k, store.entries[k]["sig"], {})
+def test_nw_store_heals_unchanged_devices_only_after_3am_pacific(tmp_path):
+    store, clock = _nightly_store(tmp_path, stale_batch=1)
+    clock[0] += 5 * 3600  # 01:00 Pacific: not yet
     assert store.due() == []
-    store.refresh_s = 0
-    assert len(store.due()) == 2  # trickled, not all at once
+    clock[0] += 3 * 3600  # 04:00 Pacific
+    assert len(store.due()) == 1  # trickled
+    for k in ("a", "b"):
+        store.entries[k]["applied_at"] = clock[0]
+    assert store.due() == []  # healed tonight; next heal is tomorrow's 3 AM
+
+
+def test_nw_store_restart_does_not_trigger_an_immediate_heal(tmp_path):
+    store, clock = _nightly_store(tmp_path)
+    for k in ("a", "b"):
+        store.entries[k]["applied_at"] = clock[0] - 86400 * 3
+    assert store.due() == []
