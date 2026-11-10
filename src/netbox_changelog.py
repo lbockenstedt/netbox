@@ -1,6 +1,7 @@
 """Change-log journaling + IP-reuse/reassign helpers for NetboxEngine."""
 # Standard-library logging; shares the "NetboxEngine" logger with the engine.
 import logging
+import os
 # datetime/timezone build and parse the UTC timestamps written to NetBox.
 from datetime import datetime, timezone
 # Type hints.
@@ -367,12 +368,13 @@ class ChangelogMixin:
     # thresholds are DAYS (7d offline / 30d delete — netbox_staleness.py), so a
     # second-resolution ``now()`` stamp was pure churn: every sync tick produced
     # a guaranteed-diff PATCH per object even when nothing else changed. Only
-    # rewrite when the stored stamp is missing/unparsable or ≥1h off.
-    _LAST_SEEN_MAX_AGE_S = 3600
+    # rewrite when the stored stamp is missing/unparsable or ≥24h off (the
+    # sweep works in days; hourly stamps were ~1 PATCH per object per hour).
+    _LAST_SEEN_MAX_AGE_S = int(os.getenv("LM_NETBOX_LAST_SEEN_MAX_AGE_S", "86400"))
 
     @staticmethod
     def _last_seen_stale(stored: Any, now: Optional[datetime] = None,
-                         max_age_s: int = 3600) -> bool:
+                         max_age_s: Optional[int] = None) -> bool:
         """Whether the stored ``last_seen`` CF value needs a rewrite.
 
         True when ``stored`` is missing/empty, unparsable (treat as stale), or
@@ -380,6 +382,8 @@ class ChangelogMixin:
         clock-skewed future stamp can't freeze the signal forever. False when
         the stamp is fresh (within the window), letting the caller skip the
         save entirely — a no-op sync then produces zero PATCHes."""
+        if max_age_s is None:
+            max_age_s = ChangelogMixin._LAST_SEEN_MAX_AGE_S
         # Normalise the stored value to a stripped string.
         s = str(stored or "").strip()
         # No stamp at all: needs writing.
@@ -403,7 +407,7 @@ class ChangelogMixin:
     def _stamp_last_seen(self, obj: Any, when: str = "") -> None:
         """Write the ``last_seen`` custom field (ISO UTC) on ``obj`` so the
         staleness sweep can age it. Quantized: when the stored stamp is already
-        fresh (parsable and <1h old — see ``_last_seen_stale``) the write is
+        fresh (parsable and <24h old — see ``_last_seen_stale``) the write is
         skipped, so a steady-state sync no longer PATCHes every object every
         tick. Best-effort: a missing field / save failure is logged at DEBUG
         and swallowed — a staleness signal must never break the sync that
