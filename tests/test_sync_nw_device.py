@@ -123,7 +123,7 @@ def test_sync_nw_device_adopts_interface_the_listing_missed():
     # The MAC matches case-insensitively and interfaces have no status field,
     # so nothing but the one-time nw_managed marker is written.
     assert vlan1.status != "active"
-    assert vlan1.mac_address == "AA:BB:CC:DD:EE:01"
+    eng.nb.dcim.mac_addresses.create.assert_not_called()
 
 
 def test_sync_nw_device_missing_defaults_errors_named():
@@ -168,9 +168,13 @@ def test_sync_nw_device_updates_existing_in_place_no_recreate():
     # Index by device *id* — NetBox's `device` filter matches the name, so
     # filter(device=<id>) returns nothing and every iface re-creates (400).
     eng.nb.dcim.interfaces.filter.assert_called_with(device_id=7)
-    # vlan1 was updated (mac stamped) + saved; status is never written (not an interface field).
+    # vlan1's MAC became its primary MAC record + saved; status is never
+    # written (not an interface field).
     assert vlan1.status == "planned"
-    assert vlan1.mac_address == "aa:bb:cc:dd:ee:01"
+    eng.nb.dcim.mac_addresses.create.assert_called_once_with(
+        mac_address="aa:bb:cc:dd:ee:01", assigned_object_type="dcim.interface",
+        assigned_object_id=vlan1.id)
+    assert vlan1.primary_mac_address == eng.nb.dcim.mac_addresses.create.return_value.id
     vlan1.save.assert_called()
     # oldport (nw-managed, stale) deleted; manual (not nw-managed) left alone.
     oldport.delete.assert_called_once()
