@@ -122,7 +122,7 @@ class NetboxSpoke(BaseSpoke):
         self._nw_flush_task = None
         self._nw_store = NwInventoryStore(
             os.getenv("LM_NETBOX_NW_STORE", "/var/lib/lm/netbox/nw_inventory.json"),
-            refresh_s=float(os.getenv("LM_NETBOX_NW_REFRESH_S", str(86400))))
+            heal_hour=int(os.getenv("LM_NETBOX_NW_HEAL_HOUR_PT", "3")))
         # perf FIX B: prefix → gateway of every scope last SUCCESSFULLY pushed
         # to Kea. Each tick diffs the NetBox scope set against this map and
         # only add/removes the deltas — the old loop re-POSTed subnet4-add for

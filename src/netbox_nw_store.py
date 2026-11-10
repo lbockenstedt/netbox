@@ -9,7 +9,11 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple
+
+_HEAL_TZ = ZoneInfo("America/Los_Angeles")
 
 # Interface fields that reach NetBox; anything else in a poll (counters etc.) is ignored.
 _IFACE_FIELDS = ("name", "mac", "status", "speed", "ip", "vlan")
@@ -41,18 +45,31 @@ class NwInventoryStore:
 
     Each entry: ``{"payload", "sig", "applied_sig", "applied_at", "result"}``. A device is
     due when its signature differs from the last one applied to NetBox, or when
-    the last apply is older than ``refresh_s`` (a slow heal of manual NetBox edits).
+    it was last applied before the most recent nightly heal time (3 AM Pacific),
+    which heals manual NetBox edits.
     """
 
-    def __init__(self, path: str, refresh_s: float = 86400.0,
-                 stale_batch: int = 200):
+    def __init__(self, path: str, heal_hour: int = 3, stale_batch: int = 500,
+                 clock=time.time):
         self.path = path
-        self.refresh_s = refresh_s
-        # Cap on unchanged devices re-applied per flush, so the daily heal
+        self.heal_hour = heal_hour
+        self._clock = clock
+        # Cap on unchanged devices re-applied per flush, so the nightly heal
         # trickles through instead of hitting NetBox all at once.
         self.stale_batch = stale_batch
+        # Heals only start for a 03:00 that falls after this process started,
+        # so a restart or deploy never triggers an immediate fleet-wide rewrite.
+        self._first_cutoff = self._heal_cutoff()
         self.entries: Dict[str, Dict[str, Any]] = {}
         self._load()
+
+    def _heal_cutoff(self) -> float:
+        """Epoch of the most recent heal time (``heal_hour``:00 Pacific)."""
+        pt = datetime.fromtimestamp(self._clock(), _HEAL_TZ)
+        cut = pt.replace(hour=self.heal_hour, minute=0, second=0, microsecond=0)
+        if cut > pt:
+            cut -= timedelta(days=1)
+        return cut.timestamp()
 
     def _load(self) -> None:
         try:
@@ -91,14 +108,15 @@ class NwInventoryStore:
         return (self.entries.get(key) or {}).get("result") or {}
 
     def due(self) -> List[Tuple[str, Dict[str, Any]]]:
-        """Records that need writing to NetBox: changed, or past the refresh age.
-        Changed records (renames, new data) come first so a routine hourly refresh
-        of thousands of unchanged devices never delays them."""
-        now = time.time()
+        """Records that need writing to NetBox: changed, or not yet re-applied since
+        the nightly heal time. Changed records (renames, new data) come first so the
+        heal of thousands of unchanged devices never delays them."""
+        cutoff = self._heal_cutoff()
+        healing = cutoff > self._first_cutoff
         changed = [(k, e["payload"]) for k, e in self.entries.items()
                    if e["sig"] != e["applied_sig"]]
         stale = sorted(((k, e) for k, e in self.entries.items()
-                        if e["sig"] == e["applied_sig"] and now - e["applied_at"] >= self.refresh_s),
+                        if healing and e["sig"] == e["applied_sig"] and e["applied_at"] < cutoff),
                        key=lambda ke: ke[1]["applied_at"])[:self.stale_batch]
         return changed + [(k, e["payload"]) for k, e in stale]
 
