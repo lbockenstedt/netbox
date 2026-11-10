@@ -258,13 +258,17 @@ def test_assign_vm_primary_ip4_builds_vminterfaces_with_macs_and_all_ips():
     ]}
     eng._assign_vm_primary_ip4(vm_obj, vm, tenant=None)
 
-    # Two vminterfaces created, each with its MAC.
+    # Two vminterfaces created, each given its MAC as a dcim MAC record.
     vmi_calls = eng.nb.virtualization.interfaces.create.call_args_list
     assert len(vmi_calls) == 2
     assert vmi_calls[0].kwargs["name"] == "eth0"
-    assert vmi_calls[0].kwargs["mac_address"] == "aa:bb:cc:dd:ee:01"
     assert vmi_calls[1].kwargs["name"] == "eth1"
-    assert vmi_calls[1].kwargs["mac_address"] == "aa:bb:cc:dd:ee:02"
+    mac_calls = eng.nb.dcim.mac_addresses.create.call_args_list
+    assert [c.kwargs for c in mac_calls] == [
+        {"mac_address": "aa:bb:cc:dd:ee:01",
+         "assigned_object_type": "virtualization.vminterface", "assigned_object_id": 100},
+        {"mac_address": "aa:bb:cc:dd:ee:02",
+         "assigned_object_type": "virtualization.vminterface", "assigned_object_id": 101}]
     # Three IPs created (2 + 1), assigned to vminterfaces, MAC-tagged.
     ip_calls = eng.nb.ipam.ip_addresses.create.call_args_list
     assert len(ip_calls) == 3
@@ -294,7 +298,8 @@ def test_assign_vm_primary_ip4_reuses_existing_vminterface_by_name():
         tenant=None)
 
     eng.nb.virtualization.interfaces.create.assert_not_called()  # reused
-    assert existing.mac_address == "aa:bb:cc:dd:ee:01"             # MAC refreshed
+    # MAC refreshed as the vminterface's primary MAC record.
+    assert existing.primary_mac_address == eng.nb.dcim.mac_addresses.create.return_value.id
     existing.save.assert_called()
     ipk = eng.nb.ipam.ip_addresses.create.call_args.kwargs
     assert ipk["assigned_object_id"] == 100     # assigned to the reused vminterface

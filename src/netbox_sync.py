@@ -300,6 +300,31 @@ class SyncMixin:
         # Not a recognisable MAC: return the cleaned value unchanged.
         return m
 
+    def _set_iface_mac(self, iface: Any, mac: str,
+                       kind: str = "dcim.interface") -> None:
+        """Make ``mac`` the primary MAC of ``iface`` (``kind`` is
+        ``dcim.interface`` or ``virtualization.vminterface``). Raises on failure.
+
+        Why: NetBox 4.2+ keeps MACs as separate ``dcim.mac-addresses`` records,
+        and the interface's own ``mac_address`` field is read-only. Writing it
+        returns 200 but stores nothing, so every poll saw a "changed" MAC and
+        re-PATCHed every interface (about 3,600 no-op PATCHes an hour on
+        LM-NETBOX). Writes happen only when the MAC NetBox shows differs."""
+        # Nothing to write without a MAC, or when NetBox already shows this one.
+        if not mac or self._norm_mac(str(getattr(iface, "mac_address", "") or "")) == mac:
+            return
+        # Reuse a record already on this interface (left by an earlier write
+        # whose second step failed), else create one, so retries never pile up.
+        key = "interface_id" if kind == "dcim.interface" else "vminterface_id"
+        rec = next(iter(self.nb.dcim.mac_addresses.filter(mac_address=mac,
+                                                          **{key: iface.id})), None)
+        if rec is None:
+            rec = self.nb.dcim.mac_addresses.create(
+                mac_address=mac, assigned_object_type=kind, assigned_object_id=iface.id)
+        # Make it the interface's primary MAC.
+        iface.primary_mac_address = rec.id
+        iface.save()
+
     @staticmethod
     def _row_has_ip_or_mac(row: dict) -> bool:
         """Whether a raw NetBox device row carries a primary IP OR a mac_address
@@ -2265,7 +2290,7 @@ class SyncMixin:
         in place instead of duplicated. Create if missing, tagged
         ``discovered_from=<source>`` + ``nw_device_id=<id>``; set ``primary_ip4``
         from the device management address. Each incoming interface is upserted
-        by name (native ``mac_address``, ``status``, ``speed``) with a
+        by name (MAC via :meth:`_set_iface_mac`, ``speed``) with a
         reused/created IP attached. ``replace=True`` deletes interfaces we
         created (``nw_managed`` marker) whose name is absent from the incoming
         set — so NetBox tracks the live switch without touching manually-created
@@ -2572,12 +2597,10 @@ class SyncMixin:
                         # already has; creating it again only fails as a dupe.
                         match = self.nb.dcim.interfaces.get(device_id=dev_id,
                                                             name=ifname)
-                    # Not in NetBox: create it with status, MAC and speed.
+                    # Not in NetBox: create it with its speed (the MAC is set below).
                     if match is None:
                         ik: Dict[str, Any] = {"device": dev_id, "name": ifname,
                                               "type": "other"}
-                        if mac:
-                            ik["mac_address"] = mac
                         if speed_kbps > 0:
                             ik["speed"] = speed_kbps
                         # VLAN: best-effort tagged vlan (NetBox expects a list of
@@ -2591,21 +2614,13 @@ class SyncMixin:
                         except Exception as e:
                             logger.debug("sync_nw_device: tag new iface %s skipped: %s",
                                          ifname, e)
-                    # Exists: update only the fields that changed.
+                    # Exists: update the speed only when it changed.
                     else:
                         iface_obj = match
-                        changed = False
                         # NetBox interfaces have no ``status`` field: setting one made every
                         # interface look changed and PATCHed it on every poll.
-                        # NetBox returns MACs upper-case, so compare normalised.
-                        if mac and self._norm_mac(str(getattr(iface_obj, "mac_address", "") or "")) != mac:
-                            iface_obj.mac_address = mac
-                            changed = True
                         if speed_kbps > 0 and int(getattr(iface_obj, "speed", 0) or 0) != speed_kbps:
                             iface_obj.speed = speed_kbps
-                            changed = True
-                        # Save once if anything changed.
-                        if changed:
                             iface_obj.save()
                         # Mark an adopted interface as nw-managed (best-effort) so
                         # replace-delete can track it on later polls.
@@ -2618,6 +2633,14 @@ class SyncMixin:
                         except Exception as e:
                             logger.debug("sync_nw_device: mark adopted iface %s: %s",
                                          ifname, e)
+
+                    # Set the interface MAC (its own NetBox record). A failure is
+                    # logged; the interface and its IP still sync.
+                    try:
+                        self._set_iface_mac(iface_obj, mac)
+                    except Exception as e:
+                        logger.warning("[sync-error] nw-poll: MAC %s on %s failed: %s",
+                                       mac, ifname, e)
 
                     # Per-interface IP (reuse global record, attach to the iface).
                     if ip:
@@ -2977,10 +3000,16 @@ class SyncMixin:
 
         The IP goes through ``_reuse_or_create_ip``: NetBox enforces global IP
         uniqueness, so an existing record is reassigned instead of 400ing."""
-        # Reuse the endpoint's eth0 interface, or create it with the MAC.
+        # Reuse the endpoint's eth0 interface, or create it.
         nic = (self.nb.dcim.interfaces.get(device_id=devobj.id, name="eth0")
                or self.nb.dcim.interfaces.create(device=devobj.id, name="eth0",
-                                                 type="other", mac_address=mac))
+                                                 type="other"))
+        # Set its MAC (own NetBox record); a failure must not block the IP.
+        try:
+            self._set_iface_mac(nic, self._norm_mac(mac))
+        except Exception as e:
+            logger.warning("[sync-error] access-tracker: MAC %s on eth0 of %s failed: %s",
+                           mac, devobj.name, e)
         # Build the IP payload: address with mask, assigned to eth0.
         mask = self._mask_for_ip(ip, tenant)
         ip_kwargs: Dict[str, Any] = {
