@@ -8,6 +8,7 @@ IP addresses, devices, racks, sites, and multi-tenant assets in NetBox.
 import logging
 import asyncio
 import base64
+import contextvars
 import functools
 import hashlib
 # Async HTTP client for Kea.
@@ -26,7 +27,7 @@ try:
 except ImportError:
     from core.src.base_spoke import BaseSpoke
 # NetBox API engine and the rack-workbook parser.
-from netbox_engine import NetboxEngine
+from netbox_engine import NetboxEngine, run_as_background
 from netbox_autorack import parse_rack_name
 from netbox_nw_store import NwInventoryStore, device_key, signature
 from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
@@ -37,6 +38,8 @@ logger = logging.getLogger("NetboxSpoke")
 
 # Threads for blocking NetBox calls (see NetboxSpoke._run_sync).
 _NETBOX_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="netbox")
+# True while a background feed command runs; its NetBox requests are paced.
+_IN_BACKGROUND_COMMAND = contextvars.ContextVar("netbox_in_background_command", default=False)
 
 # Hub-level system commands handled by BaseControlPlane.handle_system_command
 # (shared /opt/lm/core). A spoke running a STALE core (older than the build that
@@ -472,6 +475,8 @@ class NetboxSpoke(BaseSpoke):
         # Own pool: NetBox calls queue on one HTTP slot, and must not take every
         # default-pool thread from the base spoke (exec, health, hub replies).
         loop = asyncio.get_running_loop()
+        if _IN_BACKGROUND_COMMAND.get():
+            fn = functools.partial(run_as_background, fn)
         return await loop.run_in_executor(_NETBOX_POOL, functools.partial(fn, *args, **kwargs))
 
     def _fetch_upload_bytes(self, download_url: str, token: str) -> bytes:
@@ -809,6 +814,8 @@ class NetboxSpoke(BaseSpoke):
         # Normalise and log the command name.
         normalized = command_type.upper()
         logger.info(f"NetBox command: {normalized}")
+        # Background feeds are paced so they can't overrun NetBox.
+        _IN_BACKGROUND_COMMAND.set(normalized in self._BACKGROUND_MUTATIONS)
 
         # A mutation could change the dropdown contents a picklist feeds — drop
         # the cache up front so the next read sees fresh data. (UPDATE_CONFIG
