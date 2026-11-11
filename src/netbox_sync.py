@@ -830,6 +830,19 @@ class SyncMixin:
                            "will 400 on the required site): %s", create_slug, e)
         return None
 
+    def _all_devices_cached(self) -> list:
+        """Every device (all tenants), reused for _GLOBAL_IDENTITY_TTL_S seconds.
+
+        Each NW device push needs this listing (~1 MB per 500 devices), and a
+        fleet poll pushes devices seconds apart. Code that creates a device sets
+        ``_global_devices_cache = None`` so the next lookup sees it."""
+        cached = getattr(self, "_global_devices_cache", None)
+        if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
+            return cached[1]
+        rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        self._global_devices_cache = (time.monotonic(), rows)
+        return rows
+
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
                                rows: Optional[list] = None,
@@ -848,12 +861,7 @@ class SyncMixin:
         # Reuse a listing fetched in the last _GLOBAL_IDENTITY_TTL_S seconds: every
         # NW device push calls this, and each fetch is ~1 MB per 500 devices.
         if rows is None:
-            cached = getattr(self, "_global_devices_cache", None)
-            if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
-                rows = cached[1]
-            else:
-                rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-                self._global_devices_cache = (time.monotonic(), rows)
+            rows = self._all_devices_cached()
         # Walk every device row and index it by MAC and by serial.
         for row in rows or []:
             # Normalised MAC from the custom field; existing (tenant-scoped) entries are kept.
@@ -2052,6 +2060,7 @@ class SyncMixin:
         # Canonical upper-case name, then create the device.
         name = self._nb_name(name)
         devobj = self.nb.dcim.devices.create(**self._device_create_kwargs(run, d, name))
+        self._global_devices_cache = None  # next listing must see it
         # Remember the device by hostname so a second operator-named port can join it.
         if d.hostname:
             run.created_by_name.setdefault(d.hostname.lower(), devobj.id)
@@ -2362,11 +2371,14 @@ class SyncMixin:
             # and updated in place instead of spawning an nw_device_id-keyed
             # duplicate of the same box.
             # List the tenant's devices (or all); failing here aborts with an ERROR.
+            # The cached global listing is filtered here instead of paging the
+            # tenant again on every push.
             try:
-                params: Dict[str, Any] = {"limit": 500}
+                rows = self._all_devices_cached()
                 if tenant:
-                    params["tenant_id"] = tenant.id  # ``tenant`` filters by slug
-                rows = self._api_get_all("/api/dcim/devices/", params)
+                    rows = [r for r in rows
+                            if isinstance(r.get("tenant"), dict)
+                            and r["tenant"].get("id") == tenant.id]
             except Exception as e:
                 return {"status": "ERROR",
                         "message": f"failed to list NetBox devices: {e}",
@@ -2460,6 +2472,7 @@ class SyncMixin:
                         ck["tenant"] = tenant.id
                     # Create the device.
                     devobj = self.nb.dcim.devices.create(**ck)
+                    self._global_devices_cache = None  # next listing must see it
                     # Tag ownership + link to the fleet id (best-effort cf PATCH).
                     try:
                         devobj.custom_fields = {
@@ -3171,6 +3184,7 @@ class SyncMixin:
                 # Create the switch; a failure is handled below by returning None.
                 try:
                     sw = self.nb.dcim.devices.create(**ck)
+                    self._global_devices_cache = None  # next listing must see it
                     # mgmt interface holding the NAS IP + primary_ip4 so the
                     # next batch finds this switch by IP (existing_by_ip path).
                     if sw:
@@ -3383,6 +3397,7 @@ class SyncMixin:
                     if tenant:
                         create_kwargs["tenant"] = tenant.id
                     devobj = self.nb.dcim.devices.create(**create_kwargs)
+                    self._global_devices_cache = None  # next listing must see it
                     # Ownership tag + topology custom fields (best-effort; same
                     # create-without-cf + best-effort PATCH lesson as sync_vms).
                     # Best-effort: a missing custom field in NetBox makes the save fail; that is
