@@ -69,6 +69,16 @@ def _engine_with(existing_rows, tenant_obj=None):
     return eng
 
 
+
+def _bulk_cf(eng, dev_id):
+    """Custom fields sent for ``dev_id`` in the batched devices.update() calls."""
+    cf = {}
+    for c in eng.nb.dcim.devices.update.call_args_list:
+        for item in c.args[0]:
+            if item["id"] == dev_id:
+                cf.update(item["custom_fields"])
+    return cf
+
 def test_sync_devices_refuses_unknown_tenant():
     eng = _engine_with(existing_rows=[], tenant_obj=None)
     res = eng.sync_devices(
@@ -774,7 +784,7 @@ def test_sync_devices_bare_hostname_match_adopts_in_place_assigns_ip():
     eng.nb.dcim.devices.create.assert_not_called()   # adopted, not duplicated
     # The bare device now has a primary IP + a stamped MAC.
     assert existing.primary_ip4 == 555
-    assert existing.custom_fields.get("mac_address") == "aa:bb:cc:dd:ee:ff"
+    assert _bulk_cf(eng, 77).get("mac_address") == "aa:bb:cc:dd:ee:ff"
 
 
 def test_sync_devices_hostname_match_against_non_bare_device_uniquifies():
@@ -1044,7 +1054,7 @@ def test_sync_devices_source_switch_cfs_stamped_on_refreshed_device():
         tenant_slug="lrb", replace=False, defaults={})
 
     assert res["status"] == "SUCCESS", res
-    cf = existing.custom_fields
+    cf = {**existing.custom_fields, **_bulk_cf(eng, 77)}
     assert cf.get("switch_name") == "core-sw2"
     assert cf.get("switch_ip") == "10.255.0.3"
     assert cf.get("switch_port") == "Gi1/0/24"   # updated from Gi1/0/1

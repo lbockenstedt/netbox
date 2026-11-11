@@ -63,6 +63,9 @@ _DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
 # Device custom fields that carry a MAC sighting ("last seen on switch X port
 # Y"). The incoming record uses the same names (``_incoming_device_record``).
 _SWITCH_CF_KEYS = ("switch_name", "switch_ip", "switch_port")
+# Matched-device custom-field updates go to NetBox in bulk PATCHes of this
+# many devices (still paced: each is one background request).
+_CF_BATCH = 50
 # Logical interfaces a MAC transits rather than plugs into (LAGs, VXLAN
 # tunnels, VLAN SVIs); same list as lm's nw_discovery_sync.
 _LOGICAL_PORT_RE = re.compile(
@@ -190,6 +193,10 @@ class _DeviceSyncRun:
     device_objs: Dict[Any, Any] = field(default_factory=dict)
     ip_objs: Dict[Any, Any] = field(default_factory=dict)
     deleted_ids: set = field(default_factory=set)  # devices deleted this batch
+    # Custom-field stamps: id → keys not sent yet, and id → every value this
+    # batch queued or sent (so a 2nd match of the device sees them).
+    cf_pending: Dict[Any, Dict[str, Any]] = field(default_factory=dict)
+    cf_written: Dict[Any, Dict[str, Any]] = field(default_factory=dict)
 
     def forget_device(self, dev_id: Any) -> None:
         """A write to this device FAILED (or may have): drop its Record so the
@@ -1282,6 +1289,7 @@ class SyncMixin:
                     self._sync_one_device(run, _IncomingDevice(key, rec))
                 except Exception as e:
                     self._note_upsert_failure(run, key, e)
+            self._flush_cf_stamps(run)
 
             # Build the summary result for the whole batch.
             return self._sync_devices_result(run, len(incoming))
@@ -1982,7 +1990,7 @@ class SyncMixin:
             # Get the live device Record and its current custom fields.
             devobj = self._device_record(run, row["id"])
             if devobj:
-                current = devobj.custom_fields or {}
+                current = {**(devobj.custom_fields or {}), **run.cf_written.get(row["id"], {})}
                 # Build the custom fields we want: MAC and switch sighting, when present.
                 wanted: Dict[str, Any] = {}
                 if d.mac:
@@ -2003,15 +2011,45 @@ class SyncMixin:
                 if d.serial and not str(getattr(devobj, "serial", "") or "").strip():
                     devobj.serial = d.serial
                     ser_changed = True
-                # Send the delta PATCH (it also carries the serial), or a plain save for a serial
-                # only.
-                if delta:
-                    self._save_cf_delta(devobj, delta)  # also sends the serial
-                elif ser_changed:
-                    devobj.save()
+                # A new serial goes out now with the delta; otherwise the delta
+                # is queued for the next bulk PATCH.
+                if ser_changed:
+                    if delta:
+                        self._save_cf_delta(devobj, delta)  # also sends the serial
+                    else:
+                        devobj.save()
+                elif delta:
+                    run.cf_pending.setdefault(row["id"], {}).update(delta)
+                    run.cf_written.setdefault(row["id"], {}).update(delta)
+                    if len(run.cf_pending) >= _CF_BATCH:
+                        self._flush_cf_stamps(run)
         except Exception as e:
             run.forget_device(row["id"])
             logger.debug("sync_devices: device cf stamp %s: %s", d.key, e)
+
+    def _flush_cf_stamps(self, run: "_DeviceSyncRun") -> None:
+        """Send the queued custom-field deltas as ONE bulk PATCH (NetBox merges
+        each device's ``custom_fields``). If NetBox rejects the batch (it is
+        all-or-nothing), retry device by device so one bad row can't drop the
+        rest. Best-effort, like the per-device PATCH it replaces."""
+        items = [{"id": i, "custom_fields": cf} for i, cf in run.cf_pending.items()
+                 if i not in run.deleted_ids]
+        run.cf_pending.clear()
+        if not items:
+            return
+        try:
+            self.nb.dcim.devices.update(items)
+            return
+        except Exception as e:
+            logger.info("sync_devices: bulk cf update of %d devices failed, retrying "
+                        "one by one: %s", len(items), e)
+        for item in items:
+            try:
+                self.nb.dcim.devices.update([item])
+            except Exception as e:
+                run.forget_device(item["id"])
+                run.cf_written.pop(item["id"], None)
+                logger.debug("sync_devices: device cf stamp %s: %s", item["id"], e)
 
     @staticmethod
     def _keeps_switch_sighting(run: "_DeviceSyncRun", row: dict, current: dict,
