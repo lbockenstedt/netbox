@@ -409,3 +409,33 @@ def test_nw_poll_sets_interface_mac_once_then_makes_zero_writes():
                               defaults=defaults)
     assert res2["errors"] == 0, res2
     assert _writes(f) == [], _writes(f)
+
+
+def test_nw_pushes_share_one_device_listing_and_see_new_devices():
+    # A fleet poll pushes switches seconds apart. Each push used to page the
+    # tenant's whole device list (plus the global one) -- ~90 full listings an
+    # hour on the live NetBox. Pushes now share one cached listing, and a
+    # device created by a push is still found by the next one.
+    f, _ = _world(n_owned=3, page_size=2)
+    eng = make_engine(NetboxEngine, f)
+    defaults = {"device_type": "discovered", "role": "discovered", "site": "lab"}
+
+    def push(nw_id, name, ip):
+        res = eng.sync_nw_device(device={"id": nw_id, "name": name, "address": ip},
+                                 interfaces=[], tenant_slug="t1", defaults=defaults)
+        assert res["errors"] == 0, res
+        return res["device_id"]
+
+    def device_listings():
+        return [x for x in _gets(f) if x[1].rstrip("/").endswith("/dcim/devices")
+                and "offset" not in str(x[2])]
+
+    first = push("nw-1", "sw1", "10.0.0.1")
+    f.log.clear()
+    assert push("nw-1", "sw1", "10.0.0.1") == first
+    push("nw-2", "sw2", "10.0.0.2")
+    for _ in range(3):
+        assert push("nw-2", "sw2", "10.0.0.2") is not None
+    assert len([d for d in f.db["devices"].values() if d["name"] in ("SW1", "SW2")]) == 2
+    # Two listings: the one after sw1's create, then the one after sw2's create.
+    assert len(device_listings()) == 2, device_listings()

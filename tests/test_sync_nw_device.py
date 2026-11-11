@@ -336,17 +336,20 @@ def test_sync_nw_device_keeps_auto_name_when_poll_has_only_ip_name():
     assert rec.name == "DEVICE-001A1E042F00"
 
 
-def test_sync_nw_device_filters_tenant_devices_by_tenant_id():
-    # NetBox's ``tenant`` filter takes a slug; a numeric id there is a 400.
+def test_sync_nw_device_ignores_other_tenants_devices():
+    # The shared all-tenant listing is filtered to the push's tenant by id: a
+    # device with the same fleet id in another tenant is not matched.
     eng = _engine()
     eng._resolve_tenant_ci = MagicMock(return_value=MagicMock(id=7, slug="lrb"))
+    eng._api_get_all = MagicMock(return_value=[
+        {"id": 50, "name": "SW1", "tenant": {"id": 8, "slug": "other"},
+         "custom_fields": {"nw_device_id": "nw-1"}}])
     eng.nb.dcim.devices.create = MagicMock(return_value=_Obj(id=100, name="sw1"))
-    eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="lrb",
-                       defaults=_DEFAULTS)
-    params = [c.args[1] for c in eng._api_get_all.call_args_list
-              if "dcim/devices" in c.args[0]]
-    assert params and params[0].get("tenant_id") == 7
-    assert "tenant" not in params[0]
+    res = eng.sync_nw_device(device=_DEV, interfaces=[], tenant_slug="lrb",
+                             defaults=_DEFAULTS)
+    eng.nb.dcim.devices.create.assert_called_once()
+    assert eng.nb.dcim.devices.create.call_args.kwargs["tenant"] == 7
+    assert res["device_id"] == 100
 
 
 def test_sync_nw_device_create_takes_type_from_model_and_role_from_object_type():
