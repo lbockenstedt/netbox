@@ -579,6 +579,9 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_AUTORACK_SWEEP", "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP",
         "NETBOX_NORMALIZE_DEVICE_NAMES",
     })
+    # lm core caps these at half the spoke's command slots, so IPAM reads
+    # (racks, prefixes, IPs) never queue behind a long sync or sweep.
+    BACKGROUND_COMMANDS = _BACKGROUND_MUTATIONS
 
     # ── Cert custodian ──────────────────────────────────────────────────────
     def _cert_fernet(self):
