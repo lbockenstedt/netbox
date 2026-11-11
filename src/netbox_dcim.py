@@ -669,6 +669,7 @@ class DcimMixin:
                 try:
                     # Create, tag as LLDP-discovered and journal it.
                     rec = self.nb.dcim.devices.create(**ck)
+                    self._global_devices_cache = None  # next listing must see it
                     rec.custom_fields = {"discovered_from": "LLDP", **({"mac_address": macs[0]} if macs else {})}
                     rec.save()
                     self._journal("dcim.device", rec.id, "lldp", note=f"created from LLDP neighbour {name}")
@@ -992,6 +993,7 @@ class DcimMixin:
                 face=face,
                 status=status,
             )
+            self._global_devices_cache = None  # next listing must see it
             # New device id.
             return {"status": "SUCCESS", "device_id": device.id, "name": name, "rack": rack_name, "unit": rack_unit}
         except Exception as e:
@@ -1078,6 +1080,7 @@ class DcimMixin:
                 create_kwargs["tenant"] = tenant.id
             # Create the device.
             device = self.nb.dcim.devices.create(**create_kwargs)
+            self._global_devices_cache = None  # next listing must see it
 
             # Attach the IP, if given.
             attached_ip = ""
@@ -2297,6 +2300,7 @@ class DcimMixin:
                         else:
                             # New device: create it.
                             device = self.nb.dcim.devices.create(**payload)
+                            self._global_devices_cache = None  # next listing must see it
                             devices_created += 1
 
                         # ── mgmt interface + IP (mirror claim_device) ──────────
