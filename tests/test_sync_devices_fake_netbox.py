@@ -231,6 +231,34 @@ def test_other_tenants_mac_is_adopted_and_tenant_rows_win():
     assert len(f.db["devices"]) == 1
 
 
+def test_other_tenants_device_keeps_its_switch_sighting():
+    # Live churn: tenants ra and dxp both see one MAC; each push wrote its own
+    # switch/port onto the single device, flipping it twice every cycle.
+    f, _ = _world()
+    mac = "aa:bb:cc:00:02:02"
+    _add_device(f, 300, "FW1", mac, "", "",
+                {"mac_address": mac, "switch_name": "edge", "switch_port": "1/1/14"},
+                tenant_id=2)
+    _sync(f, [{"ip": "", "mac": mac, "hostname": "", "source_switch_name": "peer",
+               "source_switch_port": "1/1/3"}])
+    cf = f.db["devices"][300]["custom_fields"]
+    assert (cf["switch_name"], cf["switch_port"]) == ("edge", "1/1/14")
+    assert not [w for w in _writes(f) if "switch_" in str(w[3])]
+
+
+def test_physical_port_is_not_replaced_by_a_logical_one():
+    f, feed = _world(n_owned=1)
+    f.db["devices"][100]["custom_fields"].update(switch_name="edge", switch_port="1/1/14")
+    for port in ("lag255", "vxlan1(10.0.0.5)", "vlan10"):
+        feed[0].update(source_switch_name="peer", source_switch_port=port)
+        _sync(f, feed)
+        assert f.db["devices"][100]["custom_fields"]["switch_port"] == "1/1/14", port
+    # A move to another physical port is still recorded.
+    feed[0].update(source_switch_name="edge2", source_switch_port="1/1/2")
+    _sync(f, feed)
+    assert f.db["devices"][100]["custom_fields"]["switch_port"] == "1/1/2"
+
+
 def test_untenanted_device_holding_the_ip_is_matched_and_adopted():
     # A device that lost its tenant still owns the tenant's IP: an IP-only
     # sighting updates it (and tenants it) instead of creating a duplicate
