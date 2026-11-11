@@ -134,3 +134,25 @@ def test_apply_failed_removal_clears_state():
     sp._remove_scope_from_kea = AsyncMock(return_value=False)
     _run(sp._kea_apply_scopes([]))
     assert sp._kea_synced == {}    # forgotten → full-resync next tick
+
+
+def test_stop_background_loops_cancels_kea_and_nw_flush_loops():
+    # The agent calls stop_background_loops when it reloads the role after an
+    # update; the old loops must stop, not keep running the old code.
+    async def scenario():
+        sp = object.__new__(NetboxSpoke)
+        sp._sync_task = None
+        sp._nw_flush_task = None
+        sp._kea_sync_loop = lambda: asyncio.sleep(3600)
+        sp._nw_flush_loop = lambda: asyncio.sleep(3600)
+        sp._kea_synced = {}
+        await sp.start_kea_sync()
+        await sp.start_nw_flush()
+        kea, flush = sp._sync_task, sp._nw_flush_task
+        await sp.stop_background_loops()
+        return kea, flush, sp
+
+    kea, flush, sp = _run(scenario())
+    assert kea.cancelled() and flush.cancelled()
+    assert sp._sync_task is None and sp._nw_flush_task is None
+    assert sp.stop_background_loops() is None
