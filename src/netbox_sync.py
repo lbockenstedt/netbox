@@ -2024,14 +2024,19 @@ class SyncMixin:
         devices a day, which is most of NetBox's write load. So:
 
         * another tenant's device keeps the location its own tenant recorded;
-        * a physical port is never replaced by a logical one (LAG, VXLAN, SVI).
+        * a physical port is never replaced by a logical one (LAG, VXLAN, SVI);
+        * the same logical port seen on another switch is not a move: both
+          peers of an MC-LAG/VSX pair learn the MAC on lag33, and a switch
+          reached on a second address reports the same port.
         """
         row_tid = (row.get("tenant") or {}).get("id")
         if run.tenant and row_tid and row_tid != run.tenant.id:
             return True
         have = str(current.get("switch_port") or "")
         new = str(d.rec.get("switch_port") or "")
-        return bool(have) and not _LOGICAL_PORT_RE.match(have) and bool(_LOGICAL_PORT_RE.match(new))
+        if not have or not _LOGICAL_PORT_RE.match(new):
+            return False
+        return have == new or not _LOGICAL_PORT_RE.match(have)
 
     def _rename_or_touch_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                                         row: dict) -> None:
