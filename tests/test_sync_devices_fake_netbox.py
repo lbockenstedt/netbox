@@ -138,9 +138,9 @@ def test_custom_field_patch_sends_only_the_changed_key():
     f, feed = _world(n_owned=1)
     feed[0]["source_switch_port"] = "1/1/7"
     _sync(f, feed)
-    dev_patches = [x for x in _writes(f) if x[1] == "/api/dcim/devices/100/"]
-    assert dev_patches == [("PATCH", "/api/dcim/devices/100/", "",
-                            {"custom_fields": {"switch_port": "1/1/7"}})]
+    dev_patches = [x for x in _writes(f) if x[1].startswith("/api/dcim/devices/")]
+    assert dev_patches == [("PATCH", "/api/dcim/devices/", "",
+                            [{"id": 100, "custom_fields": {"switch_port": "1/1/7"}}])]
     assert f.db["devices"][100]["custom_fields"]["discovered_from"] == "opnsense"
 
 
@@ -273,6 +273,28 @@ def test_same_lag_on_the_peer_switch_is_not_a_move():
     feed[0].update(source_switch_port="lag34")
     _sync(f, feed)
     assert f.db["devices"][100]["custom_fields"]["switch_port"] == "lag34"
+
+
+def test_switch_stamps_go_out_in_paced_bulk_batches():
+    # 120 devices that each moved port: 3 bulk PATCHes (50+50+20), not 120.
+    f, feed = _world(n_owned=120, page_size=500)
+    for r in feed:
+        r["source_switch_port"] = "1/1/9"
+    _sync(f, feed)
+    patches = [x for x in _writes(f) if x[0] == "PATCH"]
+    assert [len(x[3]) for x in patches] == [50, 50, 20]
+    assert all(f.db["devices"][100 + i * 3]["custom_fields"]["switch_port"] == "1/1/9"
+               for i in range(120))
+
+
+def test_a_rejected_bulk_batch_is_retried_device_by_device():
+    f, feed = _world(n_owned=3)
+    for r in feed:
+        r["source_switch_port"] = "1/1/9"
+    f.fail = {("PATCH", "devices", 103)}
+    _sync(f, feed)
+    cf = {i: f.db["devices"][i]["custom_fields"].get("switch_port") for i in (100, 103, 106)}
+    assert cf == {100: "1/1/9", 103: None, 106: "1/1/9"}
 
 
 def test_untenanted_device_holding_the_ip_is_matched_and_adopted():
