@@ -385,8 +385,13 @@ class DcimMixin:
         return (DcimMixin._name_of(device), port or "")
 
     def _cable_devices(self, dev_a, a_port: str, dev_b, b_port: str,
-                       status: str = "connected") -> Dict[str, Any]:
-        """Cable two resolved NetBox devices port-to-port (see :meth:`sync_cable`)."""
+                       status: str = "connected",
+                       port_index: Optional[Dict[Any, Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Cable two resolved NetBox devices port-to-port (see :meth:`sync_cable`).
+
+        ``port_index`` (device id -> {port name: interface}) is shared across a
+        batch: each device's interfaces are listed once instead of one lookup
+        per port."""
         # Display names for messages.
         a_device = self._name_of(dev_a)
         b_device = self._name_of(dev_b)
@@ -396,8 +401,14 @@ class DcimMixin:
             # Helper: get or create a port on a device.
             def _find_or_create_iface(dev, port_name):
                 """Interface ``port_name`` on ``dev``, created if missing."""
-                # Existing interface.
-                iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
+                # Existing interface: from the batch index, else one lookup.
+                if port_index is not None:
+                    if dev.id not in port_index:
+                        port_index[dev.id] = {
+                            i.name: i for i in self.nb.dcim.interfaces.filter(device_id=dev.id)}
+                    iface = port_index[dev.id].get(port_name)
+                else:
+                    iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
                 if iface:
                     return iface
                 # Otherwise create it.
@@ -410,15 +421,10 @@ class DcimMixin:
 
             def _connected_device_port(iface):
                 """(device_name, port_name) of whatever an interface is
-                already cabled to, or ``None`` if it's unconnected."""
-                # Re-read the interface and return its cable peer.
-                try:
-                    fresh = self.nb.dcim.interfaces.get(iface.id)
-                    return self._iface_cable_peer(fresh) if fresh else None
-                except Exception as e:
-                    # Check failed: treat as unconnected.
-                    logger.debug("sync_cable: connected-endpoint check failed: %s", e)
-                    return None
+                already cabled to, or ``None`` if it's unconnected. The
+                interface was just read (or created), so it carries its
+                cable and peers; no re-read."""
+                return self._iface_cable_peer(iface)
 
             # Port A already cabled: same peer is a no-op; a different one is left alone.
             existing = _connected_device_port(iface_a)
@@ -449,6 +455,10 @@ class DcimMixin:
                 b_terminations=[{"object_type": "dcim.interface",
                                  "object_id": iface_b.id}],
                 status=status or "connected")
+            # The indexed interfaces of both devices no longer show this cable.
+            if port_index is not None:
+                port_index.pop(dev_a.id, None)
+                port_index.pop(dev_b.id, None)
             # Done.
             return {"status": "SUCCESS",
                     "message": f"cabled {a_device}:{a_port} <-> {b_device}:{b_port}"}
@@ -531,9 +541,10 @@ class DcimMixin:
                     "renamed": 0, "errors": 0}
         messages = []
 
-        # List every device.
+        # List every device (shared cached listing; matched devices are
+        # rebuilt from their row, so it is only used for matching).
         try:
-            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+            rows = self._all_devices_cached()
         except Exception as e:
             # Listing failed.
             return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}", **counters}
@@ -617,8 +628,8 @@ class DcimMixin:
             if row:
                 # Update failures are only logged.
                 try:
-                    # Fetch the record; set the MAC if it has none.
-                    rec = self.nb.dcim.devices.get(row["id"])
+                    # Rebuild the record from its listed row; set the MAC if it has none.
+                    rec = self._hydrate_record(row, self.nb.dcim.devices)
                     if rec and macs and not (rec.custom_fields or {}).get("mac_address"):
                         cf = dict(rec.custom_fields or {})
                         cf["mac_address"] = macs[0]
@@ -697,7 +708,8 @@ class DcimMixin:
                 cache[key] = rec
             return rec
 
-        # Cable each link.
+        # Cable each link; each device's interfaces are listed once.
+        port_index: Dict[Any, Dict[str, Any]] = {}
         for link in links:
             # Skip malformed links.
             if not isinstance(link, dict):
@@ -719,7 +731,7 @@ class DcimMixin:
                 continue
 
             # Cable them and count the outcome.
-            res = self._cable_devices(ra, a_port, rb, b_port)
+            res = self._cable_devices(ra, a_port, rb, b_port, port_index=port_index)
             st = res.get("status")
             if st == "SUCCESS":
                 counters["cabled"] += 1
