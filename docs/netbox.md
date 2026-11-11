@@ -185,6 +185,9 @@ backend), `TENANT` the tenant group. A trailing `R` on the RU means **rear**.
   racked immediately**, then runs an autorack sweep. Device polls run every 6 h
   by default, so a rename typically shows up racked within one flush after the
   next poll (the first rename test took about 15-45 minutes end to end).
+  When the agent reloads the role (every netbox update), it calls
+  `stop_background_loops()`, which cancels this flush loop and the Kea sync loop
+  so the old code does not keep running next to the new.
 - **Report.** `GET /api/netbox/autorack` (tenant-scoped) feeds **NetBox → Rack
   Placement**: conflicts and "cannot auto-rack" entries with tenant / wanted /
   current / mismatch. It serves the cached report (the first sweep runs in the
