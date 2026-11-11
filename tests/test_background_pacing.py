@@ -76,3 +76,13 @@ def test_only_background_commands_run_paced():
         read = await sp._handle_command("NETBOX_GET_TENANTS", {})
         assert (sync["paced"], read["paced"]) == (True, False)
     asyncio.run(run())
+
+
+def test_store_and_ack_nw_device_push_is_not_queued_as_background():
+    # SYNC_NW_DEVICE only stores the device and acks; in the capped background
+    # lane it waited behind slow syncs until the hub gave up and it was dropped.
+    lane = spoke_mod.NetboxSpoke.BACKGROUND_COMMANDS
+    assert "NETBOX_SYNC_NW_DEVICE" not in lane
+    assert "NETBOX_SYNC_DEVICES" in lane
+    # Its immediate (write-now) path is still paced against NetBox.
+    assert "NETBOX_SYNC_NW_DEVICE" in spoke_mod.NetboxSpoke._BACKGROUND_MUTATIONS
