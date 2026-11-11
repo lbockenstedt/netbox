@@ -63,6 +63,11 @@ _DNS_NAME_RE = re.compile(r"^([0-9A-Za-z_-]+|\*)(\.[0-9A-Za-z_-]+)*\.?$")
 # Device custom fields that carry a MAC sighting ("last seen on switch X port
 # Y"). The incoming record uses the same names (``_incoming_device_record``).
 _SWITCH_CF_KEYS = ("switch_name", "switch_ip", "switch_port")
+# Logical interfaces a MAC transits rather than plugs into (LAGs, VXLAN
+# tunnels, VLAN SVIs); same list as lm's nw_discovery_sync.
+_LOGICAL_PORT_RE = re.compile(
+    r"^(lag|po\d|port-channel|trk|ae\d|bond|vxlan|nve|vlan|vl\d|irb|bvi|tunnel)",
+    re.IGNORECASE)
 
 # The placeholder type/role slug for a device nobody has identified yet.
 _GENERIC_SLUG = "discovered"
@@ -1982,9 +1987,10 @@ class SyncMixin:
                 wanted: Dict[str, Any] = {}
                 if d.mac:
                     wanted["mac_address"] = d.mac
-                for cf_key in _SWITCH_CF_KEYS:
-                    if d.rec.get(cf_key):
-                        wanted[cf_key] = d.rec[cf_key]
+                if not self._keeps_switch_sighting(run, row, current, d):
+                    for cf_key in _SWITCH_CF_KEYS:
+                        if d.rec.get(cf_key):
+                            wanted[cf_key] = d.rec[cf_key]
                 # Owned devices also take whitelisted, non-sink-managed per-record fields.
                 if we_own:
                     for ck, cv in (d.rec.get("custom_fields") or {}).items():
@@ -2006,6 +2012,26 @@ class SyncMixin:
         except Exception as e:
             run.forget_device(row["id"])
             logger.debug("sync_devices: device cf stamp %s: %s", d.key, e)
+
+    @staticmethod
+    def _keeps_switch_sighting(run: "_DeviceSyncRun", row: dict, current: dict,
+                               d: "_IncomingDevice") -> bool:
+        """True when this record must not move the device's switch/port.
+
+        A MAC is seen by every switch on its path, and several tenants' nw
+        agents push the same MAC to the one NetBox device. Each push writing
+        its own view flipped switch_name/switch_port twice a cycle on ~5,500
+        devices a day, which is most of NetBox's write load. So:
+
+        * another tenant's device keeps the location its own tenant recorded;
+        * a physical port is never replaced by a logical one (LAG, VXLAN, SVI).
+        """
+        row_tid = (row.get("tenant") or {}).get("id")
+        if run.tenant and row_tid and row_tid != run.tenant.id:
+            return True
+        have = str(current.get("switch_port") or "")
+        new = str(d.rec.get("switch_port") or "")
+        return bool(have) and not _LOGICAL_PORT_RE.match(have) and bool(_LOGICAL_PORT_RE.match(new))
 
     def _rename_or_touch_matched_device(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
                                         row: dict) -> None:
