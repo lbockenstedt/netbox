@@ -31,7 +31,7 @@ def _engine(rows, recs):
     eng._resolve_tenant_ci = MagicMock(return_value=MagicMock(id=1))
     eng.cabled = []
 
-    def cable(a, a_port, b, b_port, status="connected"):
+    def cable(a, a_port, b, b_port, status="connected", port_index=None):
         eng.cabled.append((a.name, a_port, b.name, b_port))
         return {"status": "SUCCESS"}
 
