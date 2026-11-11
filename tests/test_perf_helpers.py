@@ -222,6 +222,26 @@ def test_global_identity_listing_is_cached_between_calls(monkeypatch):
     assert eng._api_get_all.call_count == 2
 
 
+def test_concurrent_device_listing_misses_fetch_once():
+    # Several commands missing the cache at the same moment used to each page
+    # every device; now one fetches and the rest reuse its listing.
+    import threading
+    import time as _time
+
+    eng = NetboxEngine.__new__(NetboxEngine)
+
+    def slow_listing(*_a, **_k):
+        _time.sleep(0.05)
+        return [{"id": 1}]
+    eng._api_get_all = MagicMock(side_effect=slow_listing)
+    threads = [threading.Thread(target=eng._all_devices_cached) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert eng._api_get_all.call_count == 1
+
+
 def test_nw_store_submits_dedupes_and_tracks_due(tmp_path):
     from netbox_nw_store import NwInventoryStore
     path = str(tmp_path / "nw.json")
