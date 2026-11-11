@@ -581,7 +581,10 @@ class NetboxSpoke(BaseSpoke):
     })
     # lm core caps these at half the spoke's command slots, so IPAM reads
     # (racks, prefixes, IPs) never queue behind a long sync or sweep.
-    BACKGROUND_COMMANDS = _BACKGROUND_MUTATIONS
+    # SYNC_NW_DEVICE is left out: it only stores the device on disk and acks
+    # at once (the flush loop writes NetBox), so queueing it behind slow
+    # syncs just made the hub give up on it.
+    BACKGROUND_COMMANDS = _BACKGROUND_MUTATIONS - {"NETBOX_SYNC_NW_DEVICE"}
 
     # ── Cert custodian ──────────────────────────────────────────────────────
     def _cert_fernet(self):
