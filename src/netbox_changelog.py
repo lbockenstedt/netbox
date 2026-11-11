@@ -210,7 +210,7 @@ class ChangelogMixin:
             updates["assigned_object_type"] = iface_type
             updates["assigned_object_id"] = iface_id
         # Set the tenant when it differs.
-        if tenant and getattr(ipobj, "tenant", None) != tenant.id:
+        if tenant and _ref_id(getattr(ipobj, "tenant", None)) != tenant.id:
             updates["tenant"] = tenant.id
         # Set dns_name from a real hostname ("unknown" is a placeholder, not a name).
         if hostname and hostname.lower() != "unknown" and \
