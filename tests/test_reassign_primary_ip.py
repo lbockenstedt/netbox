@@ -100,3 +100,16 @@ def test_ip_that_is_not_the_old_parents_primary_is_left_alone():
 
     assert eng._reassign_ip(_ip(), 1322, None, "", "", "vm-sync", "a", VMIF)
     dev.save.assert_not_called()
+
+
+def test_unchanged_ip_is_not_patched():
+    # ipobj.tenant is a nested Record; comparing it to tenant.id never matched,
+    # so every sync PATCHed the same tenant onto every reused IP.
+    log = []
+    eng = _engine(log)
+    ip = _ip(iface_id=1322)
+    ip.tenant = SimpleNamespace(id=8)
+    ip.dns_name = "host1"
+    assert eng._reassign_ip(ip, 1322, SimpleNamespace(id=8), "host1", "", "nw",
+                            "10.0.0.5/24")
+    assert log == []
