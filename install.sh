@@ -654,6 +654,13 @@ NBCFG
             systemctl restart netbox netbox-rq 2>/dev/null || true
         fi
     fi
+    # Changelog: discovery syncs write thousands of rows an hour; NetBox's
+    # 90-day default grew the table past 1M rows. Keep 30 days unless set.
+    if ! grep -q "^CHANGELOG_RETENTION" "$NB_CFG"; then
+        printf '\n# Days of change log kept (housekeeping prunes older rows).\nCHANGELOG_RETENTION = 30\n' >> "$NB_CFG"
+        ok "CHANGELOG_RETENTION = 30 added to configuration.py"
+        systemctl restart netbox netbox-rq 2>/dev/null || true
+    fi
 
     # ── Migrations + static files ────────────────────────────
     step "Running database migrations"
