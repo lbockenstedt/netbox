@@ -212,6 +212,19 @@ class NetboxSpoke(BaseSpoke):
             self._nw_flush_task.cancel()
             self._nw_flush_task = None
 
+    def stop_background_loops(self):
+        """Cancel the Kea sync and NW flush loops; returns a future to await.
+
+        The agent calls this when it unloads or reloads the role. Without it,
+        every netbox update left the old loops running the old code next to the
+        new ones, repeating NetBox writes and full device listings."""
+        tasks = [t for t in (self._sync_task, self._nw_flush_task) if t]
+        self._sync_task = None
+        self._nw_flush_task = None
+        for t in tasks:
+            t.cancel()
+        return asyncio.gather(*tasks, return_exceptions=True) if tasks else None
+
     async def _nw_apply(self, key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Write one stored device to NetBox; mark it applied when it had no errors."""
         sig = signature(payload)
