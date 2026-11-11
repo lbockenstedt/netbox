@@ -4,6 +4,7 @@ import ipaddress
 # re matches placeholder names, MAC formats and DNS-name validity.
 import re
 # time.monotonic ages the global-identity device listing cache.
+import threading
 import time
 # logging reports sync progress and best-effort failures.
 import logging
@@ -29,6 +30,8 @@ logger = logging.getLogger("NetboxEngine")
 
 # How long a global device listing is reused for the MAC/serial identity index.
 _GLOBAL_IDENTITY_TTL_S = 60
+# One fetch at a time: concurrent callers that miss the cache wait and reuse it.
+_global_devices_lock = threading.Lock()
 
 
 # Auto-generated names the create branch mints when a record has no hostname
@@ -836,12 +839,13 @@ class SyncMixin:
         Each NW device push needs this listing (~1 MB per 500 devices), and a
         fleet poll pushes devices seconds apart. Code that creates a device sets
         ``_global_devices_cache = None`` so the next lookup sees it."""
-        cached = getattr(self, "_global_devices_cache", None)
-        if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
-            return cached[1]
-        rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-        self._global_devices_cache = (time.monotonic(), rows)
-        return rows
+        with _global_devices_lock:
+            cached = getattr(self, "_global_devices_cache", None)
+            if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
+                return cached[1]
+            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+            self._global_devices_cache = (time.monotonic(), rows)
+            return rows
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
@@ -2791,7 +2795,7 @@ class SyncMixin:
     def list_stub_devices(self) -> Dict[str, Any]:
         """Devices another feeder made that no poll has identified: no serial, a
         primary IP, not a polled network device, not a management controller."""
-        rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        rows = self._all_devices_cached()
         out = []
         for r in rows or []:
             cf = r.get("custom_fields") or {}
