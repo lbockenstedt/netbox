@@ -259,6 +259,22 @@ def test_physical_port_is_not_replaced_by_a_logical_one():
     assert f.db["devices"][100]["custom_fields"]["switch_port"] == "1/1/2"
 
 
+def test_same_lag_on_the_peer_switch_is_not_a_move():
+    # VSX/MC-LAG: both peers learn the MAC on lag33 and cycles alternate.
+    f, feed = _world(n_owned=1)
+    f.db["devices"][100]["custom_fields"].update(
+        switch_name="SPSW-1-1", switch_ip="10.0.4.12", switch_port="lag33")
+    feed[0].update(source_switch_name="SPSW-1-2", source_switch_ip="10.130.6.3",
+                   source_switch_port="lag33")
+    _sync(f, feed)
+    cf = f.db["devices"][100]["custom_fields"]
+    assert (cf["switch_name"], cf["switch_ip"]) == ("SPSW-1-1", "10.0.4.12")
+    # A different LAG, or a physical port, is still recorded.
+    feed[0].update(source_switch_port="lag34")
+    _sync(f, feed)
+    assert f.db["devices"][100]["custom_fields"]["switch_port"] == "lag34"
+
+
 def test_untenanted_device_holding_the_ip_is_matched_and_adopted():
     # A device that lost its tenant still owns the tenant's IP: an IP-only
     # sighting updates it (and tenants it) instead of creating a duplicate
