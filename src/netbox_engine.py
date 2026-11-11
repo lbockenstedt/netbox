@@ -13,6 +13,9 @@ import pynetbox
 import logging
 # threading provides the semaphore that serialises direct HTTP requests.
 import threading
+# Pacing of background requests (see _background_turn).
+import contextlib
+import time
 # Type hints.
 from typing import Any, Dict, Optional
 
@@ -25,6 +28,48 @@ import requests
 # many-page device walk: at most two requests run at once.
 _netbox_http_sem = threading.Semaphore(1)
 _netbox_bulk_sem = threading.Semaphore(1)
+
+# Background feeds (discovery syncs, sweeps; see NetboxSpoke._BACKGROUND_MUTATIONS)
+# must leave NetBox room for people and other modules, whoever sends them, on
+# whatever schedule, however big. Background requests take turns through one
+# gate, and each turn waits as long as the previous background request took.
+# So all background work together uses at most about half of NetBox, and slows
+# down by itself when NetBox is slow. The wait happens before the HTTP slot is
+# taken, so user requests never queue behind it.
+_background = threading.local()
+_background_gate = threading.Lock()
+_background_next = 0.0
+_BACKGROUND_MAX_WAIT_S = 30.0
+
+
+def run_as_background(fn, *args, **kwargs):
+    """Run ``fn`` in this thread with its NetBox requests paced (see above)."""
+    _background.on = True
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _background.on = False
+
+
+@contextlib.contextmanager
+def _background_turn():
+    """One paced NetBox request for a background thread; no-op otherwise."""
+    global _background_next
+    if not getattr(_background, "on", False) or getattr(_background, "in_turn", False):
+        yield
+        return
+    with _background_gate:
+        time.sleep(max(0.0, _background_next - time.monotonic()))
+        _background.in_turn = True
+        start = time.monotonic()
+        try:
+            yield
+        finally:
+            _background.in_turn = False
+            took = time.monotonic() - start
+            _background_next = time.monotonic() + min(took, _BACKGROUND_MAX_WAIT_S)
+
+
 _BULK_PATHS = frozenset({"/api/dcim/devices/", "/api/dcim/interfaces/",
                          "/api/virtualization/virtual-machines/",
                          "/api/virtualization/interfaces/", "/api/dcim/cables/"})
@@ -57,8 +102,9 @@ class _DefaultTimeoutHTTPAdapter(requests.adapters.HTTPAdapter):
         # Only fill in a timeout when the caller did not choose one.
         if kw.get("timeout") is None:
             kw["timeout"] = self._timeout
-        # Hand the request to the normal adapter.
-        return super().send(request, **kw)
+        # Hand the request to the normal adapter (paced for background work).
+        with _background_turn():
+            return super().send(request, **kw)
 
 def get_version():
     """Return this spoke's version string from the VERSION file, or "unknown"."""
@@ -251,7 +297,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         # Build the absolute URL from the base and the API path.
         url = self.url.rstrip("/") + path
         # One request at a time against NetBox (see _netbox_http_sem).
-        with _netbox_http_sem:
+        with _background_turn(), _netbox_http_sem:
             resp = self.nb.http_session.get(url, params=params or {},
                                             timeout=_NETBOX_API_TIMEOUT)
         # Turn HTTP errors into an exception with status and path for the caller's log.
@@ -280,7 +326,7 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         # Fetch at most max_pages pages to avoid an endless loop on a bad "next" link.
         sem = _netbox_bulk_sem if path in _BULK_PATHS else _netbox_http_sem
         for _ in range(max_pages):
-            with sem:
+            with _background_turn(), sem:
                 # Later pages: follow NetBox's absolute "next" URL (already includes offset).
                 if next_url:
                     resp = self.nb.http_session.get(next_url, timeout=_NETBOX_API_TIMEOUT)
