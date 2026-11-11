@@ -185,3 +185,45 @@ def test_cable_without_peer_detail_still_counts_as_cabled():
     assert NetboxEngine._iface_cable_peer(iface) == ("(unknown)", "")
     iface.cable = None
     assert NetboxEngine._iface_cable_peer(iface) is None
+
+
+def test_batch_lists_each_devices_ports_once_and_never_rereads():
+    # Live load: an LLDP push of ~800 links did a name lookup per port plus a
+    # re-GET of each interface. A batch lists each device's ports once.
+    sw1, sw2 = _device("SW1", 1), _device("SW2", 2)
+    ports = {1: [], 2: []}
+    for p in range(1, 4):
+        a = _iface(100 + p, connected_to=("SW2", f"1/1/{p}"))
+        a.name = f"1/1/{p}"
+        b = _iface(200 + p, connected_to=("SW1", f"1/1/{p}"))
+        b.name = f"1/1/{p}"
+        ports[1].append(a)
+        ports[2].append(b)
+    eng = _engine(devices={}, interfaces={})
+    eng.nb.dcim.interfaces.filter.side_effect = lambda device_id: list(ports[device_id])
+    index = {}
+    for p in range(1, 4):
+        res = eng._cable_devices(sw1, f"1/1/{p}", sw2, f"1/1/{p}", port_index=index)
+        assert res["status"] == "UNCHANGED"
+    assert eng.nb.dcim.interfaces.filter.call_count == 2
+    eng.nb.dcim.interfaces.get.assert_not_called()
+
+
+def test_batch_relists_ports_after_creating_a_cable():
+    # A cable just created must be seen by the next link on the same ports,
+    # or the batch would try to create it twice.
+    sw1, sw2 = _device("SW1", 1), _device("SW2", 2)
+    state = {"cabled": False}
+
+    def listing(device_id):
+        peer = ("SW2", "1/1/48") if device_id == 1 else ("SW1", "1/1/1")
+        iface = _iface(100 + device_id, connected_to=peer if state["cabled"] else None)
+        iface.name = "1/1/1" if device_id == 1 else "1/1/48"
+        return [iface]
+
+    eng = _engine(devices={}, interfaces={})
+    eng.nb.dcim.interfaces.filter.side_effect = listing
+    eng.nb.dcim.cables.create.side_effect = lambda **kw: state.update(cabled=True)
+    index = {}
+    assert eng._cable_devices(sw1, "1/1/1", sw2, "1/1/48", port_index=index)["status"] == "SUCCESS"
+    assert eng._cable_devices(sw2, "1/1/48", sw1, "1/1/1", port_index=index)["status"] == "UNCHANGED"
