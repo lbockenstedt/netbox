@@ -30,6 +30,9 @@ logger = logging.getLogger("NetboxEngine")
 
 # How long a global device listing is reused for the MAC/serial identity index.
 _GLOBAL_IDENTITY_TTL_S = 60
+# After the TTL only devices changed since the last read are fetched; every
+# device is re-read this often so ones deleted in NetBox drop out.
+_GLOBAL_FULL_RELIST_S = 900
 # One fetch at a time: concurrent callers that miss the cache wait and reuse it.
 _global_devices_lock = threading.Lock()
 
@@ -848,15 +851,30 @@ class SyncMixin:
     def _all_devices_cached(self) -> list:
         """Every device (all tenants), reused for _GLOBAL_IDENTITY_TTL_S seconds.
 
-        Each NW device push needs this listing (~1 MB per 500 devices), and a
-        fleet poll pushes devices seconds apart. Code that creates a device sets
-        ``_global_devices_cache = None`` so the next lookup sees it."""
+        NW pushes, LLDP, stub listing and identity matching all read this, so
+        it was re-paged every minute (~15 pages for 7,000 devices, most of
+        NetBox's load). After the TTL only devices whose ``last_updated`` is at
+        or after the newest one held are fetched and merged by id; a full read
+        happens every _GLOBAL_FULL_RELIST_S so deleted devices drop out. Code
+        that creates or deletes a device sets ``_global_devices_cache = None``
+        so the next lookup reads everything again."""
         with _global_devices_lock:
             cached = getattr(self, "_global_devices_cache", None)
-            if cached and time.monotonic() - cached[0] < _GLOBAL_IDENTITY_TTL_S:
+            now = time.monotonic()
+            if cached and now - cached[0] < _GLOBAL_IDENTITY_TTL_S:
                 return cached[1]
+            if cached and len(cached) > 2 and now - cached[2] < _GLOBAL_FULL_RELIST_S:
+                since = max((str(r.get("last_updated") or "") for r in cached[1]), default="")
+                if since:
+                    changed = self._api_get_all("/api/dcim/devices/",
+                                                {"limit": 500, "last_updated__gte": since})
+                    by_id = {r.get("id"): r for r in cached[1]}
+                    by_id.update((r.get("id"), r) for r in changed)
+                    rows = list(by_id.values())
+                    self._global_devices_cache = (now, rows, cached[2])
+                    return rows
             rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-            self._global_devices_cache = (time.monotonic(), rows)
+            self._global_devices_cache = (now, rows, now)
             return rows
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
@@ -1571,6 +1589,7 @@ class SyncMixin:
         try:
             obj.delete()
             deleted_now = True
+            self._global_devices_cache = None  # next listing must drop it
         except pynetbox.RequestError as e:
             if getattr(getattr(e, "req", None), "status_code", None) != 404:
                 raise
