@@ -375,6 +375,43 @@ def test_device_listing_refresh_fetches_only_changed_devices(monkeypatch):
     assert calls[2] == {"limit": 500}
     # An invalidation (create/delete) forces a full read too.
     monkeypatch.setattr(netbox_sync, "_GLOBAL_FULL_RELIST_S", 900)
-    eng._global_devices_cache = None
+    eng._drop_device_cache()
     eng._all_devices_cached()
     assert calls[3] == {"limit": 500}
+
+
+def test_device_listing_is_kept_on_disk_not_in_memory():
+    # The listing used to stay in the spoke's memory, and every restart paged
+    # every device again. It now lives in a JSON file: once callers drop it
+    # nothing holds it, it is re-read from disk within the TTL, and a new
+    # engine (restart) only asks NetBox for devices changed since the file.
+    import gc
+    row = {"id": 1, "last_updated": "2026-11-12T01:00:00Z"}
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._api_get_all = MagicMock(return_value=[row])
+    rows = eng._all_devices_cached()
+    del rows
+    gc.collect()
+    assert eng._global_devices_held[0]() is None
+    assert eng._all_devices_cached() == [row]
+    assert eng._api_get_all.call_count == 1
+
+    restarted = NetboxEngine.__new__(NetboxEngine)
+    restarted._api_get_all = MagicMock(return_value=[row])
+    assert restarted._all_devices_cached() == [row]
+    restarted._api_get_all.assert_called_once_with(
+        "/api/dcim/devices/", {"limit": 500, "last_updated__gte": "2026-11-12T01:00:00Z"})
+
+
+def test_device_create_rechecks_changes_instead_of_reading_everything():
+    # A create used to throw the listing away, so the next lookup paged all
+    # ~7,000 devices. The new device is the newest, so a change fetch finds it.
+    row = {"id": 1, "last_updated": "2026-11-12T01:00:00Z"}
+    new = {"id": 2, "last_updated": "2026-11-12T01:05:00Z"}
+    eng = NetboxEngine.__new__(NetboxEngine)
+    eng._api_get_all = MagicMock(return_value=[row])
+    eng._all_devices_cached()
+    eng._recheck_device_cache()
+    eng._api_get_all.return_value = [row, new]
+    assert eng._all_devices_cached() == [row, new]
+    assert eng._api_get_all.call_args.args[1] == {"limit": 500, "last_updated__gte": "2026-11-12T01:00:00Z"}

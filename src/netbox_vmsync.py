@@ -36,7 +36,7 @@ class VmSyncMixin:
                 site=site.id,
                 description=f"vCPUs: {vcpus}, RAM: {ram}GB",
             )
-            self._global_devices_cache = None  # next listing must see it
+            self._recheck_device_cache()  # next listing must see it
             # New device id.
             return {"status": "SUCCESS", "vm_id": vm.id, "name": name}
         except Exception as e:
