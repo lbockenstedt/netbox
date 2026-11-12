@@ -121,6 +121,30 @@ def test_ip_prefetch_is_chunked_by_id():
         ["id=102", "id=105", "id=108", "limit=500"])
 
 
+def test_incremental_syncs_reuse_the_cached_device_listing():
+    # Each push paged every device in NetBox. Incremental pushes
+    # (replace=False) now share the 60s listing; a replace sync deletes, so it
+    # still reads fresh.
+    f, feed = _world(n_owned=3, page_size=500)
+    eng = make_engine(NetboxEngine, f)
+    real = eng._api_get_all
+    walks = []
+
+    def counting(path, params=None):
+        if path == "/api/dcim/devices/" and set(params or {}) <= {"limit"}:
+            walks.append(1)
+        return real(path, params)
+    eng._api_get_all = counting
+
+    for replace in (False, False):
+        assert eng.sync_devices(feed, tenant_slug="t1", replace=replace,
+                                defaults={"site": "lab"})["status"] == "SUCCESS"
+    assert len(walks) == 1
+    assert eng.sync_devices(feed, tenant_slug="t1", replace=True,
+                            defaults={"site": "lab"})["status"] == "SUCCESS"
+    assert len(walks) == 2
+
+
 def test_role_and_type_lookups_are_cached_across_syncs():
     f, feed = _world(n_owned=1)
     eng = make_engine(NetboxEngine, f)
