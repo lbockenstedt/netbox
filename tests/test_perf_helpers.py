@@ -345,3 +345,36 @@ def test_churn_report_detects_flapping_and_rate():
     assert r["writes_per_hour"] == 8
     assert r["flapping"]["objects"] == 1 and r["flapping"]["sample"][0]["name"] == "d1"
     assert r["top_fields"][0] == ["switch_ip", 3] and r["stub_creates"] == 1
+
+
+def test_device_listing_refresh_fetches_only_changed_devices(monkeypatch):
+    # The shared listing was re-paged in full every minute (~15 NetBox pages).
+    # After the TTL only devices updated since the newest held row are read,
+    # and merged by id; a full re-read still happens every _GLOBAL_FULL_RELIST_S.
+    import netbox_sync
+    eng = NetboxEngine.__new__(NetboxEngine)
+    full = [{"id": 1, "name": "a", "last_updated": "2026-11-12T01:00:00Z"},
+            {"id": 2, "name": "b", "last_updated": "2026-11-12T01:04:00Z"}]
+    changed = [{"id": 2, "name": "b2", "last_updated": "2026-11-12T01:10:00Z"},
+               {"id": 3, "name": "c", "last_updated": "2026-11-12T01:11:00Z"}]
+    calls = []
+
+    def api_get_all(path, params):
+        calls.append(dict(params))
+        return changed if "last_updated__gte" in params else full
+    eng._api_get_all = api_get_all
+
+    assert eng._all_devices_cached() == full
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_IDENTITY_TTL_S", 0)
+    rows = eng._all_devices_cached()
+    assert calls[1] == {"limit": 500, "last_updated__gte": "2026-11-12T01:04:00Z"}
+    assert sorted((r["id"], r["name"]) for r in rows) == [(1, "a"), (2, "b2"), (3, "c")]
+
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_FULL_RELIST_S", 0)
+    eng._all_devices_cached()
+    assert calls[2] == {"limit": 500}
+    # An invalidation (create/delete) forces a full read too.
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_FULL_RELIST_S", 900)
+    eng._global_devices_cache = None
+    eng._all_devices_cached()
+    assert calls[3] == {"limit": 500}
