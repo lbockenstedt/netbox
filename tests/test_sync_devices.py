@@ -39,6 +39,7 @@ def _engine_with(existing_rows, tenant_obj=None):
     """Build an engine whose nb is a MagicMock; _api_get_all returns the given
     existing device rows; _api_get (prefix lookup) returns empty (→ /32)."""
     eng = NetboxEngine("http://localhost", "tok")
+    eng._drop_device_cache()  # each test's rows are a new NetBox
     eng.nb = MagicMock()
     synced = {}
 

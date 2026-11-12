@@ -445,5 +445,6 @@ def attach(engine, fake: FakeNetBox) -> FakeNetBox:
 def make_engine(engine_cls, fake: FakeNetBox):
     eng = engine_cls(BASE, "0123456789abcdef0123456789abcdef01234567")
     attach(eng, fake)
+    eng._drop_device_cache()  # a new fake world is a new NetBox
     return eng
 
