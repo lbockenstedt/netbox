@@ -1,11 +1,14 @@
 """Device / NW-device / access-tracker sync + discovery helpers for NetboxEngine."""
 # ipaddress parses IPs/networks for prefix (mask) matching and address validation.
 import ipaddress
+import json
+import os
 # re matches placeholder names, MAC formats and DNS-name validity.
 import re
-# time.monotonic ages the global-identity device listing cache.
+# time.time ages the device listing cache file.
 import threading
 import time
+import weakref
 # logging reports sync progress and best-effort failures.
 import logging
 # dataclass/field build the per-batch state container _DeviceSyncRun.
@@ -33,8 +36,37 @@ _GLOBAL_IDENTITY_TTL_S = 60
 # After the TTL only devices changed since the last read are fetched; every
 # device is re-read this often so ones deleted in NetBox drop out.
 _GLOBAL_FULL_RELIST_S = 900
+# The listing lives on disk between calls so the spoke does not hold every
+# device in memory, and a restart does not page NetBox again.
+_DEVICE_CACHE_PATH = os.getenv("LM_NETBOX_DEVICE_CACHE", "/var/lib/lm/netbox/device_cache.json")
 # One fetch at a time: concurrent callers that miss the cache wait and reuse it.
 _global_devices_lock = threading.Lock()
+
+
+class _DeviceRows(list):
+    """A list that can be weakly referenced, so callers share one loaded listing."""
+
+
+def _read_device_cache():
+    """(full read time, rows) from the device cache file; rows is None when absent or unreadable."""
+    try:
+        with open(_DEVICE_CACHE_PATH) as f:
+            data = json.load(f)
+        return float(data["full"]), _DeviceRows(data["rows"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0, None
+
+
+def _write_device_cache(full: float, rows: list) -> None:
+    """Write the listing atomically; a failure only means the next call pages NetBox."""
+    tmp = _DEVICE_CACHE_PATH + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(_DEVICE_CACHE_PATH) or ".", exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"full": full, "rows": rows}, f, separators=(",", ":"))
+        os.replace(tmp, _DEVICE_CACHE_PATH)
+    except (OSError, TypeError, ValueError) as e:
+        logger.warning("device cache: could not write %s: %s", _DEVICE_CACHE_PATH, e)
 
 
 # Auto-generated names the create branch mints when a record has no hostname
@@ -849,33 +881,62 @@ class SyncMixin:
         return None
 
     def _all_devices_cached(self) -> list:
-        """Every device (all tenants), reused for _GLOBAL_IDENTITY_TTL_S seconds.
+        """Every device (all tenants), re-checked every _GLOBAL_IDENTITY_TTL_S.
 
-        NW pushes, LLDP, stub listing and identity matching all read this, so
-        it was re-paged every minute (~15 pages for 7,000 devices, most of
-        NetBox's load). After the TTL only devices whose ``last_updated`` is at
-        or after the newest one held are fetched and merged by id; a full read
-        happens every _GLOBAL_FULL_RELIST_S so deleted devices drop out. Code
-        that creates or deletes a device sets ``_global_devices_cache = None``
-        so the next lookup reads everything again."""
+        NW pushes, LLDP, stub listing and identity matching all read this. The
+        rows are kept in a JSON file, not in memory: callers running at the
+        same time share one loaded copy, and it is freed when the last one is
+        done. After the TTL only devices whose ``last_updated`` is at or after
+        the newest one held are fetched and merged by id; everything is re-read
+        every _GLOBAL_FULL_RELIST_S so deleted devices drop out. Code that
+        creates or deletes a device calls ``_drop_device_cache`` so the next
+        lookup reads everything again; creates call ``_recheck_device_cache``."""
         with _global_devices_lock:
-            cached = getattr(self, "_global_devices_cache", None)
-            now = time.monotonic()
-            if cached and now - cached[0] < _GLOBAL_IDENTITY_TTL_S:
-                return cached[1]
-            if cached and len(cached) > 2 and now - cached[2] < _GLOBAL_FULL_RELIST_S:
-                since = max((str(r.get("last_updated") or "") for r in cached[1]), default="")
-                if since:
-                    changed = self._api_get_all("/api/dcim/devices/",
-                                                {"limit": 500, "last_updated__gte": since})
-                    by_id = {r.get("id"): r for r in cached[1]}
+            now = time.time()
+            held = getattr(self, "_global_devices_held", None)
+            rows = held[0]() if held else None
+            if rows is not None:
+                full = held[1]
+            else:
+                full, rows = _read_device_cache()
+            checked = getattr(self, "_global_devices_checked", 0.0)
+            if rows is not None and 0 <= now - checked < _GLOBAL_IDENTITY_TTL_S:
+                return rows
+            since = max((str(r.get("last_updated") or "") for r in rows or []), default="")
+            if rows is not None and since and 0 <= now - full < _GLOBAL_FULL_RELIST_S:
+                changed = self._api_get_all("/api/dcim/devices/",
+                                            {"limit": 500, "last_updated__gte": since})
+                by_id = {r.get("id"): r for r in rows}
+                # The newest held rows always come back (gte); only rewrite
+                # the file when something really changed.
+                dirty = any(by_id.get(r.get("id")) != r for r in changed)
+                if dirty:
                     by_id.update((r.get("id"), r) for r in changed)
-                    rows = list(by_id.values())
-                    self._global_devices_cache = (now, rows, cached[2])
-                    return rows
-            rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
-            self._global_devices_cache = (now, rows, now)
+                    rows = _DeviceRows(by_id.values())
+            else:
+                rows = _DeviceRows(self._api_get_all("/api/dcim/devices/", {"limit": 500}))
+                full = now
+                dirty = True
+            if dirty:
+                _write_device_cache(full, rows)
+            self._global_devices_checked = now
+            self._global_devices_held = (weakref.ref(rows), full)
             return rows
+
+    def _recheck_device_cache(self) -> None:
+        """A device was created: the next listing asks NetBox for changes
+        (the new device's ``last_updated`` is the newest) instead of reusing
+        the file for the rest of the TTL."""
+        self._global_devices_checked = 0.0
+
+    def _drop_device_cache(self) -> None:
+        """A device was deleted or merged away: the next listing reads every device."""
+        self._global_devices_held = None
+        self._global_devices_checked = 0.0
+        try:
+            os.remove(_DEVICE_CACHE_PATH)
+        except OSError:
+            pass
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
@@ -1589,7 +1650,7 @@ class SyncMixin:
         try:
             obj.delete()
             deleted_now = True
-            self._global_devices_cache = None  # next listing must drop it
+            self._drop_device_cache()  # next listing must drop it
         except pynetbox.RequestError as e:
             if getattr(getattr(e, "req", None), "status_code", None) != 404:
                 raise
@@ -2157,7 +2218,7 @@ class SyncMixin:
         # Canonical upper-case name, then create the device.
         name = self._nb_name(name)
         devobj = self.nb.dcim.devices.create(**self._device_create_kwargs(run, d, name))
-        self._global_devices_cache = None  # next listing must see it
+        self._recheck_device_cache()  # next listing must see it
         # Remember the device by hostname so a second operator-named port can join it.
         if d.hostname:
             run.created_by_name.setdefault(d.hostname.lower(), devobj.id)
@@ -2569,7 +2630,7 @@ class SyncMixin:
                         ck["tenant"] = tenant.id
                     # Create the device.
                     devobj = self.nb.dcim.devices.create(**ck)
-                    self._global_devices_cache = None  # next listing must see it
+                    self._recheck_device_cache()  # next listing must see it
                     # Tag ownership + link to the fleet id (best-effort cf PATCH).
                     try:
                         devobj.custom_fields = {
@@ -2882,7 +2943,7 @@ class SyncMixin:
         stub.delete()
         logger.info("netbox: merged duplicate %s (id %s) into %s",
                     stub_name, stub_id, getattr(devobj, "name", my_id))
-        self._global_devices_cache = None
+        self._drop_device_cache()
         return True
 
     def list_stub_devices(self) -> Dict[str, Any]:
@@ -2953,7 +3014,7 @@ class SyncMixin:
             if self._merge_device_into(devobj, rid, row.get("name"), f"MAC {key}"):
                 merged += 1
         if merged:
-            self._global_devices_cache = None
+            self._drop_device_cache()
         return merged
 
     def _host_row_for(self, linked_host: Any, idx: dict, serial: str = "") -> Optional[dict]:
@@ -3281,7 +3342,7 @@ class SyncMixin:
                 # Create the switch; a failure is handled below by returning None.
                 try:
                     sw = self.nb.dcim.devices.create(**ck)
-                    self._global_devices_cache = None  # next listing must see it
+                    self._recheck_device_cache()  # next listing must see it
                     # mgmt interface holding the NAS IP + primary_ip4 so the
                     # next batch finds this switch by IP (existing_by_ip path).
                     if sw:
@@ -3494,7 +3555,7 @@ class SyncMixin:
                     if tenant:
                         create_kwargs["tenant"] = tenant.id
                     devobj = self.nb.dcim.devices.create(**create_kwargs)
-                    self._global_devices_cache = None  # next listing must see it
+                    self._recheck_device_cache()  # next listing must see it
                     # Ownership tag + topology custom fields (best-effort; same
                     # create-without-cf + best-effort PATCH lesson as sync_vms).
                     # Best-effort: a missing custom field in NetBox makes the save fail; that is
