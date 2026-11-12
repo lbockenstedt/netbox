@@ -70,6 +70,7 @@ class FakeNetBox(BaseAdapter):
         self.page_size = page_size
         self.db: Dict[str, Dict[int, dict]] = {c: {} for _a, c in _COLLECTIONS}
         self._next_id = 1000
+        self._clock = 0  # devices' last_updated, one second per write
         self.log: List[Tuple[str, str, str, Any]] = []
         # {(METHOD, collection, key)} -> respond 500. key is an object id; for
         # POST the ``slug``/``name``/``address`` being created; for list GETs
@@ -84,8 +85,15 @@ class FakeNetBox(BaseAdapter):
     def add(self, coll: str, obj: dict) -> dict:
         obj = dict(obj)
         obj.setdefault("id", self.new_id())
+        if coll == "devices":
+            obj.setdefault("last_updated", self._stamp())
         self.db[coll][obj["id"]] = obj
         return obj
+
+    def _stamp(self) -> str:
+        self._clock += 1
+        return "2026-01-01T%02d:%02d:%02dZ" % (self._clock // 3600, self._clock // 60 % 60,
+                                               self._clock % 60)
 
     # ── transport ──────────────────────────────────────────────────────────
     def close(self):  # pragma: no cover - adapter API
@@ -206,6 +214,8 @@ class FakeNetBox(BaseAdapter):
         if coll == "prefixes":
             rows = []  # no containing prefixes → sync falls back to /32
         if coll == "devices":
+            if one("last_updated__gte") is not None:
+                rows = [r for r in rows if r.get("last_updated", "") >= one("last_updated__gte")]
             rows.sort(key=lambda r: (str(r.get("name") or ""), r["id"]))
         else:
             rows.sort(key=lambda r: r["id"])
@@ -314,6 +324,8 @@ class FakeNetBox(BaseAdapter):
                     raise _Http(400, {"primary_ip4": ["not assigned to this device"]})
         if coll == "ip-addresses":
             self._check_ip_unique(new, obj["id"])
+        if coll == "devices" and new != obj:
+            new["last_updated"] = self._stamp()
         obj.clear()
         obj.update(new)
 
@@ -377,6 +389,7 @@ class FakeNetBox(BaseAdapter):
                     "role": self._nested("device-roles", obj.get("role_id"), "dcim"),
                     "device_type": self._nested("device-types", obj.get("device_type_id"), "dcim"),
                     "primary_ip4": self._nested("ip-addresses", obj.get("primary_ip4_id"), "ipam"),
+                    "last_updated": obj.get("last_updated"),
                     "custom_fields": copy.deepcopy(obj.get("custom_fields") or {})}
         if coll == "ip-addresses":
             return {**base, "address": obj["address"],

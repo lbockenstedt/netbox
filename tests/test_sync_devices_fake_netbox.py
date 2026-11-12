@@ -122,9 +122,8 @@ def test_ip_prefetch_is_chunked_by_id():
 
 
 def test_incremental_syncs_reuse_the_cached_device_listing():
-    # Each push paged every device in NetBox. Incremental pushes
-    # (replace=False) now share the 60s listing; a replace sync deletes, so it
-    # still reads fresh.
+    # Each push paged every device in NetBox. All pushes now share the cached
+    # listing; a replace sync (which deletes) first asks NetBox what changed.
     f, feed = _world(n_owned=3, page_size=500)
     eng = make_engine(NetboxEngine, f)
     real = eng._api_get_all
@@ -142,7 +141,7 @@ def test_incremental_syncs_reuse_the_cached_device_listing():
     assert len(walks) == 1
     assert eng.sync_devices(feed, tenant_slug="t1", replace=True,
                             defaults={"site": "lab"})["status"] == "SUCCESS"
-    assert len(walks) == 2
+    assert len(walks) == 1
 
 
 def test_role_and_type_lookups_are_cached_across_syncs():
@@ -518,7 +517,7 @@ def test_nw_pushes_share_one_device_listing_and_see_new_devices():
 
     def device_listings():
         return [x for x in _gets(f) if x[1].rstrip("/").endswith("/dcim/devices")
-                and "offset" not in str(x[2])]
+                and "offset" not in str(x[2]) and "limit=1" not in str(x[2]).split("&")]
 
     first = push("nw-1", "sw1", "10.0.0.1")
     f.log.clear()
@@ -529,3 +528,36 @@ def test_nw_pushes_share_one_device_listing_and_see_new_devices():
     assert len([d for d in f.db["devices"].values() if d["name"] in ("SW1", "SW2")]) == 2
     # Two listings: the one after sw1's create, then the one after sw2's create.
     assert len(device_listings()) == 2, device_listings()
+
+
+def test_replace_syncs_and_deletes_reuse_the_cached_listing():
+    # Paging every device on each replace sync and after each delete was most
+    # of NetBox's load. Both now reuse the cache (deletes remove one row).
+    f, feed = _world(n_owned=3)
+    eng = make_engine(NetboxEngine, f)
+    eng.sync_devices(feed, tenant_slug="t1", replace=True, defaults={"site": "lab"})
+    f.db["devices"][103]["custom_fields"].pop("last_seen")
+    f.db["devices"][103]["last_updated"] = f._stamp()  # NetBox stamps every edit
+    f.log.clear()
+    res = eng.sync_devices(feed[:1] + feed[2:], tenant_slug="t1", replace=True,
+                           defaults={"site": "lab"})
+    assert res["deleted"] == 1, res
+    eng.sync_devices(feed[:1] + feed[2:], tenant_slug="t1", replace=True,
+                     defaults={"site": "lab"})
+    full = [q for m, p, q, _ in f.log
+            if m == "GET" and p == "/api/dcim/devices/" and "last_updated__gte" not in q
+            and "id=" not in q and "id__in" not in q and "limit=1" not in q.split("&")]
+    assert full == []
+
+
+def test_device_deleted_outside_lm_is_recreated_at_the_next_cache_check(monkeypatch):
+    # Deletes don't show as NetBox changes; the cache compares NetBox's device
+    # count, so a cached device deleted in the NetBox UI comes back.
+    import netbox_sync
+    f, feed = _world(n_owned=2)
+    eng = make_engine(NetboxEngine, f)
+    eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
+    del f.db["devices"][100]
+    monkeypatch.setattr(netbox_sync, "_GLOBAL_IDENTITY_TTL_S", 0)
+    eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
+    assert sorted(d["name"] for d in f.db["devices"].values()) == ["WS-00", "WS-01"]
