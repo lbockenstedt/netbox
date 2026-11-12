@@ -188,6 +188,20 @@ def test_sweep_server_racks_from_ilo_and_ilo_gives_up_the_u():
     assert objs[2].position is None and objs[2].rack is not None  # stays in the rack
 
 
+def test_sweep_ilo_without_back_link_yields_u_to_server_that_links_it():
+    # Live case: server links to its iLO, the iLO has no linked_device back.
+    rows = [{"id": 1, "name": "MIPBE-SSPLM-PXMX01", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "hypervisor"}, "rack": {"id": 1},
+             "position": 18, "face": {"value": "front"},
+             "custom_fields": {"linked_device": "MIPBE-SSPLM-PXMX01-N31-R18-ILO"}},
+            {"id": 2, "name": "MIPBE-SSPLM-PXMX01-N31-R18-ILO", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "bmc"}, "custom_fields": {}}]
+    eng = _engine(rows, [{"id": 5, "u_height": 1}], [{"id": 1, "name": "N31", "u_height": 48, "site": {"id": 10}}])
+    eng.nb.dcim.devices.get.side_effect = lambda i: MagicMock()
+    res = eng.autorack_sweep(dry_run=True)
+    assert res["conflicts"] == [] and res["cannot"] == []
+
+
 def test_half_name_flag_puts_lower_numbered_device_left_front_and_next_right_rear():
     from netbox_autorack import plan, parse_rack_name
     assert parse_rack_name("MIPBE-SSPLM-N31-R43H-GW01")["half"] is True
