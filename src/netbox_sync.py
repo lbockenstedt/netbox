@@ -31,11 +31,13 @@ from netbox_profile import guess_role
 # Shared logger name so these messages land with the rest of the NetBox engine's logs.
 logger = logging.getLogger("NetboxEngine")
 
-# How long a global device listing is reused for the MAC/serial identity index.
-_GLOBAL_IDENTITY_TTL_S = 60
+# How long a global device listing is reused before asking NetBox what changed.
+# Our own creates ask at once (_recheck_device_cache) and our deletes remove the
+# row (_forget_cached_device), so this only catches edits made outside LM.
+_GLOBAL_IDENTITY_TTL_S = 300
 # After the TTL only devices changed since the last read are fetched; every
-# device is re-read this often so ones deleted in NetBox drop out.
-_GLOBAL_FULL_RELIST_S = 900
+# device is re-read once a day so ones deleted outside LM drop out.
+_GLOBAL_FULL_RELIST_S = 86400
 # The listing lives on disk between calls so the spoke does not hold every
 # device in memory, and a restart does not page NetBox again.
 _DEVICE_CACHE_PATH = os.getenv("LM_NETBOX_DEVICE_CACHE", "/var/lib/lm/netbox/device_cache.json")
@@ -45,6 +47,12 @@ _global_devices_lock = threading.Lock()
 
 class _DeviceRows(list):
     """A list that can be weakly referenced, so callers share one loaded listing."""
+
+
+def _is_404(e: Exception) -> bool:
+    """A NetBox 'not found' error (pynetbox RequestError or requests HTTPError)."""
+    resp = getattr(e, "req", None) or getattr(e, "response", None)
+    return getattr(resp, "status_code", None) == 404
 
 
 def _read_device_cache():
@@ -889,8 +897,8 @@ class SyncMixin:
         done. After the TTL only devices whose ``last_updated`` is at or after
         the newest one held are fetched and merged by id; everything is re-read
         every _GLOBAL_FULL_RELIST_S so deleted devices drop out. Code that
-        creates or deletes a device calls ``_drop_device_cache`` so the next
-        lookup reads everything again; creates call ``_recheck_device_cache``."""
+        deletes a device calls ``_forget_cached_device``; code that creates one
+        calls ``_recheck_device_cache``."""
         with _global_devices_lock:
             now = time.time()
             held = getattr(self, "_global_devices_held", None)
@@ -903,7 +911,9 @@ class SyncMixin:
             if rows is not None and 0 <= now - checked < _GLOBAL_IDENTITY_TTL_S:
                 return rows
             since = max((str(r.get("last_updated") or "") for r in rows or []), default="")
-            if rows is not None and since and 0 <= now - full < _GLOBAL_FULL_RELIST_S:
+            usable = rows is not None and since and 0 <= now - full < _GLOBAL_FULL_RELIST_S
+            dirty = False
+            if usable:
                 changed = self._api_get_all("/api/dcim/devices/",
                                             {"limit": 500, "last_updated__gte": since})
                 by_id = {r.get("id"): r for r in rows}
@@ -913,7 +923,12 @@ class SyncMixin:
                 if dirty:
                     by_id.update((r.get("id"), r) for r in changed)
                     rows = _DeviceRows(by_id.values())
-            else:
+                # A device deleted outside LM is not a change; it shows as a
+                # different total, and then everything is read again.
+                if self._device_count(len(rows)) != len(rows):
+                    logger.info("device cache: NetBox device count differs, reading every device")
+                    usable = False
+            if not usable:
                 rows = _DeviceRows(self._api_get_all("/api/dcim/devices/", {"limit": 500}))
                 full = now
                 dirty = True
@@ -923,6 +938,14 @@ class SyncMixin:
             self._global_devices_held = (weakref.ref(rows), full)
             return rows
 
+    def _device_count(self, default: int) -> int:
+        """How many devices NetBox has (one small request); ``default`` if it can't say."""
+        try:
+            return int(self.nb.dcim.devices.count())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("device cache: count failed: %s", e)
+            return default
+
     def _recheck_device_cache(self) -> None:
         """A device was created: the next listing asks NetBox for changes
         (the new device's ``last_updated`` is the newest) instead of reusing
@@ -930,13 +953,30 @@ class SyncMixin:
         self._global_devices_checked = 0.0
 
     def _drop_device_cache(self) -> None:
-        """A device was deleted or merged away: the next listing reads every device."""
+        """A write found a cached device gone (deleted outside LM): the next
+        listing reads every device."""
         self._global_devices_held = None
         self._global_devices_checked = 0.0
         try:
             os.remove(_DEVICE_CACHE_PATH)
         except OSError:
             pass
+
+    def _forget_cached_device(self, device_id: Any) -> None:
+        """We deleted a device: remove its row from the cached listing. Paging
+        every device again after each delete was most of NetBox's load."""
+        with _global_devices_lock:
+            held = getattr(self, "_global_devices_held", None)
+            rows = held[0]() if held else None
+            full = held[1] if held else 0.0
+            if rows is None:
+                full, rows = _read_device_cache()
+            if rows is None:
+                return
+            keep = [r for r in rows if r.get("id") != device_id]
+            if len(keep) != len(rows):
+                _write_device_cache(full, keep)
+                self._global_devices_held = None  # next listing reads the file
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
@@ -1367,6 +1407,8 @@ class SyncMixin:
                 try:
                     self._sync_one_device(run, _IncomingDevice(key, rec))
                 except Exception as e:
+                    if _is_404(e):
+                        self._drop_device_cache()
                     self._note_upsert_failure(run, key, e)
             self._flush_cf_stamps(run)
 
@@ -1544,12 +1586,12 @@ class SyncMixin:
         (same order NetBox's ``?tenant=`` filter returns, so first-row-wins
         indexing is unchanged). There is no tenant-only fallback: matching
         without the global MAC/serial index mints cross-tenant duplicates.
-        Pass ``cached=True`` to reuse the 60s all-devices listing from
-        ``_all_devices_cached`` instead of paging NetBox again."""
-        # Incremental pushes (replace=False) reuse the 60s listing; a replace
-        # sync deletes, so it reads fresh.
-        all_rows = (self._all_devices_cached() if cached
-                     else self._api_get_all("/api/dcim/devices/", {"limit": 500}))
+        ``cached=False`` (a replace sync, which deletes) first asks NetBox what
+        changed since the cached listing; a device someone else deleted since
+        then is a 404 no-op in ``_delete_device_row``."""
+        if not cached:
+            self._recheck_device_cache()
+        all_rows = self._all_devices_cached()
         # Unscoped sync: the full listing is what we index; no separate global list needed.
         if not run.tenant_slug:
             return all_rows, None
@@ -1650,11 +1692,12 @@ class SyncMixin:
         try:
             obj.delete()
             deleted_now = True
-            self._drop_device_cache()  # next listing must drop it
+            self._forget_cached_device(row["id"])
         except pynetbox.RequestError as e:
             if getattr(getattr(e, "req", None), "status_code", None) != 404:
                 raise
             deleted_now = False  # someone else already deleted it
+            self._forget_cached_device(row["id"])
         # Mark it deleted and drop its cached Record.
         run.deleted_ids.add(row["id"])
         run.device_objs.pop(row["id"], None)
@@ -2658,8 +2701,9 @@ class SyncMixin:
             # Matched an existing device: fetch its live Record.
             else:
                 devobj = self.nb.dcim.devices.get(existing["id"])
-                # It disappeared since the listing: report it.
+                # It disappeared since the listing (deleted outside LM): report it.
                 if not devobj:
+                    self._forget_cached_device(existing["id"])
                     return {"status": "ERROR",
                             "message": f"existing nw device {existing['id']} vanished",
                             "pushed": 0, "errors": 1, "skipped": 0, "deleted": 0,
@@ -2943,7 +2987,7 @@ class SyncMixin:
         stub.delete()
         logger.info("netbox: merged duplicate %s (id %s) into %s",
                     stub_name, stub_id, getattr(devobj, "name", my_id))
-        self._drop_device_cache()
+        self._forget_cached_device(stub_id)
         return True
 
     def list_stub_devices(self) -> Dict[str, Any]:
@@ -3013,8 +3057,6 @@ class SyncMixin:
             seen.add(rid)
             if self._merge_device_into(devobj, rid, row.get("name"), f"MAC {key}"):
                 merged += 1
-        if merged:
-            self._drop_device_cache()
         return merged
 
     def _host_row_for(self, linked_host: Any, idx: dict, serial: str = "") -> Optional[dict]:
