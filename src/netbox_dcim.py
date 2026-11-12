@@ -1190,7 +1190,7 @@ class DcimMixin:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
             # Delete it.
             device.delete()
-            self._drop_device_cache()  # next listing must drop it
+            self._forget_cached_device(device_id)
             return {"status": "SUCCESS"}
         except Exception as e:
             # API failure.

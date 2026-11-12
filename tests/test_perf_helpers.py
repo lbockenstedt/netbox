@@ -373,11 +373,12 @@ def test_device_listing_refresh_fetches_only_changed_devices(monkeypatch):
     monkeypatch.setattr(netbox_sync, "_GLOBAL_FULL_RELIST_S", 0)
     eng._all_devices_cached()
     assert calls[2] == {"limit": 500}
-    # An invalidation (create/delete) forces a full read too.
+    # A delete removes the row locally instead of paging every device again.
     monkeypatch.setattr(netbox_sync, "_GLOBAL_FULL_RELIST_S", 900)
-    eng._drop_device_cache()
-    eng._all_devices_cached()
-    assert calls[3] == {"limit": 500}
+    eng._forget_cached_device(1)
+    rows = eng._all_devices_cached()
+    assert calls[3] == {"limit": 500, "last_updated__gte": "2026-11-12T01:04:00Z"}
+    assert sorted(r["id"] for r in rows) == [2, 3]
 
 
 def test_device_listing_is_kept_on_disk_not_in_memory():
