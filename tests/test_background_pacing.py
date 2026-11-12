@@ -86,3 +86,36 @@ def test_store_and_ack_nw_device_push_is_not_queued_as_background():
     assert "NETBOX_SYNC_DEVICES" in lane
     # Its immediate (write-now) path is still paced against NetBox.
     assert "NETBOX_SYNC_NW_DEVICE" in spoke_mod.NetboxSpoke._BACKGROUND_MUTATIONS
+
+
+def test_two_reads_run_side_by_side_but_never_more_than_netbox_workers(monkeypatch):
+    # A paged IP/prefix walk held the only slot, so every other read queued
+    # behind it and timed out at the hub while NetBox sat idle.
+    seen = {"now": 0, "max": 0}
+    lock = threading.Lock()
+
+    class Ok:
+        ok = True
+
+        def json(self):
+            return {"results": []}
+
+    def get(url, params=None, timeout=None):
+        with lock:
+            seen["now"] += 1
+            seen["max"] = max(seen["max"], seen["now"])
+        time.sleep(REQUEST_S)
+        with lock:
+            seen["now"] -= 1
+        return Ok()
+
+    eng = netbox_engine.NetboxEngine.__new__(netbox_engine.NetboxEngine)
+    eng.url = "https://netbox.example"
+    eng.nb = type("Nb", (), {"http_session": type("S", (), {"get": staticmethod(get)})()})()
+    threads = [threading.Thread(target=eng._api_get, args=("/api/ipam/ip-addresses/",))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert seen["max"] == 2
