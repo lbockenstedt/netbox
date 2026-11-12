@@ -344,6 +344,10 @@ class AutoRackMixin:
         online = {str(k).lower(): bool(v) for k, v in (online or {}).items()}
         devices = []
         listed = {_short(r.get("name")): str(r.get("name") or "") for r in rows}
+        # Controller -> server, from the server's link, for iLOs that don't link back.
+        hosted_by = {_short((r.get("custom_fields") or {}).get("linked_device")): str(r.get("name") or "")
+                     for r in rows
+                     if not _is_mgmt(r) and (r.get("custom_fields") or {}).get("linked_device")}
         for r in rows:
             dt = types.get((r.get("device_type") or {}).get("id"), {})
             nm = str(r.get("name") or "")
@@ -364,7 +368,8 @@ class AutoRackMixin:
                 "half_width": half, "type_id": dt.get("id"),
                 "controller": "" if mgmt else link,
                 # A controller whose server is in NetBox: the server holds the slot.
-                "host": listed.get(_short(link), "") if mgmt and link else "",
+                "host": (listed.get(_short(link), "") if link else hosted_by.get(_short(nm), ""))
+                        if mgmt else "",
                 "type_full": bool(dt.get("is_full_depth", True))})
         result = plan(devices, racks)
         dev_by_id = {d["id"]: d for d in devices}
