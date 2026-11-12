@@ -1247,7 +1247,7 @@ class SyncMixin:
 
             # One paginated listing of existing devices; failing here aborts the batch.
             try:
-                rows, all_rows = self._list_devices_for_sync(run)
+                rows, all_rows = self._list_devices_for_sync(run, cached=not replace)
             except Exception as e:
                 return {"status": "ERROR",
                         "message": f"failed to list NetBox devices: {e}",
@@ -1453,7 +1453,8 @@ class SyncMixin:
             if run.owns(cf):
                 run.owned_ips.add(addr)
 
-    def _list_devices_for_sync(self, run: "_DeviceSyncRun") -> Tuple[list, Optional[list]]:
+    def _list_devices_for_sync(self, run: "_DeviceSyncRun",
+                                cached: bool = False) -> Tuple[list, Optional[list]]:
         """Return ``(rows, all_rows)``: the devices this sync indexes, and the
         global listing for ``_add_global_identities`` (None when not needed or
         unavailable). Raises when no listing can be read.
@@ -1463,9 +1464,13 @@ class SyncMixin:
         pages everything once and keeps the tenant's rows in listing order
         (same order NetBox's ``?tenant=`` filter returns, so first-row-wins
         indexing is unchanged). There is no tenant-only fallback: matching
-        without the global MAC/serial index mints cross-tenant duplicates."""
-        # Page through every device once (all tenants).
-        all_rows = self._api_get_all("/api/dcim/devices/", {"limit": 500})
+        without the global MAC/serial index mints cross-tenant duplicates.
+        Pass ``cached=True`` to reuse the 60s all-devices listing from
+        ``_all_devices_cached`` instead of paging NetBox again."""
+        # Incremental pushes (replace=False) reuse the 60s listing; a replace
+        # sync deletes, so it reads fresh.
+        all_rows = (self._all_devices_cached() if cached
+                     else self._api_get_all("/api/dcim/devices/", {"limit": 500}))
         # Unscoped sync: the full listing is what we index; no separate global list needed.
         if not run.tenant_slug:
             return all_rows, None
