@@ -243,6 +243,7 @@ class StalenessMixin:
                     if action == "delete":
                         obj.delete()
                         deleted += 1
+                        self._global_devices_cache = None  # next listing must drop it
                         _bucket(tslug)["deleted"] += 1
                         self._journal("dcim.device", row["id"], "staleness-sweep",
                                        note=f"deleted: offline since {decomm}")
