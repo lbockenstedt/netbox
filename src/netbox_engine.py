@@ -22,11 +22,11 @@ from typing import Any, Dict, Optional
 # requests supplies the HTTPAdapter subclassed below for default timeouts.
 import requests
 
-# Limit concurrent HTTP requests to gunicorn to avoid OOM-killing workers
-# when multiple IPAM queries arrive simultaneously. Whole-fleet listings get
-# their own slot so a quick read (prefixes, one device) never waits behind a
-# many-page device walk: at most two requests run at once.
-_netbox_http_sem = threading.Semaphore(1)
+# NetBox runs 3 gunicorn workers (about 320 MB each on a 4 GB VM). Use all
+# three and no more: extra requests would only queue inside gunicorn. Whole-fleet
+# listings get their own slot so quick reads never wait behind a many-page walk,
+# and two slots for everything else so one paged IP/prefix walk can't block them.
+_netbox_http_sem = threading.Semaphore(2)
 _netbox_bulk_sem = threading.Semaphore(1)
 
 # Background feeds (discovery syncs, sweeps; see NetboxSpoke._BACKGROUND_MUTATIONS)
