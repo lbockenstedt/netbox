@@ -368,8 +368,9 @@ class AutoRackMixin:
                 "half_width": half, "type_id": dt.get("id"),
                 "controller": "" if mgmt else link,
                 # A controller whose server is in NetBox: the server holds the slot.
-                "host": (listed.get(_short(link), "") if link else hosted_by.get(_short(nm), ""))
-                        if mgmt else "",
+                # Its own link may carry the server's agent hostname, so fall back
+                # to the server's link to it.
+                "host": (listed.get(_short(link)) or hosted_by.get(_short(nm), "")) if mgmt else "",
                 "type_full": bool(dt.get("is_full_depth", True))})
         result = plan(devices, racks)
         dev_by_id = {d["id"]: d for d in devices}
