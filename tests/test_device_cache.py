@@ -184,6 +184,7 @@ def test_a_damaged_file_during_a_write_rebuilds_instead_of_truncating(write):
     eng = _mock_engine(ROWS)
     eng._all_devices_cached()
     cache = eng._device_cache()
+    cache.tenant_rows("t1")  # the parsed file is kept in memory
     with open(os.path.join(netbox_device_cache.CACHE_DIR, "t1.json"), "w") as fh:
         fh.write("garbage")
     if write == "upsert":
@@ -280,6 +281,21 @@ def test_console_sync_finds_a_device_added_in_netbox_since_the_cache_was_built()
     assert res["status"] == "SUCCESS", res
     assert [d["id"] for d in f.db["devices"].values()] == [100]
     assert _listings(f) == []
+
+
+def test_console_sync_finds_a_device_added_in_netbox_by_its_ip():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _device(f, 100, "HAND-MADE")  # added in the NetBox UI, under another name
+    f.add("interfaces", {"id": 7, "device_id": 100, "name": "mgmt", "type": "virtual"})
+    ip = f.add("ip-addresses", {"address": "10.0.0.9/24", "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": 7, "custom_fields": {}})
+    f.db["devices"][100]["primary_ip4_id"] = ip["id"]
+    res = eng.sync_devices([{"ip": "10.0.0.9", "mac": "", "hostname": "box", "serial": ""}],
+                           tenant_slug="t1", source="Console", defaults={"site": "lab"})
+    assert res["status"] == "SUCCESS", res
+    assert sorted(f.db["devices"]) == [100]
 
 
 def test_feed_sync_asks_netbox_before_creating_a_device():
@@ -435,6 +451,8 @@ def test_a_failed_recreate_keeps_the_device_for_the_next_reconcile():
     f.fail.add(("POST", "devices", "create"))
     res = eng.reconcile_device_cache("t1")
     assert res["status"] == "ERROR", res
+    # Retried within the hour, not a day later.
+    assert eng._device_cache()._meta["reconcile"]["t1"] - time.time() <= 3600
     f.fail.clear()
     assert 100 in {r["id"] for r in eng._device_cache().rows()}
     res = eng.reconcile_device_cache("t1")
@@ -452,6 +470,29 @@ def test_reconcile_leaves_deleted_a_scanner_device_without_last_seen():
     res = eng.reconcile_device_cache("t1")
     assert res["changed"] == 0, res
     assert [d["name"] for d in f.db["devices"].values()] == ["HUMAN"]
+
+
+def test_reconcile_keeps_a_write_the_spoke_made_during_the_listing():
+    f, eng = _reconcile_world()
+    listing = eng._api_get_all
+
+    def list_after_a_poll(path, params):
+        # A scanner poll renames the device while the tenant is being listed.
+        eng.nb.dcim.devices.update([{"id": 100, "name": "SW1-POLLED"}])
+        return listing(path, params)
+    eng._api_get_all = list_after_a_poll
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert f.db["devices"][100]["name"] == "SW1-POLLED"
+
+
+def test_reconcile_does_not_recreate_a_device_re_added_under_another_id():
+    f, eng = _reconcile_world()
+    del f.db["devices"][100]
+    _device(f, 200, "SW1-READDED", serial="S1")
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert sorted(f.db["devices"]) == [101, 200]
 
 
 def test_reconcile_runs_only_for_a_due_tenant():

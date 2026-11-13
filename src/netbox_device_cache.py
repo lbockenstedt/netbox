@@ -127,13 +127,21 @@ class DeviceCache:
         """One tenant's full rows; raises when the file is unreadable."""
         if self._mem is not None:
             return [dict(r) for r in self._mem.get(key, [])]
-        if self._last_read is None or self._last_read[0] != key:
+        # Reuse the last parse while the file is unchanged on disk; a file
+        # deleted or rewritten behind our back is read (and fails) again.
+        stamp = self._file_stamp(key)
+        if self._last_read is None or self._last_read[:2] != (key, stamp):
             with open(self._path(key)) as f:
                 data = json.load(f)
             if data.get("version") != VERSION:
                 raise ValueError("old cache format")
-            self._last_read = (key, data["rows"])
-        return [dict(r) for r in self._last_read[1]]
+            self._last_read = (key, stamp, data["rows"])
+        return [dict(r) for r in self._last_read[2]]
+
+    def _file_stamp(self, key: str) -> tuple:
+        """(mtime, size) of a tenant file; raises when it is missing."""
+        st = os.stat(self._path(key))
+        return (st.st_mtime_ns, st.st_size)
 
     def _write_tenant(self, key: str, rows: List[dict]) -> None:
         """Replace one tenant's file (removed when it has no devices left),
@@ -144,6 +152,8 @@ class DeviceCache:
         self._last_read = None
         if rows:
             write_json(self._path(key), {"version": VERSION, "rows": rows})
+            # The next read of this tenant need not parse what we just wrote.
+            self._last_read = (key, self._file_stamp(key), [dict(r) for r in rows])
         else:
             try:
                 os.remove(self._path(key))
@@ -366,6 +376,14 @@ class DeviceCache:
                 if not self._walks:
                     self._journal = []
 
+    def journal_ids(self) -> set:
+        """Ids of the devices the spoke wrote during the current walk."""
+        with self.lock:
+            ids = set()
+            for op, payload in self._journal:
+                ids.update(payload if op == "remove" else (r.get("id") for r in payload))
+            return ids
+
     def _replay_journal(self) -> None:
         """Apply the writes seen during the current walk again, skipping a
         row older than the one the listing brought."""
@@ -409,13 +427,15 @@ class DeviceCache:
                          for k in tenants)
             return tenants[due[0][1]] if due and due[0][0] <= now else None
 
-    def mark_reconciled(self, slug: str, now: Optional[float] = None) -> None:
-        """Schedule the tenant's next reconcile a day from ``now``."""
+    def mark_reconciled(self, slug: str, now: Optional[float] = None,
+                        delay: Optional[float] = None) -> None:
+        """Schedule the tenant's next reconcile ``delay`` seconds (default a
+        day) from ``now``."""
         now = time.time() if now is None else now
         with self.lock:
             if self.load():
                 key = tenant_key({"tenant": {"slug": slug}})
-                self._meta.setdefault("reconcile", {})[key] = now + RECONCILE_EVERY_S
+                self._meta.setdefault("reconcile", {})[key] = now + (delay or RECONCILE_EVERY_S)
                 self._save_meta()
 
     # ── follow our own writes ──────────────────────────────────────────────
