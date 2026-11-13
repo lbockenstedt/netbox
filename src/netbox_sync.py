@@ -3032,13 +3032,15 @@ class SyncMixin:
         so a firewall/ARP feeder files them as a separate device (own name, no
         serial). A stub qualifies only when it is a different record whose MAC
         shares the first 5 octets, carries no serial (or the same one), is not
-        itself a polled network device, and is the same kind (controller vs not).
+        itself a polled network device, is in the same tenant (or none), and is the same
+        kind (controller vs not).
         Its IPs move onto ``devobj`` (interface ``lm-merged``), a journal entry
         records the merge, then the stub is deleted. Returns the number merged."""
         mine = re.sub(r"[^0-9a-f]", "", base_mac.lower())
         if len(mine) != 12:
             return 0
         my_id = getattr(devobj, "id", None)
+        my_tenant = getattr(getattr(devobj, "tenant", None), "id", None)
         merged = 0
         seen = set()
         for key, row in list((idx.get("by_mac") or {}).items()):
@@ -3046,6 +3048,12 @@ class SyncMixin:
             rid = row.get("id")
             if (len(other) != 12 or other == mine or other[:10] != mine[:10]
                     or rid in (None, my_id) or rid in seen):
+                continue
+            # by_mac holds every tenant's rows; another tenant's record of this
+            # box is theirs to keep (its feed would just re-create it). An
+            # untenanted stub has no owner and still merges.
+            row_tenant = (row.get("tenant") or {}).get("id")
+            if row_tenant is not None and row_tenant != my_tenant:
                 continue
             cf = row.get("custom_fields") or {}
             rserial = str(row.get("serial") or "").strip()

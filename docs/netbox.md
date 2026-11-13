@@ -206,8 +206,10 @@ keeps its history; the stub's few changelog entries are lost).
 
 1. **Sibling MAC** (`_merge_sibling_stubs`, during `sync_nw_device`): a stub whose
    MAC shares the first 5 octets with the polled base MAC, has no serial (or the
-   same one), is not itself a polled device and is the same kind (not a
-   management controller).
+   same one), is not itself a polled device, is in the same tenant (or none) and is the
+   same kind (not a management controller). Another tenant's record of the box
+   (e.g. its DHCP lease feed) is left alone: deleting it only made that feed
+   re-create it every cycle.
 2. **Live poll** (`nw_merge_stubs_by_live_poll`, hub): after a successful push the
    hub lists stubs (`NETBOX_LIST_STUBS`: IP, no serial, no `nw_device_id`), takes
    those in the same /16 as the device, probes each stub IP through the device's
