@@ -167,7 +167,9 @@ backend), `TENANT` the tenant group. A trailing `R` on the RU means **rear**.
   first, an *offline* holder is unracked (replaced), and only an *online* holder
   still named for the slot is a real conflict. Chains are capped so swaps and
   cycles are reported, not looped. A slot held by a device's own management
-  controller is released (it sits inside the server).
+  controller is released (it sits inside the server). A controller finds its
+  server by its own link, or else by the server's link to it (the controller's
+  link may hold the host's agent hostname rather than its NetBox name).
 - **Half-width chassis** (two per U, e.g. Aruba CX 9004): a device type is
   half-width when its comments say `half-width` or the model is a known one
   (9004), **or** the name carries `H` after the RU (`R43H`). Devices naming the
