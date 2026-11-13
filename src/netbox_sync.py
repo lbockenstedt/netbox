@@ -196,6 +196,8 @@ class _DeviceSyncRun:
     owned_ips: set = field(default_factory=set)  # primary IPs of devices we own
     # The batch's identities were already read from NetBox (a targeted lookup).
     looked_up: bool = False
+    # The rows that lookup returned, indexed once the cached rows are.
+    looked_up_rows: list = field(default_factory=list)
     # Names created/refreshed THIS batch: a 2nd create with the same name would
     # 400 on (name, site, tenant), and by_name can't see these.
     used_names: set = field(default_factory=set)
@@ -1552,6 +1554,8 @@ class SyncMixin:
                     addr = _primary_addr(r)
                     if addr and not r.get("tenant"):
                         run.by_ip.setdefault(addr, r)
+            # A targeted lookup's rows carry NetBox edits the cache kept out.
+            self._index_found_rows(run, run.looked_up_rows)
 
             # replace=True and tenant-scoped: remove owned devices missing from the feed.
             if replace and tenant_slug:
@@ -1760,11 +1764,11 @@ class SyncMixin:
         if (not replace and run.source_tag in TARGETED_SOURCES
                 and len(incoming) <= _TARGETED_LOOKUP_MAX):
             recs = [_IncomingDevice(k, r) for k, r in incoming.items()]
-            self._lookup_devices(serials=[d.serial for d in recs],
-                                 macs=[d.mac for d in recs],
-                                 names=[d.hostname for d in recs],
-                                 tenant_id=getattr(run.tenant, "id", None),
-                                 ips=[d.real_ip for d in recs])
+            run.looked_up_rows = self._lookup_devices(serials=[d.serial for d in recs],
+                                                      macs=[d.mac for d in recs],
+                                                      names=[d.hostname for d in recs],
+                                                      tenant_id=getattr(run.tenant, "id", None),
+                                                      ips=[d.real_ip for d in recs])
             run.looked_up = True
         all_rows = self._all_devices_cached()
         # Unscoped sync: every device is indexed; no separate global list needed.
@@ -1950,22 +1954,53 @@ class SyncMixin:
 
     def _index_looked_up_devices(self, run: "_DeviceSyncRun", d: "_IncomingDevice") -> bool:
         """Read the record's serial, MAC and hostname from NetBox
-        (``_lookup_devices``) and add devices the cache did not have, or whose
-        name, serial, MAC or primary IP changed in NetBox since the run's
-        rows were read, to the run's indexes. True when any was added."""
-        tenant_id = getattr(run.tenant, "id", None)
+        (``_lookup_devices``) and index what it finds
+        (``_index_found_rows``). True when the indexes changed."""
         found = self._lookup_devices(serials=[d.serial], macs=[d.mac],
                                      names=[d.hostname] if d.has_hostname else [],
-                                     tenant_id=tenant_id, ips=[d.real_ip])
-        new = [r for r in found if r.get("id") not in run.device_rows
-               or self._row_identity(r) != self._row_identity(run.device_rows[r["id"]])]
-        # This sync's own scope is indexed fully; other tenants only by MAC/serial.
-        own = [r for r in new if not tenant_id or (r.get("tenant") or {}).get("id") == tenant_id]
+                                     tenant_id=getattr(run.tenant, "id", None), ips=[d.real_ip])
+        return self._index_found_rows(run, found)
+
+    def _index_found_rows(self, run: "_DeviceSyncRun", found: list) -> bool:
+        """Index rows just read from NetBox that the run's indexes lack, or
+        hold with another name, serial, MAC or primary IP. The cache keeps a
+        scanner-owned row as it was (the reconcile puts NetBox edits back),
+        so these rows are the only place a person's edit shows up; matching
+        on it stops a duplicate create. A changed device's old keys are
+        removed first, so a record using its old identity no longer matches
+        it. True when any row was indexed."""
+        if not found:
+            return False
+        indexes = (run.by_name, run.by_mac, run.by_serial, run.by_ip)
+        # The row each device id is currently indexed by.
+        indexed: Dict[Any, dict] = {}
+        for idx in indexes:
+            for row in idx.values():
+                indexed.setdefault(row.get("id"), row)
+        changed = [r for r in found if r.get("id") is not None and (
+            r["id"] not in indexed
+            or self._row_identity(r) != self._row_identity(indexed[r["id"]]))]
+        if not changed:
+            return False
+        # Drop every key that still points at a changed device's old row.
+        ids = {r["id"] for r in changed}
+        for idx in indexes:
+            for key in [k for k, row in idx.items() if row.get("id") in ids]:
+                del idx[key]
+                if idx is run.by_ip:
+                    run.owned_ips.discard(key)
+        # This sync's own scope is indexed fully; other tenants by MAC/serial,
+        # plus their IP when they have no tenant (adopted, as in the listing).
+        tenant_id = getattr(run.tenant, "id", None)
+        own = [r for r in changed if not tenant_id or (r.get("tenant") or {}).get("id") == tenant_id]
+        other = [r for r in changed if r not in own]
         self._index_sync_rows(run, own)
-        self._add_global_identities(run.by_mac, run.by_serial,
-                                    rows=[r for r in new if r not in own])
+        self._add_global_identities(run.by_mac, run.by_serial, rows=other)
+        for r in other:
+            if _primary_addr(r) and not r.get("tenant"):
+                run.by_ip.setdefault(_primary_addr(r), r)
         run.device_rows.update((r["id"], r) for r in own)
-        return bool(new)
+        return True
 
     def _match_existing_device(self, run: "_DeviceSyncRun",
                                d: "_IncomingDevice") -> Optional[dict]:
@@ -2690,18 +2725,24 @@ class SyncMixin:
                 "skipped": run.skipped, "deleted": run.deleted,
                 "devices_total": devices_total, "message": msg}
 
-    def _resolve_nw_device(self, tenant, is_mgmt: bool, **ident) -> Tuple[dict, Optional[dict]]:
+    def _resolve_nw_device(self, tenant, is_mgmt: bool, fresh: Optional[list] = None,
+                           **ident) -> Tuple[dict, Optional[dict]]:
         """``(index, existing row or None)`` for a polled network device, from
         the cached rows of its tenant (or every tenant when it has none) plus
         every tenant's MACs and serials, walked with the canonical ladder.
+        ``fresh`` rows, just read from NetBox, replace the cached rows with
+        the same id: the cache keeps a scanner-owned row as it was, so a name,
+        serial or MAC someone set in NetBox shows up only there.
         ``ident`` carries serial, mac, nw_device_id, ip and hostname."""
-        # Index the tenant's cached rows, plus global MAC/serial identities.
-        rows = self._all_devices_cached()
+        # Every cached row, with the fresh rows in place of their cached copy.
+        by_id = {r.get("id"): r for r in self._all_devices_cached()}
+        by_id.update((r.get("id"), r) for r in fresh or [])
+        rows = list(by_id.values())
+        # Index the tenant's rows, plus global MAC/serial identities.
+        mine = [r for r in rows if (r.get("tenant") or {}).get("id") == tenant.id] if tenant else rows
+        idx = self._index_existing_devices(mine)
         if tenant:
-            rows = [r for r in rows if (r.get("tenant") or {}).get("id") == tenant.id]
-        idx = self._index_existing_devices(rows)
-        if tenant:
-            self._add_global_identities(idx["by_mac"], idx["by_serial"],
+            self._add_global_identities(idx["by_mac"], idx["by_serial"], rows=rows,
                                         by_serial_mgmt=idx["by_serial_mgmt"])
         # Walk the ladder; a controller and a server are never the same object.
         existing = self._resolve_existing_device(
@@ -2815,17 +2856,17 @@ class SyncMixin:
                 # and after asking NetBox by serial / MAC / name when the cache
                 # has no match, in case someone added the device there since
                 # the last reconcile.
-                looked_up, devobj = False, None
+                looked_up, fresh, devobj = False, [], None
                 # Two stale rows can 404 before the lookup, so up to four passes.
                 for _attempt in range(4):
                     idx, existing = self._resolve_nw_device(
-                        tenant, is_mgmt, serial=serial, mac=base_mac, nw_device_id=nw_id,
-                        ip=mgmt_ip, hostname=name)
+                        tenant, is_mgmt, fresh=fresh, serial=serial, mac=base_mac,
+                        nw_device_id=nw_id, ip=mgmt_ip, hostname=name)
                     if existing is None:
                         if looked_up:
                             break
-                        self._lookup_devices(serials=[serial], macs=[base_mac], names=[name],
-                                             tenant_id=getattr(tenant, "id", None), ips=[mgmt_ip])
+                        fresh = self._lookup_devices(serials=[serial], macs=[base_mac], names=[name],
+                                                     tenant_id=getattr(tenant, "id", None), ips=[mgmt_ip])
                         looked_up = True
                         continue
                     devobj = self.nb.dcim.devices.get(existing["id"])
@@ -2834,6 +2875,7 @@ class SyncMixin:
                     # A cached device NetBox no longer has (deleted outside LM):
                     # the GET's 404 dropped it from the cache; it is created again.
                     logger.info("sync_nw_device: device %s was deleted in NetBox", existing["id"])
+                    fresh = [r for r in fresh if r.get("id") != existing["id"]]
                     existing = None
             except Exception as e:
                 return {"status": "ERROR",

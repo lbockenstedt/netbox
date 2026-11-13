@@ -585,3 +585,59 @@ def test_mac_added_in_netbox_since_the_cache_matches_instead_of_creating():
                            defaults={"site": "lab"})
     assert res["status"] == "SUCCESS", res
     assert set(f.db["devices"]) == {100}, sorted(f.db["devices"])
+
+
+def test_old_mac_no_longer_matches_a_device_whose_mac_changed_in_netbox():
+    # Device 100's MAC changed from A to B in NetBox. The record with B
+    # updates 100; a later record in the same batch still using A is a
+    # different machine and must not be folded into 100.
+    f, _ = _world()
+    old, new = "aa:bb:cc:00:09:01", "aa:bb:cc:00:09:02"
+    _add_device(f, 100, "PRINTER", old, "10.1.0.50", "printer", {"mac_address": old})
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    f.db["devices"][100]["custom_fields"]["mac_address"] = new
+    f.db["devices"][100]["last_updated"] = f._stamp()
+    res = eng.sync_devices([{"ip": "10.1.0.98", "mac": new}, {"ip": "10.1.0.99", "mac": old}],
+                           tenant_slug="t1", defaults={"site": "lab"})
+    assert res["status"] == "SUCCESS", res
+    assert len(f.db["devices"]) == 2, sorted(f.db["devices"])
+    other = [d for i, d in f.db["devices"].items() if i != 100][0]
+    assert other["custom_fields"].get("mac_address") == old
+
+
+def test_console_batch_matches_a_scanner_device_by_a_mac_added_in_netbox():
+    # The cache keeps a scanner-owned row as it was, so the Console batch's
+    # up-front lookup must index the rows it read, or a MAC someone added in
+    # NetBox is missed and the console probe creates a duplicate.
+    f, _ = _world()
+    _add_device(f, 100, "SW9", "", "10.1.0.50", "sw9", {"discovered_from": "Network Devices"},
+                ip_cf={})
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    mac = "aa:bb:cc:00:09:03"
+    f.db["devices"][100]["custom_fields"]["mac_address"] = mac
+    f.db["devices"][100]["last_updated"] = f._stamp()
+    res = eng.sync_devices([{"ip": "10.1.0.99", "mac": mac}], tenant_slug="t1",
+                           defaults={"site": "lab"}, source="Console")
+    assert res["status"] == "SUCCESS", res
+    assert set(f.db["devices"]) == {100}, sorted(f.db["devices"])
+
+
+def test_nw_poll_matches_a_scanner_device_by_a_serial_added_in_netbox():
+    # Same for a polled switch: its serial was set in NetBox after the cache
+    # read the row; the poll (new name and IP) updates it instead of creating.
+    f, _ = _world()
+    _add_device(f, 100, "SW9", "", "10.1.0.50", "sw9", {"discovered_from": "Network Devices"},
+                ip_cf={})
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    f.db["devices"][100]["serial"] = "SER9"
+    f.db["devices"][100]["last_updated"] = f._stamp()
+    res = eng.sync_nw_device(device={"id": "nw-9", "name": "core9", "address": "10.0.0.9",
+                                     "serial": "SER9"},
+                             interfaces=[], tenant_slug="t1",
+                             defaults={"device_type": "discovered", "role": "discovered",
+                                       "site": "lab"})
+    assert res["errors"] == 0, res
+    assert res["device_id"] == 100 and set(f.db["devices"]) == {100}
