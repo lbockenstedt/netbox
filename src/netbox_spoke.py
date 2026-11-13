@@ -576,6 +576,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_MIGRATE_TENANT", "NETBOX_SEED_CATALOG",
         "NETBOX_IMPORT_RACK_DETECT", "NETBOX_IMPORT_RACK_COMMIT",
         "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP", "NETBOX_NORMALIZE_DEVICE_NAMES",
+        "NETBOX_REPLACE_RESERVATION_MAC",
     })
 
     # Writes the hub/nw/cppm feeders make continuously; they must not flush the
@@ -769,7 +770,8 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_LIST_STUBS", "NETBOX_COUNT"})
     _SHARED_RUNS = frozenset({
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_AUTORACK_SWEEP",
-        "NETBOX_STALENESS_SWEEP", "NETBOX_RESERVE_STATIC_HOSTS"})
+        "NETBOX_STALENESS_SWEEP", "NETBOX_RESERVE_STATIC_HOSTS",
+        "NETBOX_REPLACE_RESERVATION_MAC"})
     _READ_REUSE_S = 10.0
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1176,7 +1178,19 @@ class NetboxSpoke(BaseSpoke):
             # A background command keeps the list cache; drop it after any
             # write (including a pass whose rollback failed) so the hub's
             # next IP read (the DHCP sync) sees NetBox as it is.
-            if res.get("changes") or res.get("rolled_back") or res.get("rollback_failed"):
+            if res.get("changes") or res.get("replaced") or res.get("rolled_back") \
+                    or res.get("rollback_kept") or res.get("rollback_failed"):
+                self._list_invalidate()
+            return res
+
+        # The "Use new MAC" button: move one reservation (and its interface
+        # MAC) to the device's new MAC now (see netbox_static_reservations).
+        if normalized == "NETBOX_REPLACE_RESERVATION_MAC":
+            res = await self._run_sync(
+                netbox_static_reservations.replace_reservation_mac, self.engine, data,
+                self.__dict__.setdefault("_static_res_failed", {}), time.time())
+            if res.get("replaced") or res.get("rolled_back") or res.get("rollback_kept") \
+                    or res.get("rollback_failed"):
                 self._list_invalidate()
             return res
 
