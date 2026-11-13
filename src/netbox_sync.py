@@ -1028,9 +1028,11 @@ class SyncMixin:
         values; the before/after record, or None when nothing drifted."""
         before: Dict[str, Any] = {}
         after: Dict[str, Any] = {}
+        # Top-level scanner fields that differ from the cache.
         for k in SCANNER_FIELDS:
             if (cached.get(k) or "") != (live.get(k) or ""):
                 before[k], after[k] = live.get(k), cached.get(k)
+        # Scanner custom fields that differ (only those keys are sent).
         ccf, lcf = cached.get("custom_fields") or {}, live.get("custom_fields") or {}
         cf = {k: ccf.get(k) for k in SCANNER_CUSTOM_FIELDS if (ccf.get(k) or "") != (lcf.get(k) or "")}
         if cf:
@@ -1038,6 +1040,7 @@ class SyncMixin:
             after["custom_fields"] = cf
         if not after:
             return None
+        # Push the cached values back and report what changed.
         self.nb.dcim.devices.update([{"id": live["id"], **after}])
         logger.info("device reconcile: device %s: reverted %s", live["id"], ", ".join(sorted(
             list(k for k in after if k != "custom_fields") + list(cf))))
