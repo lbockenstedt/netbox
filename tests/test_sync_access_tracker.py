@@ -45,6 +45,8 @@ def _engine_with(existing_rows, tenant_obj=None):
     # that need the reuse path override ip_addresses.get.return_value.
     eng.nb.ipam.ip_addresses.get.return_value = None
     eng.nb.dcim.interfaces.get.return_value = None
+    # The device cache files rows by tenant; untagged rows belong to "lrb".
+    existing_rows = [{"tenant": {"id": 1, "slug": "lrb"}, **r} for r in existing_rows]
     eng._api_get_all = MagicMock(return_value=existing_rows)
     eng._api_get = MagicMock(return_value={"results": []})
     return eng
