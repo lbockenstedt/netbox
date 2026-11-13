@@ -105,6 +105,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 | `NETBOX_ALLOCATE_IP` | `allocate_ip` | Reserves the next available IP address in a prefix. |
 | `NETBOX_RELEASE_IP` | `release_ip` | Deletes an IP address record. |
 | `NETBOX_UPDATE_IP_ADDR` / `NETBOX_UPDATE_IP` | `update_ip_address` | Updates DNS name, description, status, or custom fields of an IP. |
+| `NETBOX_RESERVE_STATIC_HOSTS` | `netbox_static_reservations.reserve_static_hosts` | Marks static hosts as DHCP reservations from hub-relayed agent/sweep/Kea data; reports before/after, rolls back on failure. |
 | `NETBOX_DOC_VM` | `create_vm_entry` | Creates or updates a virtual machine entry with primary IP. |
 | `NETBOX_GET_TENANTS` | `get_tenants` | Lists all tenants configured in NetBox. |
 | `NETBOX_MIGRATE_TENANT` | `migrate_tenant` | Reassigns all DCIM/IPAM/VM objects from source to target tenant. |
