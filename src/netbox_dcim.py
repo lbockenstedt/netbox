@@ -254,6 +254,31 @@ class DcimMixin:
             # API failure.
             return {"status": "ERROR", "message": str(e)}
 
+    def count_tenant_objects(self, tenant: Optional[str] = None,
+                             tenant_group: Optional[str] = None) -> Dict[str, Any]:
+        """Count the devices, prefixes and IP addresses of a tenant (or tenant
+        group, which supersedes ``tenant`` as in :meth:`get_devices`; neither
+        counts everything). Each is one ``limit=1`` read of NetBox's own
+        ``count``, instead of fetching every row just to count it."""
+        try:
+            params: Dict[str, Any] = {"limit": 1, "brief": 1}
+            if tenant_group:
+                params["tenant_group"] = tenant_group
+            elif tenant:
+                params["tenant"] = tenant
+            counts = {"status": "SUCCESS"}
+            for key, path in (("devices", "/api/dcim/devices/"),
+                              ("prefixes", "/api/ipam/prefixes/"),
+                              ("ip_addresses", "/api/ipam/ip-addresses/")):
+                count = self._api_get(path, params).get("count")
+                # A reply without a whole-number count is an error, never zero.
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise ValueError(f"NetBox {path} reply has no count")
+                counts[key] = count
+            return counts
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
     def get_cables(self, site: Optional[str] = None) -> Dict[str, Any]:
         """Retrieve physical device-to-device cable connections.
 

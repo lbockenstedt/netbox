@@ -131,6 +131,17 @@ optional **`tenant_group`** slug alongside the existing `tenant` slug.
 server-side. Sending neither is unscoped (all tenants), exactly as before — so
 an older hub that never sends `tenant_group` is unaffected.
 
+- **`NETBOX_COUNT`**
+  - **Purpose**: A tenant's device, prefix and IP-address counts for the hub's
+    admin overview, from NetBox's own `count` (one `limit=1` read per type)
+    instead of fetching every row.
+  - **Payload**: `{"tenant": "<slug>"?, "tenant_group": "<slug>"?}` — scoped like
+    the list commands above; neither counts all tenants.
+  - **Response**: `{"status": "SUCCESS", "devices": N, "prefixes": N,
+    "ip_addresses": N}`, or `{"status": "ERROR", "message": ...}` when any read
+    fails or has no count (never a zero). Cached and shared like the list reads.
+    An older spoke answers "Unknown command"; the hub then counts the full lists.
+
 ### Tenant Self-Service Subnet Allocation
 - **`NETBOX_FIND_AVAILABLE_PREFIXES`**
   - **Purpose**: Finds the closest free subnets of a requested size to a
