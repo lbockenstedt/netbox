@@ -179,6 +179,8 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         # device-roles). Keyed "kind:slug"; each entry {"ts", "value"}. Shared
         # across every mixin because they all share `self`.
         self._ref_cache: Dict[str, Any] = {}
+        # Hook the device cache onto the session so it follows our writes.
+        self._device_cache()
         logger.info(f"Initialized NetboxEngine v{version} → {url}")
 
     def reconnect(self, url: str, token: str, verify_ssl: bool = None):
@@ -195,6 +197,8 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         self._apply_timeout()
         # A new API target invalidates any slug→object mappings from the old one.
         self._ref_cache = {}
+        # The new session needs the device-cache hook (a new URL gets a new cache).
+        self._device_cache()
 
     def _cached_ref(self, kind: str, slug: str, fetch):
         """TTL-cached slug→object resolver for rarely-changing reference data.

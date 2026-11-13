@@ -362,8 +362,6 @@ class DedupeMixin:
         self._journal("dcim.device", dupe["id"], "dedupe-merge",
                       note=f"merged duplicate into device {survivor['id']}")
         dobj.delete()
-        self._forget_cached_device(dupe["id"])
-        self._recheck_device_cache()  # the survivor may have changed
         return True
 
     def _repoint_ips(self, sobj, dobj) -> None:

@@ -154,6 +154,7 @@ class FakeNetBox(BaseAdapter):
                 self._maybe_fail("GET", coll, "list-global")
             return 200, self._list(coll, q, path)
         if method == "POST":
+            self._maybe_fail("POST", coll, "create")
             return 201, self._create(coll, body or {})
         if method == "PATCH" and isinstance(body, list):  # bulk update
             out = []
@@ -165,6 +166,12 @@ class FakeNetBox(BaseAdapter):
                 self._patch(coll, obj, {k: v for k, v in item.items() if k != "id"})
                 out.append(self.render(coll, obj))
             return 200, out
+        if method == "DELETE" and isinstance(body, list):  # bulk delete
+            for item in body:
+                if item.get("id") not in self.db[coll]:
+                    raise _Http(400, {"detail": f"id {item.get('id')} not found"})
+                self._delete(coll, item["id"])
+            return 204, None
         raise _Http(405, {"detail": "method"})
 
     def _maybe_fail(self, method: str, coll: str, key: Any) -> None:
@@ -188,16 +195,28 @@ class FakeNetBox(BaseAdapter):
             tid = self._slug_to_id("tenants", one("tenant"))
             rows = [r for r in rows if r.get("tenant_id") == tid and tid is not None]
         if one("tenant_id") is not None:
-            rows = [r for r in rows if str(r.get("tenant_id")) == one("tenant_id")]
+            want = None if one("tenant_id") == "null" else one("tenant_id")
+            rows = [r for r in rows if (r.get("tenant_id") is None if want is None
+                                        else str(r.get("tenant_id")) == want)]
+        if coll == "devices":
+            # Multi-value identity filters (any value matches), as NetBox does.
+            if "serial" in q:
+                rows = [r for r in rows if r.get("serial") in q["serial"]]
+            if "name__ie" in q:
+                names = {n.lower() for n in q["name__ie"]}
+                rows = [r for r in rows if str(r.get("name") or "").lower() in names]
+            if "cf_mac_address" in q:
+                macs = {m.lower() for m in q["cf_mac_address"]}
+                rows = [r for r in rows
+                        if str((r.get("custom_fields") or {}).get("mac_address") or "").lower()
+                        in macs]
         if one("device_id") is not None:
             rows = [r for r in rows if str(r.get("device_id")) == one("device_id")]
         if coll == "ip-addresses":
-            addr = one("address")
-            if addr is not None:
-                if "/" in addr:
-                    rows = [r for r in rows if r["address"] == addr]
-                else:
-                    rows = [r for r in rows if _host(r["address"]) == addr]
+            if "address" in q:  # any of the given addresses
+                want = set(q["address"])
+                rows = [r for r in rows
+                        if r["address"] in want or _host(r["address"]) in want]
             if one("vrf_id") is not None:
                 want = None if one("vrf_id") == "null" else one("vrf_id")
                 rows = [r for r in rows
@@ -376,6 +395,16 @@ class FakeNetBox(BaseAdapter):
             out["display"] = str(r.get("name") or r.get("address") or r.get("model") or oid)
         return out
 
+    def _assigned_interface(self, ip: dict):
+        """An IP's nested ``assigned_object`` (interface with its device), as
+        NetBox renders it; None when not on a device interface."""
+        iface = (self.db["interfaces"].get(ip.get("assigned_object_id"))
+                 if ip.get("assigned_object_type") == "dcim.interface" else None)
+        if iface is None:
+            return None
+        return {"id": iface["id"], "name": iface.get("name"),
+                "device": self._nested("devices", iface.get("device_id"), "dcim")}
+
     def render(self, coll: str, obj: dict) -> dict:
         app = next(a for a, c in _COLLECTIONS if c == coll)
         base = {"id": obj["id"], "url": f"{BASE}/api/{app}/{coll}/{obj['id']}/",
@@ -398,6 +427,7 @@ class FakeNetBox(BaseAdapter):
                     "dns_name": obj.get("dns_name") or "",
                     "assigned_object_type": obj.get("assigned_object_type"),
                     "assigned_object_id": obj.get("assigned_object_id"),
+                    "assigned_object": self._assigned_interface(obj),
                     "custom_fields": copy.deepcopy(obj.get("custom_fields") or {})}
         if coll == "interfaces":
             mac = self.db["mac-addresses"].get(obj.get("primary_mac_address_id")) or {}
