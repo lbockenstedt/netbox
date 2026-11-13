@@ -432,13 +432,28 @@ class DcimMixin:
                         port_index[dev.id] = {
                             i.name: i for i in self.nb.dcim.interfaces.filter(device_id=dev.id)}
                     iface = port_index[dev.id].get(port_name)
+                    # Another sync may have added the port since this batch's listing.
+                    if iface is None:
+                        iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
                 else:
                     iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
-                if iface:
-                    return iface
-                # Otherwise create it.
-                return self.nb.dcim.interfaces.create(
-                    device=dev.id, name=port_name, type="other")
+                if iface is None:
+                    try:
+                        iface = self.nb.dcim.interfaces.create(
+                            device=dev.id, name=port_name, type="other")
+                    except Exception as e:
+                        # A concurrent poll can win between lookup and create.
+                        # Recover only this uniqueness conflict; other failures surface.
+                        if "interface with this device and name already exists" not in str(e).lower():
+                            raise
+                        iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
+                        if iface is None:
+                            raise
+                # Keep the port even if cabling is skipped or fails below. Otherwise
+                # the next link in this batch tries to create the same port again.
+                if port_index is not None:
+                    port_index[dev.id][port_name] = iface
+                return iface
 
             # Both ports.
             iface_a = _find_or_create_iface(dev_a, a_port)
