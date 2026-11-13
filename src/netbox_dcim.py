@@ -143,6 +143,16 @@ def _vm_row(vm: Dict) -> Dict:
 _SEED_CATALOG_PATH = Path(__file__).parent / "seed_catalog.json"
 
 
+def _lldp_creatable_name(name: str) -> bool:
+    """True when an LLDP neighbour name can become a new device: a hostname
+    of 3+ characters, not an IP address and not a bare MAC."""
+    name = name or ""
+    return (len(name) >= 3 and ".." not in name
+            and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name))
+            and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name)
+            and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())))
+
+
 class DcimMixin:
     """DCIM sites/racks/devices + health + universal search methods for NetboxEngine."""
 
@@ -432,13 +442,28 @@ class DcimMixin:
                         port_index[dev.id] = {
                             i.name: i for i in self.nb.dcim.interfaces.filter(device_id=dev.id)}
                     iface = port_index[dev.id].get(port_name)
+                    # Another sync may have added the port since this batch's listing.
+                    if iface is None:
+                        iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
                 else:
                     iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
-                if iface:
-                    return iface
-                # Otherwise create it.
-                return self.nb.dcim.interfaces.create(
-                    device=dev.id, name=port_name, type="other")
+                if iface is None:
+                    try:
+                        iface = self.nb.dcim.interfaces.create(
+                            device=dev.id, name=port_name, type="other")
+                    except Exception as e:
+                        # A concurrent poll can win between lookup and create.
+                        # Recover only this uniqueness conflict; other failures surface.
+                        if "interface with this device and name already exists" not in str(e).lower():
+                            raise
+                        iface = self.nb.dcim.interfaces.get(device_id=dev.id, name=port_name)
+                        if iface is None:
+                            raise
+                # Keep the port even if cabling is skipped or fails below. Otherwise
+                # the next link in this batch tries to create the same port again.
+                if port_index is not None:
+                    port_index[dev.id][port_name] = iface
+                return iface
 
             # Both ports.
             iface_a = _find_or_create_iface(dev_a, a_port)
@@ -566,16 +591,34 @@ class DcimMixin:
                     "renamed": 0, "errors": 0}
         messages = []
 
-        # List every device (shared cached listing; matched devices are
-        # rebuilt from their row, so it is only used for matching).
+        # Every device's slim identity row from the device cache (no NetBox
+        # read once it is built); matched devices load their full cached row.
         try:
             rows = self._all_devices_cached()
         except Exception as e:
             # Listing failed.
             return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}", **counters}
 
-        # Identity index over existing devices.
+        # Tenant and lazily resolved defaults for created devices.
+        tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
+        if tenant_slug and tenant is None:
+            # Unscoped matching would reach every tenant's devices.
+            return {"status": "ERROR", "message": f"NetBox tenant '{tenant_slug}' not found",
+                    **counters}
+        tenant_id = getattr(tenant, "id", None)
+        role = dtype = site = None
+        created_device = False
+
+        # Identity index over the tenant's devices (and untenanted ones), plus
+        # every tenant's MACs and serials so a box another tenant holds is
+        # recognised, not duplicated (it is then left alone, see resolve()).
+        # The tenant's own rows first, so they win a key an untenanted row shares.
+        every_row = rows
+        rows = sorted((r for r in rows if self._tenant_rank(r, tenant_id) < 2),
+                      key=lambda r: self._tenant_rank(r, tenant_id))
         idx = self._index_existing_devices(rows)
+        if tenant_id:
+            self._add_global_identities(idx["by_mac"], idx["by_serial"], rows=every_row)
 
         # Build by_short index
         # Count devices by short name.
@@ -591,11 +634,6 @@ class DcimMixin:
             short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
             if short_counts[short] == 1:
                 by_short[short] = row
-
-        # Tenant and lazily resolved defaults for created devices.
-        tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
-        role = dtype = site = None
-        created_device = False
 
         # Cache of resolved ends.
         cache = {}
@@ -642,10 +680,32 @@ class DcimMixin:
                 if not row and name:
                     short = name.lower().split(".", 1)[0] if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) else name.lower()
                     row = by_short.get(short)
+                # Unknown to the cache and about to be created: ask NetBox by
+                # MAC and name first, in case someone added the device there.
+                if not row and create_missing and _lldp_creatable_name(name):
+                    hits = self._lookup_devices(serials=[end.get("serial")], macs=macs,
+                                                names=[name] if name else [], tenant_id=tenant_id)
+                    # As the ladder: a serial or MAC match before a name match;
+                    # then the tenant's own device, an untenanted one; lowest id.
+                    serial = str(end.get("serial") or "").strip().lower()
+                    row = min(hits, default=None, key=lambda r: (
+                        not ((serial and str(r.get("serial") or "").strip().lower() == serial)
+                             or self._norm_mac((r.get("custom_fields") or {})
+                                               .get("mac_address") or "") in macs),
+                        self._tenant_rank(r, tenant_id),
+                        r.get("id") or 0))
             except Exception as e:
                 # Resolution failed.
                 counters["errors"] += 1
                 messages.append(f"failed to resolve device {name}: {e}")
+                return None
+
+            # Another tenant's device (matched by MAC or serial): known, so
+            # not created again, but not ours to update or cable.
+            if row and self._tenant_rank(row, tenant_id) == 2:
+                messages.append(f"{name or key}: device {row.get('id')} belongs to "
+                                f"another tenant; left alone")
+                # Not memoised: the key may be a name another end shares.
                 return None
 
             # Existing device: backfill its MAC and adopt the LLDP name.
@@ -654,7 +714,7 @@ class DcimMixin:
                 # Update failures are only logged.
                 try:
                     # Rebuild the record from its listed row; set the MAC if it has none.
-                    rec = self._hydrate_record(row, self.nb.dcim.devices)
+                    rec = self._hydrate_record(self._full_device_row(row), self.nb.dcim.devices)
                     if rec and macs and not (rec.custom_fields or {}).get("mac_address"):
                         cf = dict(rec.custom_fields or {})
                         cf["mac_address"] = macs[0]
@@ -668,9 +728,7 @@ class DcimMixin:
                 except Exception as e:
                     # Update failed.
                     logger.debug(f"failed to update custom fields for device {row['id']}: {e}")
-            elif create_missing and len(name) >= 3 and ".." not in name \
-                    and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name) and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) \
-                    and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())):
+            elif create_missing and _lldp_creatable_name(name):
                 # First creation: provision custom fields and resolve role/type/site once.
                 if not created_device:
                     try:
@@ -705,7 +763,6 @@ class DcimMixin:
                 try:
                     # Create, tag as LLDP-discovered and journal it.
                     rec = self.nb.dcim.devices.create(**ck)
-                    self._recheck_device_cache()  # next listing must see it
                     rec.custom_fields = {"discovered_from": "LLDP", **({"mac_address": macs[0]} if macs else {})}
                     rec.save()
                     self._journal("dcim.device", rec.id, "lldp", note=f"created from LLDP neighbour {name}")
@@ -1030,7 +1087,6 @@ class DcimMixin:
                 face=face,
                 status=status,
             )
-            self._recheck_device_cache()  # next listing must see it
             # New device id.
             return {"status": "SUCCESS", "device_id": device.id, "name": name, "rack": rack_name, "unit": rack_unit}
         except Exception as e:
@@ -1117,7 +1173,6 @@ class DcimMixin:
                 create_kwargs["tenant"] = tenant.id
             # Create the device.
             device = self.nb.dcim.devices.create(**create_kwargs)
-            self._recheck_device_cache()  # next listing must see it
 
             # Attach the IP, if given.
             attached_ip = ""
@@ -1215,7 +1270,6 @@ class DcimMixin:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
             # Delete it.
             device.delete()
-            self._forget_cached_device(device_id)
             return {"status": "SUCCESS"}
         except Exception as e:
             # API failure.
@@ -2338,7 +2392,6 @@ class DcimMixin:
                         else:
                             # New device: create it.
                             device = self.nb.dcim.devices.create(**payload)
-                            self._recheck_device_cache()  # next listing must see it
                             devices_created += 1
 
                         # ── mgmt interface + IP (mirror claim_device) ──────────
