@@ -21,7 +21,10 @@ def _rec(dev_id, name, cf=None):
 def _engine(rows, recs):
     eng = NetboxEngine.__new__(NetboxEngine)
     eng.nb = MagicMock()
-    eng._api_get_all = MagicMock(return_value=rows)
+    # The plain listing builds the device cache; filtered lookups find nothing.
+    eng._api_get_all = MagicMock(
+        side_effect=lambda path, params=None, **k: [] if {"serial", "cf_mac_address", "name__ie"}
+        & set(params or {}) else rows)
     eng.nb.dcim.devices.get.side_effect = lambda *a, **k: recs.get(a[0]) if a else None
     eng._journal = MagicMock()
     eng._ensure_custom_fields = MagicMock()

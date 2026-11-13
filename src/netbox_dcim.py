@@ -581,8 +581,8 @@ class DcimMixin:
                     "renamed": 0, "errors": 0}
         messages = []
 
-        # List every device (shared cached listing; matched devices are
-        # rebuilt from their row, so it is only used for matching).
+        # Every device's slim identity row from the device cache (no NetBox
+        # read once it is built); matched devices load their full cached row.
         try:
             rows = self._all_devices_cached()
         except Exception as e:
@@ -657,6 +657,12 @@ class DcimMixin:
                 if not row and name:
                     short = name.lower().split(".", 1)[0] if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) else name.lower()
                     row = by_short.get(short)
+                # Unknown to the cache: ask NetBox by MAC and name before a
+                # create, in case someone added the device there.
+                if not row and create_missing and (macs or name):
+                    hits = self._lookup_devices(macs=macs, names=[name] if name else [],
+                                                tenant_id=getattr(tenant, "id", None))
+                    row = hits[0] if hits else None
             except Exception as e:
                 # Resolution failed.
                 counters["errors"] += 1
@@ -669,7 +675,7 @@ class DcimMixin:
                 # Update failures are only logged.
                 try:
                     # Rebuild the record from its listed row; set the MAC if it has none.
-                    rec = self._hydrate_record(row, self.nb.dcim.devices)
+                    rec = self._hydrate_record(self._full_device_row(row), self.nb.dcim.devices)
                     if rec and macs and not (rec.custom_fields or {}).get("mac_address"):
                         cf = dict(rec.custom_fields or {})
                         cf["mac_address"] = macs[0]
@@ -720,7 +726,6 @@ class DcimMixin:
                 try:
                     # Create, tag as LLDP-discovered and journal it.
                     rec = self.nb.dcim.devices.create(**ck)
-                    self._recheck_device_cache()  # next listing must see it
                     rec.custom_fields = {"discovered_from": "LLDP", **({"mac_address": macs[0]} if macs else {})}
                     rec.save()
                     self._journal("dcim.device", rec.id, "lldp", note=f"created from LLDP neighbour {name}")
@@ -1045,7 +1050,6 @@ class DcimMixin:
                 face=face,
                 status=status,
             )
-            self._recheck_device_cache()  # next listing must see it
             # New device id.
             return {"status": "SUCCESS", "device_id": device.id, "name": name, "rack": rack_name, "unit": rack_unit}
         except Exception as e:
@@ -1132,7 +1136,6 @@ class DcimMixin:
                 create_kwargs["tenant"] = tenant.id
             # Create the device.
             device = self.nb.dcim.devices.create(**create_kwargs)
-            self._recheck_device_cache()  # next listing must see it
 
             # Attach the IP, if given.
             attached_ip = ""
@@ -1230,7 +1233,6 @@ class DcimMixin:
                 return {"status": "ERROR", "message": f"Device {device_id} not found"}
             # Delete it.
             device.delete()
-            self._forget_cached_device(device_id)
             return {"status": "SUCCESS"}
         except Exception as e:
             # API failure.
@@ -2353,7 +2355,6 @@ class DcimMixin:
                         else:
                             # New device: create it.
                             device = self.nb.dcim.devices.create(**payload)
-                            self._recheck_device_cache()  # next listing must see it
                             devices_created += 1
 
                         # ── mgmt interface + IP (mirror claim_device) ──────────

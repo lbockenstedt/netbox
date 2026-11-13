@@ -500,11 +500,13 @@ def test_nw_poll_sets_interface_mac_once_then_makes_zero_writes():
     assert _writes(f) == [], _writes(f)
 
 
-def test_nw_pushes_share_one_device_listing_and_see_new_devices():
+def test_repeated_nw_pushes_never_page_the_device_list():
     # A fleet poll pushes switches seconds apart. Each push used to page the
     # tenant's whole device list (plus the global one) -- ~90 full listings an
-    # hour on the live NetBox. Pushes now share one cached listing, and a
-    # device created by a push is still found by the next one.
+    # hour on the live NetBox, then one per create and per TTL. With the device
+    # cache as the source of truth, pushes read no listing at all; a new
+    # device costs one filtered lookup (by name here) before its create, and
+    # the next push finds it in the cache.
     f, _ = _world(n_owned=3, page_size=2)
     eng = make_engine(NetboxEngine, f)
     defaults = {"device_type": "discovered", "role": "discovered", "site": "lab"}
@@ -516,32 +518,34 @@ def test_nw_pushes_share_one_device_listing_and_see_new_devices():
         return res["device_id"]
 
     def device_listings():
-        return [x for x in _gets(f) if x[1].rstrip("/").endswith("/dcim/devices")
-                and "offset" not in str(x[2]) and "limit=1" not in str(x[2]).split("&")]
+        return [x[2] for x in _gets(f) if x[1] == "/api/dcim/devices/"]
 
     first = push("nw-1", "sw1", "10.0.0.1")
     f.log.clear()
-    assert push("nw-1", "sw1", "10.0.0.1") == first
+    for _ in range(20):
+        assert push("nw-1", "sw1", "10.0.0.1") == first
     push("nw-2", "sw2", "10.0.0.2")
     for _ in range(3):
         assert push("nw-2", "sw2", "10.0.0.2") is not None
     assert len([d for d in f.db["devices"].values() if d["name"] in ("SW1", "SW2")]) == 2
-    # Two listings: the one after sw1's create, then the one after sw2's create.
-    assert len(device_listings()) == 2, device_listings()
+    assert device_listings() == ["limit=500&name__ie=sw2&tenant_id=1"]
 
 
 def test_replace_syncs_and_deletes_reuse_the_cached_listing():
     # Paging every device on each replace sync and after each delete was most
-    # of NetBox's load. Both now reuse the cache (deletes remove one row).
+    # of NetBox's load. The vanished device is found from the cache, and the
+    # delete updates the cache, so no device listing is read at all.
     f, feed = _world(n_owned=3)
     eng = make_engine(NetboxEngine, f)
     eng.sync_devices(feed, tenant_slug="t1", replace=True, defaults={"site": "lab"})
     f.db["devices"][103]["custom_fields"].pop("last_seen")
     f.db["devices"][103]["last_updated"] = f._stamp()  # NetBox stamps every edit
+    eng.reconcile_device_cache("t1")  # the daily reconcile sees the edit
     f.log.clear()
     res = eng.sync_devices(feed[:1] + feed[2:], tenant_slug="t1", replace=True,
                            defaults={"site": "lab"})
     assert res["deleted"] == 1, res
+    assert 103 not in {r["id"] for r in eng._all_devices_cached()}  # tombstoned
     eng.sync_devices(feed[:1] + feed[2:], tenant_slug="t1", replace=True,
                      defaults={"site": "lab"})
     full = [q for m, p, q, _ in f.log
@@ -550,14 +554,16 @@ def test_replace_syncs_and_deletes_reuse_the_cached_listing():
     assert full == []
 
 
-def test_device_deleted_outside_lm_is_recreated_at_the_next_cache_check(monkeypatch):
-    # Deletes don't show as NetBox changes; the cache compares NetBox's device
-    # count, so a cached device deleted in the NetBox UI comes back.
-    import netbox_sync
+def test_device_deleted_outside_lm_is_recreated_after_the_reconcile():
+    # A feed record that is unchanged writes nothing, so a device deleted in
+    # the NetBox UI used to stay missing until the daily full relist. The
+    # tenant's daily reconcile drops it from the cache; the next sync creates it.
     f, feed = _world(n_owned=2)
     eng = make_engine(NetboxEngine, f)
     eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
     del f.db["devices"][100]
-    monkeypatch.setattr(netbox_sync, "_GLOBAL_IDENTITY_TTL_S", 0)
+    eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
+    assert sorted(d["name"] for d in f.db["devices"].values()) == ["WS-01"]
+    eng.reconcile_device_cache("t1")
     eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
     assert sorted(d["name"] for d in f.db["devices"].values()) == ["WS-00", "WS-01"]

@@ -272,6 +272,12 @@ class NetboxSpoke(BaseSpoke):
                     await self._run_sync(self.engine.autorack_sweep)
             except Exception as e:
                 logger.error(f"NW flush error: {e}", exc_info=True)
+            # Daily device-cache reconcile: at most one due tenant per tick,
+            # so the tenants are spread over the day.
+            try:
+                await self._run_sync(self.engine.reconcile_device_cache)
+            except Exception as e:
+                logger.error(f"device cache reconcile error: {e}", exc_info=True)
 
     async def stop_kea_sync(self):
         """Cancel and stop the background Kea DHCP synchronization task."""

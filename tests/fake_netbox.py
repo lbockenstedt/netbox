@@ -188,7 +188,21 @@ class FakeNetBox(BaseAdapter):
             tid = self._slug_to_id("tenants", one("tenant"))
             rows = [r for r in rows if r.get("tenant_id") == tid and tid is not None]
         if one("tenant_id") is not None:
-            rows = [r for r in rows if str(r.get("tenant_id")) == one("tenant_id")]
+            want = None if one("tenant_id") == "null" else one("tenant_id")
+            rows = [r for r in rows if (r.get("tenant_id") is None if want is None
+                                        else str(r.get("tenant_id")) == want)]
+        if coll == "devices":
+            # Multi-value identity filters (any value matches), as NetBox does.
+            if "serial" in q:
+                rows = [r for r in rows if r.get("serial") in q["serial"]]
+            if "name__ie" in q:
+                names = {n.lower() for n in q["name__ie"]}
+                rows = [r for r in rows if str(r.get("name") or "").lower() in names]
+            if "cf_mac_address" in q:
+                macs = {m.lower() for m in q["cf_mac_address"]}
+                rows = [r for r in rows
+                        if str((r.get("custom_fields") or {}).get("mac_address") or "").lower()
+                        in macs]
         if one("device_id") is not None:
             rows = [r for r in rows if str(r.get("device_id")) == one("device_id")]
         if coll == "ip-addresses":
