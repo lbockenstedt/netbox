@@ -657,6 +657,30 @@ def test_sync_nw_device_merges_sibling_mac_stub_into_the_polled_device():
     assert stub_obj.primary_ip4 is None
 
 
+def test_sync_nw_device_leaves_another_tenants_sibling_mac_device_alone():
+    # Tenant 9's DHCP feed files the switch's SVI MAC as its own device; a
+    # tenant-10 poll deleting it made the feed re-create it every cycle.
+    real = {"id": 7, "name": "SW", "serial": "SN1", "tenant": {"id": 10},
+            "custom_fields": {"nw_device_id": "nw-1", "mac_address": "ec:eb:b8:f3:2a:e5"}}
+    theirs = {"id": 8, "name": "SW-2A81", "serial": "", "tenant": {"id": 9},
+              "custom_fields": {"discovered_from": "Kea (LM DHCP)", "mac_address": "ec:eb:b8:f3:2a:81"}}
+    ours = {"id": 9, "name": "SW-STUB", "serial": "", "tenant": {"id": 10},
+            "custom_fields": {"discovered_from": "opnsense", "mac_address": "ec:eb:b8:f3:2a:00"}}
+    nobodys = {"id": 10, "name": "DEVICE-ECEBB8F32A01", "serial": "", "tenant": None,
+               "custom_fields": {"discovered_from": "opnsense", "mac_address": "ec:eb:b8:f3:2a:01"}}
+    eng = _engine(existing_devices=[real, theirs, ours, nobodys])
+    real_obj = _Obj(id=7, name="SW")
+    real_obj.tenant = _Obj(id=10)
+    eng.nb.dcim.devices.get = MagicMock(side_effect=lambda x=None, **k: {7: real_obj}.get(x))
+    eng._merge_device_into = MagicMock(return_value=True)
+    res = eng.sync_nw_device(
+        device={"id": "nw-1", "name": "SW", "serial": "SN1", "mac": "ec:eb:b8:f3:2a:e5",
+                "address": "10.0.0.1", "object_type": "aos_switch"},
+        interfaces=[], tenant_slug="", defaults=_DEFAULTS)
+    assert res["status"] == "SUCCESS", res
+    assert sorted(c.args[1] for c in eng._merge_device_into.call_args_list) == [9, 10]
+
+
 def test_merge_stub_device_refuses_stub_with_different_serial():
     eng = _engine()
     eng._api_get_all = MagicMock(return_value=[{"id": 7, "custom_fields": {"nw_device_id": "nw-1"}}])
