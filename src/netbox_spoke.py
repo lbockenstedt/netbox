@@ -28,6 +28,7 @@ except ImportError:
     from core.src.base_spoke import BaseSpoke
 # NetBox API engine and the rack-workbook parser.
 from netbox_engine import NetboxEngine, run_as_background
+import netbox_static_reservations
 from netbox_autorack import parse_rack_name
 from netbox_nw_store import NwInventoryStore, device_key, signature
 from netbox_xlsx import (load_workbook_from_bytes, detect_rack_sheets,
@@ -271,6 +272,12 @@ class NetboxSpoke(BaseSpoke):
                     await self._run_sync(self.engine.autorack_sweep)
             except Exception as e:
                 logger.error(f"NW flush error: {e}", exc_info=True)
+            # Daily device-cache reconcile: at most one due tenant per tick,
+            # so the tenants are spread over the day.
+            try:
+                await self._run_sync(self.engine.reconcile_device_cache)
+            except Exception as e:
+                logger.error(f"device cache reconcile error: {e}", exc_info=True)
 
     async def stop_kea_sync(self):
         """Cancel and stop the background Kea DHCP synchronization task."""
@@ -577,7 +584,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_SYNC_VMS",
         "NETBOX_SYNC_DHCP", "NETBOX_SYNC_ACCESS_TRACKER", "NETBOX_STALENESS_SWEEP",
         "NETBOX_AUTORACK_SWEEP", "NETBOX_SYNC_CABLE", "NETBOX_SYNC_LLDP",
-        "NETBOX_NORMALIZE_DEVICE_NAMES",
+        "NETBOX_NORMALIZE_DEVICE_NAMES", "NETBOX_RESERVE_STATIC_HOSTS",
     })
     # lm core caps these at half the spoke's command slots, so IPAM reads
     # (racks, prefixes, IPs) never queue behind a long sync or sweep.
@@ -762,7 +769,7 @@ class NetboxSpoke(BaseSpoke):
         "NETBOX_LIST_STUBS", "NETBOX_COUNT"})
     _SHARED_RUNS = frozenset({
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_AUTORACK_SWEEP",
-        "NETBOX_STALENESS_SWEEP"})
+        "NETBOX_STALENESS_SWEEP", "NETBOX_RESERVE_STATIC_HOSTS"})
     _READ_REUSE_S = 10.0
 
     async def handle_command(self, command_type: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1155,6 +1162,23 @@ class NetboxSpoke(BaseSpoke):
                 status=data.get("status"),
                 custom_fields=data.get("custom_fields"),
             )
+
+        # Reserve statically addressed hosts in DHCP, or roll a pass back
+        # (see netbox_static_reservations).
+        if normalized == "NETBOX_RESERVE_STATIC_HOSTS":
+            if "rollback" in data:
+                res = await self._run_sync(netbox_static_reservations.roll_back,
+                                           self.engine, data.get("rollback") or [])
+            else:
+                res = await self._run_sync(
+                    netbox_static_reservations.reserve_static_hosts, self.engine, data,
+                    self.__dict__.setdefault("_static_res_failed", {}), time.time())
+            # A background command keeps the list cache; drop it after any
+            # write (including a pass whose rollback failed) so the hub's
+            # next IP read (the DHCP sync) sees NetBox as it is.
+            if res.get("changes") or res.get("rolled_back") or res.get("rollback_failed"):
+                self._list_invalidate()
+            return res
 
         # Update a device's primary IP.
         if normalized == "NETBOX_UPDATE_IP":

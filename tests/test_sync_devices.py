@@ -25,14 +25,21 @@ class _Obj:
     """A minimal stand-in for a pynetbox record: settable custom_fields, save,
     delete, and an arbitrary .id / .interfaces / .primary_ip4."""
 
-    def __init__(self, id=1, custom_fields=None):
+    def __init__(self, id=1, custom_fields=None, name=None, address=None):
         self.id = id
+        self.name = name
         self.custom_fields = dict(custom_fields or {})
         self.primary_ip4 = None
+        self.address = address  # the primary IP a live read shows
         self.interfaces = MagicMock()
         self.interfaces.create.return_value = _Iface(id=100)
         self.save = MagicMock()
         self.delete = MagicMock()
+
+    def __iter__(self):
+        """``dict(record)``: the row a live read returns."""
+        yield from {"id": self.id, "name": self.name, "custom_fields": self.custom_fields,
+                    "primary_ip4": {"address": self.address} if self.address else None}.items()
 
 
 def _engine_with(existing_rows, tenant_obj=None):
@@ -289,7 +296,7 @@ def test_sync_devices_replace_deletes_owned_absent_tenant_scoped():
     ]
     eng = _engine_with(existing_rows=rows, tenant_obj=_Obj(id=1))
     # The absent device's IP 10.0.0.6 → device 22 fetched + deleted.
-    dev22 = _Obj(id=22)
+    dev22 = _Obj(id=22, custom_fields={"discovered_from": "opnsense"}, address="10.0.0.6/24")
     eng.nb.dcim.devices.get.return_value = dev22
     eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=111, custom_fields={})
 
@@ -361,7 +368,8 @@ def test_sync_devices_owned_name_collision_deletes_stale_then_creates():
            "primary_ip4": {"id": 901, "address": "10.0.0.9/24"},
            "custom_fields": {"discovered_from": "opnsense"}}
     eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
-    stale = _Obj(id=77, custom_fields={"discovered_from": "opnsense"})
+    stale = _Obj(id=77, custom_fields={"discovered_from": "opnsense"},
+                 name="device-aabbccddeeff", address="10.0.0.9/24")
     new_dev = _Obj(id=42)
     eng.nb.dcim.devices.get.return_value = stale      # the by-name stale fetch
     eng.nb.dcim.devices.create.return_value = new_dev
@@ -420,7 +428,8 @@ def test_sync_devices_no_ip_owned_device_indexed_by_name():
     row = {"id": 99, "name": "device-aabbccddeeff",
            "primary_ip4": None, "custom_fields": {"discovered_from": "opnsense"}}
     eng = _engine_with(existing_rows=[row], tenant_obj=_Obj(id=1))
-    stale = _Obj(id=99, custom_fields={"discovered_from": "opnsense"})
+    stale = _Obj(id=99, custom_fields={"discovered_from": "opnsense"},
+                 name="device-aabbccddeeff")
     eng.nb.dcim.devices.get.return_value = stale
     eng.nb.dcim.devices.create.return_value = _Obj(id=42)
     eng.nb.ipam.ip_addresses.create.return_value = _Obj(id=555)
@@ -698,7 +707,8 @@ def test_sync_devices_nw_replace_delete_skips_opnsense_owned():
          "custom_fields": {"discovered_from": "Network Devices"}},  # nw's
     ]
     eng = _engine_with(existing_rows=rows, tenant_obj=_Obj(id=1))
-    dev22 = _Obj(id=22)
+    dev22 = _Obj(id=22, custom_fields={"discovered_from": "Network Devices"},
+                 address="10.0.0.6/24")
     eng.nb.dcim.devices.get.return_value = dev22   # the nw-owned absent fetch
     eng.nb.ipam.ip_addresses.get.return_value = _Obj(id=222, custom_fields={})
 

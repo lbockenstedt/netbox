@@ -187,6 +187,82 @@ def test_cable_without_peer_detail_still_counts_as_cabled():
     assert NetboxEngine._iface_cable_peer(iface) is None
 
 
+def test_batch_cache_miss_checks_live_port_before_creating():
+    """A port added after the batch listing is reused, not duplicate-created."""
+    sw1, sw2 = _device("SW1", 1), _device("SW2", 2)
+    iface_a = _iface(101, connected_to=("SW2", "1/1/48"))
+    iface_b = _iface(102)
+    eng = _engine(devices={}, interfaces={(1, "1/1/1"): iface_a})
+    index = {1: {}, 2: {"1/1/48": iface_b}}
+
+    for _ in range(2):
+        res = eng._cable_devices(sw1, "1/1/1", sw2, "1/1/48", port_index=index)
+        assert res["status"] == "UNCHANGED", res
+
+    assert index[1]["1/1/1"] is iface_a
+    eng.nb.dcim.interfaces.get.assert_called_once_with(device_id=1, name="1/1/1")
+    eng.nb.dcim.interfaces.filter.assert_not_called()
+    eng.nb.dcim.interfaces.create.assert_not_called()
+    eng.nb.dcim.cables.create.assert_not_called()
+
+
+def test_created_port_is_cached_when_far_end_cable_prevents_connection():
+    """Skipping a cable must not leave the newly created port out of the index."""
+    sw1, sw2 = _device("SW1", 1), _device("SW2", 2)
+    eng = _engine(devices={}, interfaces={})
+    index = {1: {}, 2: {"1/1/48": _iface(102, connected_to=("SW9", "9/9/9"))}}
+
+    for _ in range(2):
+        res = eng._cable_devices(sw1, "1/1/1", sw2, "1/1/48", port_index=index)
+        assert res["status"] == "SKIPPED", res
+
+    eng.nb.dcim.interfaces.create.assert_called_once_with(
+        device=1, name="1/1/1", type="other")
+    eng.nb.dcim.interfaces.get.assert_called_once_with(device_id=1, name="1/1/1")
+    eng.nb.dcim.interfaces.filter.assert_not_called()
+    eng.nb.dcim.cables.create.assert_not_called()
+
+
+def test_interface_create_race_reuses_winner_and_preserves_its_cable():
+    """A concurrent creator's port is re-read, including its cable ownership."""
+    sw1, sw2 = _device("SW1", 1), _device("SW2", 2)
+    interfaces = {(2, "1/1/48"): _iface(102)}
+    eng = _engine(devices={"SW1": sw1, "SW2": sw2}, interfaces=interfaces)
+
+    def concurrent_create(**kwargs):
+        """Simulate another sync creating and cabling the port first."""
+        interfaces[(kwargs["device"], kwargs["name"])] = _iface(
+            101, connected_to=("SW9", "9/9/9"))
+        raise RuntimeError("{'__all__': ['Interface with this Device and Name already exists.']}")
+
+    eng.nb.dcim.interfaces.create.side_effect = concurrent_create
+    for _ in range(2):
+        res = eng.sync_cable("SW1", "1/1/1", "SW2", "1/1/48")
+        assert res["status"] == "SKIPPED", res
+        assert "SW9" in res["message"]
+
+    eng.nb.dcim.interfaces.create.assert_called_once()
+    eng.nb.dcim.cables.create.assert_not_called()
+
+
+def test_interface_create_failures_without_a_reusable_port_remain_errors():
+    """Neither unrelated failures nor an unresolved uniqueness error are hidden."""
+    for message in (
+        "permission denied",
+        "Interface with this Device and Name already exists.",
+    ):
+        eng = _engine(
+            devices={"SW1": _device("SW1", 1), "SW2": _device("SW2", 2)},
+            interfaces={},
+        )
+        eng.nb.dcim.interfaces.create.side_effect = RuntimeError(message)
+        res = eng.sync_cable("SW1", "1/1/1", "SW2", "1/1/48")
+        assert res["status"] == "ERROR"
+        assert message in res["message"]
+        eng.nb.dcim.interfaces.create.assert_called_once()
+        eng.nb.dcim.cables.create.assert_not_called()
+
+
 def test_batch_lists_each_devices_ports_once_and_never_rereads():
     # Live load: an LLDP push of ~800 links did a name lookup per port plus a
     # re-GET of each interface. A batch lists each device's ports once.

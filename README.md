@@ -55,6 +55,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 - **`src/netbox_dcim.py` (`DcimMixin`)**: Sites, racks, device CRUD, front/rear rack elevation models, bundled catalog seeding, and universal multi-attribute search.
 - **`src/netbox_vmsync.py` (`VmSyncMixin`)**: Proxmox cluster VM ingestion, primary IP assignment, tag-driven tenancy mappings, and VMID range queries.
 - **`src/netbox_sync.py` (`SyncMixin`)**: Multi-source device discovery upsert (switches, APs, firewalls, ClearPass access tracker) with MAC normalization and prefix-length derivation.
+- **`src/netbox_device_cache.py` (`DeviceCache`)**: The spoke's own copy of every NetBox device (slim index in memory, full rows per tenant in `/var/lib/lm/netbox/devices/`), kept current by a response hook on our own writes and a daily per-tenant reconcile of scanner-owned devices. See `docs/netbox.md` → **Device cache**.
 - **`src/netbox_tenancy.py` (`TenancyMixin`)**: Tenant queries, multi-model tenant data reassignment/migration (`migrate_tenant`), and DHCP scope harvesting.
 - **`src/netbox_staleness.py` (`StalenessMixin`)**: Scheduled discovery record retirement (marking devices offline after inactivity, followed by automatic purge).
 - **`src/custom_fields_spec.py`**: Pure-data specification defining custom fields required for discovery tracking, Proxmox links, switch ports, and tenancy ranges, plus the reference objects (fallback `discovered` site) the syncs rely on.
@@ -105,6 +106,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 | `NETBOX_ALLOCATE_IP` | `allocate_ip` | Reserves the next available IP address in a prefix. |
 | `NETBOX_RELEASE_IP` | `release_ip` | Deletes an IP address record. |
 | `NETBOX_UPDATE_IP_ADDR` / `NETBOX_UPDATE_IP` | `update_ip_address` | Updates DNS name, description, status, or custom fields of an IP. |
+| `NETBOX_RESERVE_STATIC_HOSTS` | `netbox_static_reservations.reserve_static_hosts` | Marks static hosts as DHCP reservations from hub-relayed agent/sweep/Kea data; reports before/after, rolls back on failure. |
 | `NETBOX_DOC_VM` | `create_vm_entry` | Creates or updates a virtual machine entry with primary IP. |
 | `NETBOX_GET_TENANTS` | `get_tenants` | Lists all tenants configured in NetBox. |
 | `NETBOX_MIGRATE_TENANT` | `migrate_tenant` | Reassigns all DCIM/IPAM/VM objects from source to target tenant. |

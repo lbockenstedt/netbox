@@ -96,6 +96,47 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
   - **Response**: `{"status": "SUCCESS", "pushed": N, "errors": N, "skipped": N, "deleted": N, "devices_total": N, "message": "..."}`
   - **Errors**: unknown tenant → `{"status": "ERROR", "message": "NetBox tenant '<slug>' not found ..."}`. Missing `discovered_from`/`mac_address` custom fields are tolerated (writes skipped, replace-delete becomes a safe no-op).
 
+- **`NETBOX_RESERVE_STATIC_HOSTS`**
+  - **Purpose**: Marks statically addressed hosts as DHCP reservations
+    (`custom_fields.mac_address` + `dhcp_reservation: true` on their NetBox
+    IP), so Kea stops handing their address to other clients. The hub
+    decides when (it owns the on/off switch and the interval) and relays what
+    this spoke cannot reach: each tenant's raw agent `GET_HOST_ADDRESSING`
+    rows, its sweep/ARP observations, and a strict lease and subnet read of
+    the tenant's Kea. This spoke reads the tenant's prefixes and IPs from
+    NetBox, plans (`netbox_static_reservations.plan_static_reservations`:
+    conservative, conflicts are reported and never overwritten) and writes.
+  - **Payload**: `{"tenants": [{"ref": "<opaque label>", "filters":
+    {"tenant"|"tenant_group": "<slug>"}, "agent_addresses": [{"ip", "mac",
+    "mode"}], "sweep": [{"ip", "mac", "seen_age", "arp_age"}], "kea": "<key>"}],
+    "kea": {"<key>": {"leases": [...], "subnets": [...]}}, "max_writes": 25}`.
+    A Kea serving several tenants is sent once under its key.
+  - **Response**: `{"status": "SUCCESS", "evaluated": ["<ref>"], "changes":
+    [{"ref", "ip", "ip_id", "mac", "source", "before": {"mac_address",
+    "dhcp_reservation"}, "after": {...}}], "conflicts": [{"ref", "ip", "mac",
+    "reason"}], "errors": [{"ref", "ip"?, "error"}], "skipped": N, "deferred":
+    N}`. `status` is `"ERROR"` (with a `message`) whenever `errors` is not
+    empty, so a pass where every read failed never looks like an empty
+    success.
+  - **Reversible**: each write is a compare-and-set on the two fields,
+    compared exactly as stored (other custom fields are kept). An IP that
+    another writer changed or deleted after the read is a conflict
+    (`changed in netbox since it was read` / `netbox ip deleted since it was
+    read`) and the pass goes on. If NetBox refuses a write, the pass stops,
+    its earlier writes are rolled back newest first, and the reply is
+    `status: "ERROR"` with `changes: []`, `rolled_back`, `rollback_kept` and
+    `rollback_failed`; that address is not retried for an hour. Payload
+    `{"rollback": [<changes>]}` undoes a pass (the hub sends it when the
+    DHCP sync after the pass fails) and replies `{"status", "rolled_back",
+    "rollback_kept", "rollback_failed"}`: `rolled_back` were restored to
+    `before` (or already were, so repeating a rollback is harmless);
+    `rollback_kept` were left alone with a `reason` because NetBox changed
+    since (a later edit is never undone) or the IP is gone; only
+    `rollback_failed` (NetBox refused, with an `error`) makes the status
+    `ERROR`. The IP list cache is dropped after any write.
+  - **Older spokes** answer `Unknown command: NETBOX_RESERVE_STATIC_HOSTS`;
+    the hub then reports the feature as unsupported and writes nothing.
+
 ### Tenancy
 - **`NETBOX_GET_TENANTS`**
   - **Purpose**: Lists NetBox tenants for the hub's tenant sync and the tenant
