@@ -933,6 +933,18 @@ class SyncMixin:
             full = self._device_cache().full_row(row.get("id"))
         return full or row
 
+    @staticmethod
+    def _tenant_rank(row: dict, tenant_id: Any) -> int:
+        """Where ``row`` stands for a sync scoped to ``tenant_id``: 0 in that
+        tenant (or the sync has no tenant), 1 untenanted (adoptable), 2 another
+        tenant's (a known box that is not ours to change). Serial, MAC and IP
+        lookups are global, so a caller picking from their hits sorts by this
+        and never writes a rank-2 row."""
+        if not tenant_id:
+            return 0
+        owner = (row.get("tenant") or {}).get("id")
+        return 0 if owner == tenant_id else 1 if owner is None else 2
+
     def _lookup_devices(self, serials=(), macs=(), names=(), tenant_id=None, ips=()) -> list:
         """Read the devices matching any of these identities straight from
         NetBox (one filtered request per kind) and store them in the cache.
@@ -3648,8 +3660,13 @@ class SyncMixin:
                 # Unless NetBox already has it (added since the last reconcile).
                 found_rows = self._lookup_devices(names=[name], ips=[nas_ip],
                                                   tenant_id=getattr(tenant, "id", None))
+                # The IP lookup is global (VRFs overlap): only this tenant's
+                # switch, else an untenanted one, lowest id first.
+                found_rows.sort(key=lambda r: (self._tenant_rank(r, getattr(tenant, "id", None)),
+                                               r.get("id") or 0))
                 for found in found_rows:
-                    if _primary_addr(found) == nas_ip:
+                    if (_primary_addr(found) == nas_ip
+                            and self._tenant_rank(found, getattr(tenant, "id", None)) < 2):
                         switch_by_ip[nas_ip] = found
                         return found
                 # A device with that name but another IP keeps its name.

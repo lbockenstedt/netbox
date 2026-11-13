@@ -599,8 +599,19 @@ class DcimMixin:
             # Listing failed.
             return {"status": "ERROR", "message": f"failed to list NetBox devices: {e}", **counters}
 
-        # Identity index over existing devices.
+        # Tenant and lazily resolved defaults for created devices.
+        tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
+        tenant_id = getattr(tenant, "id", None)
+        role = dtype = site = None
+        created_device = False
+
+        # Identity index over the tenant's devices (and untenanted ones), plus
+        # every tenant's MACs and serials so a box another tenant holds is
+        # recognised, not duplicated (it is then left alone, see resolve()).
+        every_row, rows = rows, [r for r in rows if self._tenant_rank(r, tenant_id) < 2]
         idx = self._index_existing_devices(rows)
+        if tenant_id:
+            self._add_global_identities(idx["by_mac"], idx["by_serial"], rows=every_row)
 
         # Build by_short index
         # Count devices by short name.
@@ -616,11 +627,6 @@ class DcimMixin:
             short = n.split(".", 1)[0] if "." in n and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", n) else n
             if short_counts[short] == 1:
                 by_short[short] = row
-
-        # Tenant and lazily resolved defaults for created devices.
-        tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
-        role = dtype = site = None
-        created_device = False
 
         # Cache of resolved ends.
         cache = {}
@@ -671,12 +677,27 @@ class DcimMixin:
                 # MAC and name first, in case someone added the device there.
                 if not row and create_missing and _lldp_creatable_name(name):
                     hits = self._lookup_devices(macs=macs, names=[name] if name else [],
-                                                tenant_id=getattr(tenant, "id", None))
-                    row = hits[0] if hits else None
+                                                tenant_id=tenant_id)
+                    # The tenant's own device first, then an untenanted one;
+                    # a MAC match before a name match; then the lowest id.
+                    row = min(hits, default=None, key=lambda r: (
+                        self._tenant_rank(r, tenant_id),
+                        self._norm_mac((r.get("custom_fields") or {}).get("mac_address") or "")
+                        not in macs,
+                        r.get("id") or 0))
             except Exception as e:
                 # Resolution failed.
                 counters["errors"] += 1
                 messages.append(f"failed to resolve device {name}: {e}")
+                return None
+
+            # Another tenant's device (matched by MAC or serial): known, so
+            # not created again, but not ours to update or cable.
+            if row and self._tenant_rank(row, tenant_id) == 2:
+                messages.append(f"{name or key}: device {row.get('id')} belongs to "
+                                f"another tenant; left alone")
+                if key:
+                    cache[key] = None
                 return None
 
             # Existing device: backfill its MAC and adopt the LLDP name.

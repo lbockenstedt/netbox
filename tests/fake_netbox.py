@@ -166,6 +166,12 @@ class FakeNetBox(BaseAdapter):
                 self._patch(coll, obj, {k: v for k, v in item.items() if k != "id"})
                 out.append(self.render(coll, obj))
             return 200, out
+        if method == "DELETE" and isinstance(body, list):  # bulk delete
+            for item in body:
+                if item.get("id") not in self.db[coll]:
+                    raise _Http(400, {"detail": f"id {item.get('id')} not found"})
+                self._delete(coll, item["id"])
+            return 204, None
         raise _Http(405, {"detail": "method"})
 
     def _maybe_fail(self, method: str, coll: str, key: Any) -> None:

@@ -334,10 +334,10 @@ class DeviceCache:
                 old_rows = self._rows_or_clear(key)
                 if old_rows is None:
                     return
-                rows = [new.pop(r.get("id"), r) for r in old_rows if r.get("id") not in gone]
-                self._write_tenant(key, rows + list(new.values()))
-            for new in add.values():
-                for dev_id, row in new.items():
+                kept = [new.pop(r.get("id"), r) for r in old_rows if r.get("id") not in gone]
+                self._write_tenant(key, kept + list(new.values()))
+            for stored in add.values():
+                for dev_id, row in stored.items():
                     self._index[dev_id] = slim_row(row)
 
     def remove(self, ids: Iterable[Any]) -> None:

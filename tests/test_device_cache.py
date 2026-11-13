@@ -597,3 +597,123 @@ def test_concurrent_first_reads_page_netbox_once():
     for t in threads:
         t.join()
     assert eng._api_get_all.call_count == 1
+
+
+def test_global_identities_come_from_the_cache_not_a_listing_per_call():
+    eng = _mock_engine(ROWS)
+    first, second = {}, {}
+    eng._add_global_identities(first, {})
+    eng._add_global_identities(second, {})
+    assert first == second == {"aa": first["aa"]} and first["aa"]["id"] == 1
+    assert eng._api_get_all.call_count == 1
+
+
+# ── deletes made by LM leave the cache (no recreate by the reconcile) ───────
+
+def _run(eng):
+    from netbox_sync import _DeviceSyncRun
+    return _DeviceSyncRun(tenant_slug="t1", source_tag="Network Devices",
+                          source_of_truth="external", defaults={})
+
+
+DELETES = {
+    "record delete": lambda f, eng: eng.delete_device(100),
+    "bulk delete": lambda f, eng: eng.nb.dcim.devices.delete([100]),
+    "replace delete": lambda f, eng: eng._delete_device(_run(eng), {"id": 100}, lambda live: True),
+    "stub merge": lambda f, eng: eng._merge_device_into(
+        eng.nb.dcim.devices.get(101), 100, "SW1", "test"),
+    "dedupe": lambda f, eng: eng.dedupe_devices("t1", apply=True),
+    "staleness": lambda f, eng: eng.staleness_sweep(stale_days=1, delete_days=1),
+}
+
+
+@pytest.mark.parametrize("how", sorted(DELETES))
+def test_a_device_lm_deletes_leaves_the_cache_and_is_not_recreated(how):
+    f, eng = _reconcile_world()
+    if how == "dedupe":
+        # A bare copy of SW1 by MAC: dedupe keeps the more complete device.
+        _device(f, 102, "COPY", mac_address="aa:bb:cc:00:00:01")
+    if how == "staleness":
+        # Retired two days ago, seen three days ago: due for deletion.
+        f.db["devices"][100]["status"] = "offline"
+        f.db["devices"][100]["custom_fields"].update(
+            last_seen=_ago(3 * 86400), decommissioned_at=_ago(2 * 86400))
+    eng._drop_device_cache()
+    eng._all_devices_cached()
+    before = set(f.db["devices"])
+    DELETES[how](f, eng)
+    gone = before - set(f.db["devices"])
+    assert gone, how
+    assert not gone & {r["id"] for r in eng._all_devices_cached()}
+    eng.reconcile_device_cache("t1")
+    assert set(f.db["devices"]) == before - gone
+
+
+# ── global identities never let a sync write another tenant's device ────────
+
+def _lldp_engine(f):
+    eng = make_engine(NetboxEngine, f)
+    eng._ensure_device_role = MagicMock(return_value=MagicMock(id=31))
+    eng._ensure_device_type = MagicMock(return_value=MagicMock(id=41))
+    eng._resolve_site = MagicMock(return_value=MagicMock(id=21))
+    eng.cabled = []
+
+    def cable(a, a_port, b, b_port, status="connected", port_index=None):
+        eng.cabled.append((a.id, b.id))
+        return {"status": "SUCCESS"}
+    eng._cable_devices = cable
+    return eng
+
+
+MAC = "aa:bb:cc:00:00:09"
+LINK = [{"a": {"name": "sw1"}, "a_port": "1", "b": {"name": "nbr.example.com", "macs": [MAC]},
+         "b_port": "eth0"}]
+
+
+def test_lldp_picks_the_tenants_device_when_two_tenants_hold_the_mac():
+    f = _world()
+    _device(f, 50, "SW1")
+    eng = _lldp_engine(f)
+    eng._all_devices_cached()
+    # Added in NetBox since the cache was built; t2's copy sorts first.
+    _device(f, 100, "AAA", tenant_id=2, serial="S9", mac_address=MAC)
+    _device(f, 101, "ZZZ", tenant_id=1, serial="S9", mac_address=MAC)
+    res = eng.sync_lldp_links(LINK, tenant_slug="t1")
+    assert res["cabled"] == 1 and res["created"] == 0, res
+    assert eng.cabled == [(50, 101)]
+    assert f.db["devices"][100]["name"] == "AAA"
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_lldp_leaves_another_tenants_device_alone(cached):
+    f = _world()
+    _device(f, 50, "SW1")
+    _device(f, 100, f"DEVICE-{MAC}", tenant_id=2, serial="S9", mac_address=MAC)
+    if not cached:
+        del f.db["devices"][100]
+    eng = _lldp_engine(f)
+    eng._all_devices_cached()
+    if not cached:  # added in NetBox since the cache was built
+        _device(f, 100, f"DEVICE-{MAC}", tenant_id=2, serial="S9", mac_address=MAC)
+    f.log.clear()
+    res = eng.sync_lldp_links(LINK, tenant_slug="t1")
+    assert res["cabled"] == 0 and res["created"] == 0 and res["skipped"] == 1, res
+    assert eng.cabled == [] and sorted(f.db["devices"]) == [50, 100]
+    assert not [x for x in f.log if x[0] != "GET"]
+    assert f.db["devices"][100]["name"] == f"DEVICE-{MAC}"
+
+
+def test_access_tracker_does_not_use_another_tenants_switch_on_the_same_ip():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _hand_made_device_with_ip(f, "10.0.0.254/24")
+    f.db["devices"][100]["tenant_id"] = 2
+    eng.sync_access_tracker(
+        sessions=[{"mac": "AA:BB:CC:DD:EE:FF", "ip": "10.0.0.5", "nas_ip": "10.0.0.254",
+                   "nas_port": "Ethernet1/0/12", "nas_name": "sw-core",
+                   "start_time": "2026-06-30T10:00:00"}],
+        tenant_slug="t1", defaults={"site": "lab"})
+    (switch,) = [d for d in f.db["devices"].values() if "sw-core" in str(d.get("name")).lower()]
+    assert switch["tenant_id"] == 1
+    assert not [i for i in f.db["interfaces"].values() if i["device_id"] == 100 and i["id"] != 7]
