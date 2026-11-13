@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from custom_fields_spec import FALLBACK_SITE_SLUG
 # The spoke's per-tenant copy of NetBox's devices.
 import netbox_device_cache
-from netbox_device_cache import DeviceCache
+from netbox_device_cache import DeviceCache, scanner_owned
 # guess_role infers a device role from names/vendors for newly discovered devices.
 from netbox_profile import guess_role
 
@@ -32,13 +32,12 @@ logger = logging.getLogger("NetboxEngine")
 
 # NetBox device rows live in the spoke's per-tenant device cache (see
 # netbox_device_cache): matching reads it instead of paging NetBox.
-# Owner tags (custom_fields.discovered_from) of the network scanner. For these
-# devices the cache is the source of truth: the daily reconcile pushes the
+# Scanner-owned devices: custom_fields.discovered_from in SCANNER_SOURCES
+# (defined in netbox_device_cache). For these devices the cache is the source of truth: the daily reconcile pushes the
 # cached scanner-owned fields back over edits made in NetBox and recreates
 # ones deleted there while the scanner still sees them. Devices with any other
 # tag (or none) are never written by the reconcile; the cache just takes
 # NetBox's copy. Changing discovered_from in NetBox releases a device.
-SCANNER_SOURCES = frozenset({"Network Devices", "LLDP"})
 # Fields the network scanner owns on its devices (see SCANNER_SOURCES).
 SCANNER_FIELDS = ("name", "serial")
 SCANNER_CUSTOM_FIELDS = ("nw_device_id", "mac_address")
@@ -62,9 +61,6 @@ def _is_404(e: Exception) -> bool:
     return getattr(resp, "status_code", None) == 404
 
 
-def _scanner_owned(row: dict) -> bool:
-    """True for a device the network scanner created (see SCANNER_SOURCES)."""
-    return str((row.get("custom_fields") or {}).get("discovered_from") or "") in SCANNER_SOURCES
 
 
 # Auto-generated names the create branch mints when a record has no hostname
@@ -960,7 +956,7 @@ class SyncMixin:
                 found += self._api_get_all("/api/dcim/devices/", {"limit": 500, key: vals, **scope})
         if found:
             self._all_devices_cached()
-            self._device_cache().upsert(found)
+            self._device_cache().upsert(found, read=True)
         return found
 
     def _drop_device_cache(self) -> None:
@@ -1000,20 +996,45 @@ class SyncMixin:
                 return {"status": "ERROR", "message": f"NetBox tenant '{tenant_slug}' not found"}
             tenant = {"id": getattr(t, "id", None), "slug": tenant_slug}
         slug = tenant["slug"]
-        # Step 1: the cached copy and NetBox's. Devices the spoke itself
-        # wrote meanwhile are skipped: NetBox has its new values, not drift.
+        # Steps 1-3 inside a walk, so the spoke's own writes meanwhile are
+        # journaled (and not reverted as drift).
         with cache.walking():
-            cached = {r["id"]: r for r in self._tenant_devices_cached(slug)}
+            records, errors, checked = self._reconcile_tenant(cache, tenant)
+        # Log and keep the before/after records; schedule the next run
+        # (in an hour when something failed, else in a day).
+        logged = self._write_reconcile_records(slug, records)
+        cache.mark_reconciled(slug, delay=RECONCILE_RETRY_S if errors else None)
+        logger.info("device reconcile: tenant %s: %d device(s) checked, %d reverted or "
+                    "recreated, %d failed", slug or "(none)", checked, len(records), errors)
+        res = {"status": "ERROR" if errors or not logged else "SUCCESS", "tenant": slug,
+               "checked": checked, "changed": len(records), "errors": errors}
+        if not logged:
+            res["message"] = "the before/after records could not be written"
+        return res
+
+    def _reconcile_tenant(self, cache, tenant: dict) -> tuple:
+        """Steps 1-3 of ``reconcile_device_cache`` for one tenant, run inside
+        ``cache.walking()`` so the spoke's own writes meanwhile are journaled.
+        Returns (records, errors, devices checked)."""
+        slug = tenant["slug"]
+        # Step 1: the cached copy and NetBox's. A failed listing is retried
+        # in an hour.
+        cached = {r["id"]: r for r in self._tenant_devices_cached(slug)}
+        try:
             live = self._api_get_all("/api/dcim/devices/",
                                      {"limit": 500, "tenant_id": tenant["id"] or "null"})
-            cache.replace_tenant(slug, live)
-            written_meanwhile = cache.journal_ids()
+        except Exception:
+            cache.mark_reconciled(slug, delay=RECONCILE_RETRY_S)
+            raise
+        cache.replace_tenant(slug, live)
         live_by_id = {r["id"]: r for r in live}
         records: list = []
         errors = 0
-        # Steps 2 and 3: scanner-owned devices only.
+        # Steps 2 and 3: scanner-owned devices only. A device the spoke
+        # wrote since the snapshot is skipped (checked right before each
+        # write): NetBox has LM's new values, not drift.
         for dev_id, row in cached.items():
-            if not _scanner_owned(row) or dev_id in written_meanwhile:
+            if not scanner_owned(row) or dev_id in cache.journal_ids():
                 continue
             try:
                 if dev_id not in live_by_id:
@@ -1028,7 +1049,7 @@ class SyncMixin:
                             # leave it deleted; its feed recreates it if seen.
                             logger.info("device reconcile: device %s deleted in NetBox and "
                                         "not seen in the last week; left deleted", dev_id)
-                elif _scanner_owned(live_by_id[dev_id]):
+                elif scanner_owned(live_by_id[dev_id]):
                     rec = self._revert_scanner_fields(row, live_by_id[dev_id])
                     if rec:
                         records.append(rec)
@@ -1038,14 +1059,7 @@ class SyncMixin:
                 errors += 1
                 logger.warning("device reconcile: device %s: %s", dev_id, e)
                 cache.upsert([row], force=True)
-        # Log and keep the before/after records; schedule the next run
-        # (in an hour when something failed, else in a day).
-        self._write_reconcile_records(slug, records)
-        cache.mark_reconciled(slug, delay=RECONCILE_RETRY_S if errors else None)
-        logger.info("device reconcile: tenant %s: %d device(s) checked, %d reverted or "
-                    "recreated, %d failed", slug or "(none)", len(cached), len(records), errors)
-        return {"status": "ERROR" if errors else "SUCCESS", "tenant": slug,
-                "checked": len(cached), "changed": len(records), "errors": errors}
+        return records, errors, len(cached)
 
     def _seen_recently(self, row: dict) -> bool:
         """True when the row's last_seen is within RECREATE_SEEN_WITHIN_S."""
@@ -1105,11 +1119,12 @@ class SyncMixin:
             list(k for k in after if k != "custom_fields") + list(cf))))
         return {"action": "revert", "device": live["id"], "before": before, "after": after}
 
-    def _write_reconcile_records(self, slug: str, records: list) -> None:
+    def _write_reconcile_records(self, slug: str, records: list) -> bool:
         """Append before/after records to ``_reconcile.jsonl`` in the cache
-        directory (rolled over to ``.1`` past 1 MB). Best-effort."""
+        directory (rolled over to ``.1`` past 1 MB). False when they could
+        not be written (each change is still in the spoke log)."""
         if not records:
-            return
+            return True
         path = os.path.join(self._device_cache().dir, "_reconcile.jsonl")
         try:
             if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
@@ -1120,6 +1135,8 @@ class SyncMixin:
                     f.write(json.dumps({"ts": ts, "tenant": slug, **rec}, default=str) + "\n")
         except OSError as e:
             logger.warning("device reconcile: could not write %s: %s", path, e)
+            return False
+        return True
 
     def _add_global_identities(self, by_mac: Dict[str, dict],
                                by_serial: Optional[Dict[str, dict]] = None,
@@ -1824,17 +1841,22 @@ class SyncMixin:
                 run.ip_objs[ip_id] = obj
         return obj
 
-    def _delete_device(self, run: "_DeviceSyncRun", row: dict) -> bool:
+    def _delete_device(self, run: "_DeviceSyncRun", row: dict, still_ok) -> bool:
         """Delete a listed device; True iff this call deleted it. Raises on a
         failed delete.
 
+        The cached row can be a day old, so the device is read from NetBox
+        first and deleted only when ``still_ok(live_row)`` holds (someone may
+        have released it, stamped ``last_seen`` or moved its IP since).
         A device that is already gone (deleted earlier this batch, or by
         someone else since the listing → 404) is a silent no-op, matching the
         old ``get() → None → skip``. NetBox cascades the delete to the
         device's interfaces and their IPs, so its primary IP is forgotten."""
-        # Get the live Record; an already-deleted or missing device is a no-op.
-        obj = self._device_record(run, row["id"])
-        if obj is None:
+        # Read it live; an already-deleted, missing or no-longer-ours device is a no-op.
+        if row["id"] in run.deleted_ids:
+            return False
+        obj = self.nb.dcim.devices.get(row["id"])
+        if obj is None or not still_ok(dict(obj)):
             return False
         # Delete it; a 404 means someone else already deleted it, anything else is raised.
         try:
@@ -1869,9 +1891,14 @@ class SyncMixin:
             row = run.by_ip.get(ip_str)
             if not row or (row.get("custom_fields") or {}).get("last_seen"):
                 continue
-            # Delete it; a failure is recorded as an error and the loop continues.
+            # Delete it (if NetBox agrees it is still ours, without last_seen
+            # and on that IP); a failure is recorded as an error.
+            def still_ok(live, ip_str=ip_str):
+                """NetBox still shows it ours, unswept and on that IP."""
+                cf = live.get("custom_fields") or {}
+                return run.owns(cf) and not cf.get("last_seen") and _primary_addr(live) == ip_str
             try:
-                if self._delete_device(run, row):
+                if self._delete_device(run, row, still_ok):
                     run.deleted += 1
             except Exception as e:
                 run.note_error(f"delete {ip_str}: {e}")
@@ -2503,8 +2530,12 @@ class SyncMixin:
             # Our own stale copy of this machine: delete it and take the name back.
             if (self._is_reclaimable(run, d, byname, name)
                     and name.lower() not in run.used_names):
+                def still_ok(live):
+                    """NetBox still shows it holding the name, ours and reclaimable."""
+                    return (str(live.get("name") or "").lower() == name.lower()
+                            and self._is_reclaimable(run, d, live, name))
                 try:
-                    if self._delete_device(run, byname):
+                    if self._delete_device(run, byname, still_ok):
                         run.deleted += 1
                 except Exception as e:
                     run.note_error(f"delete-stale {name}: {e}")
@@ -3562,10 +3593,15 @@ class SyncMixin:
                 # New switch: pick a unique name from the NAS name or IP and reserve it.
                 name = (nas_name or f"switch-{nas_ip}").strip() or f"switch-{nas_ip}"
                 # Unless NetBox already has it (added since the last reconcile).
-                for found in self._lookup_devices(names=[name], tenant_id=getattr(tenant, "id", None)):
+                found_rows = self._lookup_devices(names=[name], ips=[nas_ip],
+                                                  tenant_id=getattr(tenant, "id", None))
+                for found in found_rows:
                     if _primary_addr(found) == nas_ip:
                         switch_by_ip[nas_ip] = found
                         return found
+                # A device with that name but another IP keeps its name.
+                for found in found_rows:
+                    existing_by_name.setdefault(str(found.get("name") or "").lower(), found)
                 name = self._uniq_device_name(name, "", nas_ip, existing_by_name, used_names)
                 used_names.add(name.lower())
                 # Create payload with role, type, site and tenant when known.

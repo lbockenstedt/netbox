@@ -46,6 +46,10 @@ FULL_FIELDS = ("id", "name", "serial", "role", "device_type", "status", "site",
                "tenant", "rack", "primary_ip4", "url", "last_updated", "custom_fields")
 # Custom fields the slim index keeps (identity and ownership).
 _SLIM_CF = ("mac_address", "nw_device_id", "discovered_from")
+# discovered_from values of the devices the network scanner owns. The cache
+# is their source of truth: a read of NetBox never overwrites their cached
+# row; only the spoke's own writes (and the daily reconcile) change it.
+SCANNER_SOURCES = frozenset({"Network Devices", "LLDP"})
 _DEVICE_PATH_RE = re.compile(r"/api/dcim/devices/(?:(\d+)/)?$")
 
 
@@ -74,6 +78,11 @@ def slim_row(row: dict) -> dict:
         "custom_fields": {k: cf[k] for k in _SLIM_CF if cf.get(k)},
         "last_updated": row.get("last_updated"),
     }
+
+
+def scanner_owned(row: dict) -> bool:
+    """True for a device the network scanner created (see SCANNER_SOURCES)."""
+    return str((row.get("custom_fields") or {}).get("discovered_from") or "") in SCANNER_SOURCES
 
 
 def write_json(path: str, data: Any) -> None:
@@ -289,10 +298,13 @@ class DeviceCache:
 
     # ── writes ─────────────────────────────────────────────────────────────
 
-    def upsert(self, rows: Iterable[dict], force: bool = False) -> None:
+    def upsert(self, rows: Iterable[dict], force: bool = False, read: bool = False) -> None:
         """Store fresh NetBox rows (a write response or a filtered read),
         moving a device between tenant files when its tenant changed.
-        ``force`` stores a row even when its last_updated is unchanged."""
+        ``force`` stores a row even when its last_updated is unchanged.
+        ``read`` (rows read, not written, by the spoke) leaves a cached
+        scanner-owned device as it is, so drift made in NetBox is not adopted
+        before the reconcile puts it back."""
         with self.lock:
             if not self.load():
                 return  # nothing to update; the next read rebuilds anyway
@@ -304,6 +316,8 @@ class DeviceCache:
                     continue
                 key = tenant_key(row)
                 old = self._index.get(row["id"])
+                if read and old is not None and scanner_owned(old):
+                    continue
                 # Unchanged since we stored it (a read of a known device): skip.
                 if (not force and old is not None and row.get("last_updated")
                         and old.get("last_updated") == row.get("last_updated")
@@ -377,24 +391,26 @@ class DeviceCache:
                     self._journal = []
 
     def journal_ids(self) -> set:
-        """Ids of the devices the spoke wrote during the current walk."""
+        """Ids of the devices the spoke wrote (not just read) during the
+        current walk."""
         with self.lock:
             ids = set()
-            for op, payload in self._journal:
-                ids.update(payload if op == "remove" else (r.get("id") for r in payload))
+            for op, payload, wrote in self._journal:
+                if wrote:
+                    ids.update(payload if op == "remove" else (r.get("id") for r in payload))
             return ids
 
     def _replay_journal(self) -> None:
         """Apply the writes seen during the current walk again, skipping a
         row older than the one the listing brought."""
-        for op, payload in list(self._journal):
+        for op, payload, wrote in list(self._journal):
             if op == "remove":
                 self.remove(payload)
                 continue
             newer = [r for r in payload
                      if str(r.get("last_updated") or "")
                      >= str((self._index.get(r.get("id")) or {}).get("last_updated") or "")]
-            self.upsert(newer)
+            self.upsert(newer, read=not wrote)
 
     def _rows_or_clear(self, key: str) -> Optional[List[dict]]:
         """A tenant's rows before a rewrite ([] for a tenant without a file).
@@ -467,10 +483,14 @@ class DeviceCache:
                 data = resp.json()
                 op = ("upsert", [r for r in (data if isinstance(data, list) else [data])
                                  if isinstance(r, dict)])
+            wrote = req.method != "GET"
             with self.lock:
                 if self._walks:
-                    self._journal.append(op)
-                (self.remove if op[0] == "remove" else self.upsert)(op[1])
+                    self._journal.append(op + (wrote,))
+                if op[0] == "remove":
+                    self.remove(op[1])
+                else:
+                    self.upsert(op[1], read=not wrote)
         except Exception as e:  # noqa: BLE001 - see docstring
             logger.warning("device cache: response hook skipped: %s", e)
         return resp

@@ -287,11 +287,7 @@ def test_console_sync_finds_a_device_added_in_netbox_by_its_ip():
     f = _world()
     eng = make_engine(NetboxEngine, f)
     eng._all_devices_cached()
-    _device(f, 100, "HAND-MADE")  # added in the NetBox UI, under another name
-    f.add("interfaces", {"id": 7, "device_id": 100, "name": "mgmt", "type": "virtual"})
-    ip = f.add("ip-addresses", {"address": "10.0.0.9/24", "assigned_object_type": "dcim.interface",
-                                "assigned_object_id": 7, "custom_fields": {}})
-    f.db["devices"][100]["primary_ip4_id"] = ip["id"]
+    _hand_made_device_with_ip(f, "10.0.0.9/24")  # under another name
     res = eng.sync_devices([{"ip": "10.0.0.9", "mac": "", "hostname": "box", "serial": ""}],
                            tenant_slug="t1", source="Console", defaults={"site": "lab"})
     assert res["status"] == "SUCCESS", res
@@ -322,17 +318,53 @@ def test_nw_push_finds_a_device_added_in_netbox_by_its_ip():
     f = _world()
     eng = make_engine(NetboxEngine, f)
     eng._all_devices_cached()
-    _device(f, 100, "HAND-MADE")  # added in the NetBox UI, under another name
-    f.add("interfaces", {"id": 7, "device_id": 100, "name": "mgmt", "type": "virtual"})
-    ip = f.add("ip-addresses", {"address": "10.0.0.9/24", "assigned_object_type": "dcim.interface",
-                                "assigned_object_id": 7, "custom_fields": {}})
-    f.db["devices"][100]["primary_ip4_id"] = ip["id"]
+    _hand_made_device_with_ip(f, "10.0.0.9/24")  # under another name
     f.log.clear()
     res = eng.sync_nw_device(device={"id": "nw-9", "name": "sw9", "address": "10.0.0.9"},
                              interfaces=[], tenant_slug="t1", defaults=NW)
     assert res["status"] == "SUCCESS", res
     assert sorted(f.db["devices"]) == [100]
     assert _listings(f) == []
+
+
+def _hand_made_device_with_ip(f, address):
+    """Device 100 added in the NetBox UI, holding ``address`` on an interface."""
+    _device(f, 100, "HAND-MADE")
+    f.add("interfaces", {"id": 7, "device_id": 100, "name": "mgmt", "type": "virtual"})
+    ip = f.add("ip-addresses", {"address": address, "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": 7, "custom_fields": {}})
+    f.db["devices"][100]["primary_ip4_id"] = ip["id"]
+
+
+def test_access_tracker_finds_a_switch_added_in_netbox_by_its_ip():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _hand_made_device_with_ip(f, "10.0.0.254/24")
+    eng.sync_access_tracker(
+        sessions=[{"mac": "AA:BB:CC:DD:EE:FF", "ip": "10.0.0.5", "nas_ip": "10.0.0.254",
+                   "nas_port": "Ethernet1/0/12", "nas_name": "sw-core",
+                   "start_time": "2026-06-30T10:00:00"}],
+        tenant_slug="t1", defaults={"site": "lab"})
+    assert not [d for d in f.db["devices"].values() if "sw-core" in str(d.get("name")).lower()]
+
+
+def test_replace_sync_does_not_delete_a_device_released_in_netbox():
+    # The cached row says opnsense owns it; NetBox says someone took it over.
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    feed = dict(tenant_slug="t1", source="opnsense", defaults={"site": "lab"}, replace=True)
+    eng.sync_devices([{"ip": "10.0.0.5", "mac": "aa:bb:cc:00:00:05", "hostname": "pc5"}], **feed)
+    (dev_id,) = f.db["devices"]
+    # An older device without last_seen (one with it is left to the sweep).
+    cache = eng._device_cache()
+    row = cache.full_row(dev_id)
+    del row["custom_fields"]["last_seen"], f.db["devices"][dev_id]["custom_fields"]["last_seen"]
+    cache.upsert([row], force=True)
+    f.db["devices"][dev_id]["custom_fields"]["discovered_from"] = "manual"
+    res = eng.sync_devices([{"ip": "10.0.0.6", "mac": "aa:bb:cc:00:00:06", "hostname": "pc6"}], **feed)
+    assert res["deleted"] == 0, res
+    assert dev_id in f.db["devices"]
 
 
 def test_nw_device_deleted_in_netbox_is_recreated_on_its_next_push():
@@ -493,6 +525,51 @@ def test_reconcile_does_not_recreate_a_device_re_added_under_another_id():
     res = eng.reconcile_device_cache("t1")
     assert res["changed"] == 0, res
     assert sorted(f.db["devices"]) == [101, 200]
+
+
+def test_reconcile_keeps_a_write_the_spoke_made_after_the_listing():
+    f = _world()
+    # SW0 (checked first) was deleted in NetBox and is not recreated.
+    _device(f, 98, "SW0", discovered_from="Network Devices", last_seen=_ago(8 * 86400))
+    _device(f, 100, "SW1", discovered_from="Network Devices", last_seen=_ago(3600))
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    del f.db["devices"][98]
+    f.db["devices"][100]["name"] = "DRIFTED"  # edited in the NetBox UI
+    seen_recently = eng._seen_recently
+
+    def poll_meanwhile(row):
+        # A scanner poll renames SW1 while the reconcile is checking SW0.
+        eng.nb.dcim.devices.update([{"id": 100, "name": "SW1-POLLED"}])
+        return seen_recently(row)
+    eng._seen_recently = poll_meanwhile
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert f.db["devices"][100]["name"] == "SW1-POLLED"
+
+
+def test_reading_a_drifted_scanner_device_does_not_adopt_the_drift():
+    f, eng = _reconcile_world()
+    f.db["devices"][100].update(name="DRIFTED", last_updated=_ago(0))
+    eng.nb.dcim.devices.get(100)  # e.g. a poll hydrating the device
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 1 and f.db["devices"][100]["name"] == "SW1", res
+
+
+def test_reconcile_reports_records_it_could_not_write():
+    f, eng = _reconcile_world()
+    os.mkdir(os.path.join(netbox_device_cache.CACHE_DIR, "_reconcile.jsonl"))
+    f.db["devices"][100]["name"] = "DRIFTED"
+    res = eng.reconcile_device_cache("t1")
+    assert res["status"] == "ERROR" and res["changed"] == 1 and res["errors"] == 0, res
+
+
+def test_a_failed_tenant_listing_is_retried_within_the_hour():
+    f, eng = _reconcile_world()
+    f.fail.add(("GET", "devices", "list"))
+    with pytest.raises(Exception):
+        eng.reconcile_device_cache("t1")
+    assert eng._device_cache()._meta["reconcile"]["t1"] - time.time() <= 3600
 
 
 def test_reconcile_runs_only_for_a_due_tenant():
