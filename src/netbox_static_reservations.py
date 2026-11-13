@@ -21,6 +21,13 @@ stops. The hub sends ``{"rollback": changes}`` when the DHCP sync that
 follows the pass fails; a rollback restores ``before`` only where NetBox
 still holds ``after``, so it never undoes a later edit.
 
+Device replacement: an IP NetBox reserves for an old MAC whose host now
+answers with a new one (new NIC, server, iLO, switch) moves to the new MAC,
+on the IP and on its interface, when every check passes and the hub's
+``replace_watch`` shows the waits are over (``auto_replace``), or at once
+from the "Use new MAC" button (:func:`replace_reservation_mac`). The hub
+keeps the waiting state; this module keeps none.
+
 Audience: NetBox spoke developers.
 """
 
@@ -38,6 +45,12 @@ ARP_MAX_AGE = 2 * 3600
 DEFAULT_MAX_WRITES = 25
 # An address whose write failed is not retried for this long (in memory).
 WRITE_BACKOFF = 3600
+# Automatic device replacement: the new MAC seen at the IP for this long
+# (so on at least two passes) and the old MAC unseen anywhere for this long.
+REPLACE_NEW_MIN_AGE = 1800
+REPLACE_OLD_UNSEEN = 24 * 3600
+# Writes a replacement may need (the IP, and its interface's MAC).
+REPLACE_WRITES = 2
 # The two custom fields this pass owns.
 FIELDS = ("mac_address", "dhcp_reservation")
 
@@ -202,11 +215,20 @@ def candidates(tenant: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _age(value: Any) -> Optional[float]:
+    """An age in seconds from the hub, or None when missing or not a number."""
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
                              ips: Iterable[Dict[str, Any]],
                              leases: Iterable[Dict[str, Any]],
                              cands: Iterable[Dict[str, Any]],
-                             kea_subnets: Optional[Iterable[Dict[str, Any]]] = None
+                             kea_subnets: Optional[Iterable[Dict[str, Any]]] = None,
+                             replace: Optional[Dict[str, Any]] = None
                              ) -> Dict[str, List]:
     """Decide which candidates become reservations. Pure; no I/O.
 
@@ -217,28 +239,47 @@ def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
         cands: ``{ip, mac, mode, source}`` from :func:`candidates`.
         kea_subnets: Kea v4 subnets (``subnet``, ``pools``,
             ``reservations``). None means unknown: nothing is reserved.
+        replace: device replacement policy ``{auto, watch, force}``.
+            ``auto`` (bool) lets a NetBox reservation move to a new MAC once
+            ``watch[ip]`` (the hub's ``{old_mac, new_mac, first_seen_age,
+            old_unseen_age}``) shows the new MAC for ``REPLACE_NEW_MIN_AGE``
+            and the old MAC unseen for ``REPLACE_OLD_UNSEEN``. ``force``
+            (``{ip, old_mac, new_mac}``, the "Use new MAC" button) replaces
+            that one IP without the waits. Every other check still applies.
 
     A MAC seen at several candidate IPs is skipped, except that addresses an
     agent reports as ``unknown`` (a secondary or VIP on the same NIC) are left
     out of that count. Anything that differs from what the candidate claims
     (another MAC or reservation in NetBox or Kea, a lease for another MAC, a
-    declined address) is a conflict and is never overwritten.
+    declined address) is a conflict and is never overwritten. The one
+    exception is a device replacement: NetBox holds old MAC A for the IP, the
+    new MAC B passes every check a new reservation needs, and A holds no
+    lease, is reserved nowhere else and is not seen in this pass.
 
     Returns:
-        ``{"reserve": [{ip_id, ip, mac, source, before}], "conflicts": [{ip,
-        mac, reason}], "skipped": [{ip, reason}]}``. ``before`` holds the two
-        custom fields as NetBox stores them now.
+        ``{"reserve": [{ip_id, ip, mac, source, before}], "replace": [{ip_id,
+        ip, mac, old_mac, source, before}], "pending_replace": [{ip, old_mac,
+        new_mac, first_seen_age}], "conflicts": [{ip, mac, reason}],
+        "skipped": [{ip, reason}]}``. ``before`` holds the two custom fields
+        as NetBox stores them now. A conflict where NetBox holds another MAC
+        also has ``old_mac`` and ``replace`` (why it was not replaced).
     """
     reserve: List[Dict[str, Any]] = []
+    replace_rows: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
     conflicts: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     scopes = _scopes(prefixes)
     kea_nets = _kea_pools(kea_subnets)
     kea_res = _kea_reservations(kea_subnets)
+    replace = replace or {}
+    auto = bool(replace.get("auto"))
+    watch = replace.get("watch") or {}
+    force = replace.get("force") or {}
 
     # Index NetBox IPs by host address; existing reservations by MAC.
     nb_rows: Dict[str, List[Dict[str, Any]]] = {}
-    reserved_mac_at: Dict[str, str] = {}
+    reserved_at: Dict[str, set] = {}
     for row in ips or []:
         ip = _host(row.get("address"))
         if not ip:
@@ -247,7 +288,7 @@ def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
         cf = row.get("custom_fields") or {}
         mac = _norm_mac(cf.get("mac_address"))
         if cf.get("dhcp_reservation") and mac:
-            reserved_mac_at.setdefault(mac, ip)
+            reserved_at.setdefault(mac, set()).add(ip)
 
     # Index Kea leases by IP and the set of MACs holding any lease.
     lease_macs_by_ip: Dict[str, set] = {}
@@ -262,8 +303,11 @@ def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
 
     # Merge candidates per IP: an agent "dhcp" answer vetoes; MACs must agree.
     merged: Dict[str, Dict[str, Any]] = {}
+    seen_macs = set()
     for c in cands or []:
         ip, mac = _host(c.get("ip")), _mac(c.get("mac"))
+        if mac:
+            seen_macs.add(mac)
         if not ip:
             continue
         m = merged.setdefault(ip, {"macs": set(), "modes": set(),
@@ -280,6 +324,66 @@ def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
             continue
         for mac in m["macs"]:
             mac_ip_count[mac] = mac_ip_count.get(mac, 0) + 1
+
+    def _new_mac_block(ip: str, addr: Any, mac: str, sources: set,
+                       old: str, repeat: bool = False) -> Optional[Tuple[str, str]]:
+        """Why ``mac`` may not be reserved at ``ip``, as ``(list, reason)``,
+        or None. ``old`` is the MAC NetBox reserves the IP for now (a
+        replacement), whose own Kea reservation does not count. On a
+        ``repeat`` of the button, Kea may already reserve the IP for ``mac``
+        (the sync pushed it) and every other check still runs."""
+        if reserved_at.get(mac, set()) - {ip}:
+            return "conflicts", "mac reserved at another address"
+        # The same against Kea's own host reservations (unknown → wait).
+        if kea_res is None:
+            return "skipped", "kea reservations unknown"
+        kea_ip_macs, kea_mac_ips = kea_res
+        if not any(addr in k[0] for k in kea_nets):
+            return "skipped", "not in a kea subnet"
+        held = kea_ip_macs.get(ip)
+        if held is not None and not (old and held == {old}) and not (repeat and held == {mac}):
+            if held == {mac}:
+                return "skipped", "already reserved"
+            return "conflicts", "reserved in kea for another mac"
+        if kea_mac_ips.get(mac, set()) - {ip}:
+            return "conflicts", "mac reserved in kea at another address"
+        # Any Kea lease for the IP or the MAC means not static. A declined
+        # lease has no MAC; HA peers may disagree (one declined, one
+        # leased), which is reported as its own conflict.
+        lease_macs = lease_macs_by_ip.get(ip)
+        if lease_macs:
+            if lease_macs == {mac}:
+                return "skipped", "dynamic lease"
+            if lease_macs == {""}:
+                return "conflicts", "address declined in kea"
+            if "" in lease_macs:
+                return "conflicts", "kea leases disagree (declined and leased)"
+            return "conflicts", "leased to another mac"
+        if mac in leased_macs:
+            return "skipped", "mac holds a lease"
+        # A sweep-only host needs positive evidence — an IP outside every
+        # Kea pool (a DHCP client always holds a pool address). An agent's
+        # "static" is not pool-checked: a static host inside a pool is the
+        # very clash this pass prevents.
+        if "agent" not in sources:
+            kea = next((k for k in kea_nets if addr in k[0]), None)
+            if kea is None or kea[1] is None:
+                return "skipped", "kea pools unknown"
+            if any(lo <= int(addr) <= hi for lo, hi in kea[1]):
+                return "skipped", "inside a dhcp pool"
+        return None
+
+    def _old_mac_block(ip: str, old: str) -> Optional[str]:
+        """Why old MAC ``old`` may not give up ``ip``, or None."""
+        if old in leased_macs:
+            return "old mac holds a lease"
+        if reserved_at.get(old, set()) - {ip}:
+            return "old mac reserved at another address"
+        if kea_res is not None and kea_res[1].get(old, set()) - {ip}:
+            return "old mac reserved in kea at another address"
+        if old in seen_macs:
+            return "old mac still seen"
+        return None
 
     for ip, m in sorted(merged.items()):
         # Step 1: exactly one well-formed MAC, used at no other candidate IP.
@@ -327,71 +431,68 @@ def plan_static_reservations(prefixes: Iterable[Dict[str, Any]],
             continue
         cf = row.get("custom_fields") or {}
         nb_mac = _norm_mac(cf.get("mac_address"))
-        # Step 5: never overwrite a different reservation or MAC.
+        source = ",".join(sorted(x for x in m["sources"] if x))
+        before = {k: cf.get(k) for k in FIELDS}
+        # Step 5: NetBox holds another MAC. Never overwritten, except a
+        # device replacement that passes every check (see above).
+        if nb_mac and nb_mac != mac:
+            reserved = bool(cf.get("dhcp_reservation"))
+            block = _new_mac_block(ip, addr, mac, m["sources"], nb_mac)
+            why = block[1] if block else _old_mac_block(ip, nb_mac)
+            row_out = {"ip_id": row.get("id"), "ip": ip, "mac": mac, "old_mac": nb_mac,
+                       "source": source, "before": before}
+            if why is None and not reserved:
+                why = "not a dhcp reservation"
+            if force.get("ip") == ip:
+                if why is None and (_norm_mac(force.get("old_mac")), _norm_mac(
+                        force.get("new_mac"))) == (nb_mac, mac):
+                    replace_rows.append(row_out)
+                    continue
+                why = why or "macs changed since the last pass; refresh"
+            elif why is None and not auto:
+                why = "automatic replacement is off"
+            elif why is None:
+                w = watch.get(ip) or {}
+                same = (_norm_mac(w.get("old_mac")), _norm_mac(w.get("new_mac"))) == (nb_mac, mac)
+                first = (_age(w.get("first_seen_age")) or 0.0) if same else 0.0
+                unseen = _age(w.get("old_unseen_age")) if same else None
+                if first >= REPLACE_NEW_MIN_AGE and unseen is not None \
+                        and unseen >= REPLACE_OLD_UNSEEN:
+                    replace_rows.append(row_out)
+                    continue
+                pending.append({"ip": ip, "old_mac": nb_mac, "new_mac": mac,
+                                "first_seen_age": first})
+                why = "waiting before replacing"
+            conflicts.append({"ip": ip, "mac": mac, "old_mac": nb_mac,
+                              "reason": "reserved for another mac" if reserved
+                              else "netbox mac differs", "replace": why})
+            continue
         if cf.get("dhcp_reservation"):
-            if nb_mac == mac:
+            f_old = _norm_mac(force.get("old_mac"))
+            if nb_mac == mac and force.get("ip") == ip and f_old and f_old != mac \
+                    and _norm_mac(force.get("new_mac")) == mac:
+                # A repeated button request: done only if the replacement
+                # would still pass every check (Kea may already hold the
+                # new MAC here, via the sync).
+                block = _new_mac_block(ip, addr, mac, m["sources"], f_old, repeat=True)
+                why = block[1] if block else _old_mac_block(ip, f_old)
+                skipped.append({"ip": ip, "reason": why or "already replaced"})
+            elif nb_mac == mac:
                 skipped.append({"ip": ip, "reason": "already reserved"})
             else:
                 conflicts.append({"ip": ip, "mac": mac, "reason": "reserved for another mac"})
             continue
-        if nb_mac and nb_mac != mac:
-            conflicts.append({"ip": ip, "mac": mac, "reason": "netbox mac differs"})
+        # Steps 6-7: Kea reservations, leases and pools (see _new_mac_block).
+        block = _new_mac_block(ip, addr, mac, m["sources"], "")
+        if block is not None:
+            (conflicts if block[0] == "conflicts" else skipped).append(
+                {"ip": ip, "mac": mac, "reason": block[1]} if block[0] == "conflicts"
+                else {"ip": ip, "reason": block[1]})
             continue
-        if reserved_mac_at.get(mac, ip) != ip:
-            conflicts.append({"ip": ip, "mac": mac, "reason": "mac reserved at another address"})
-            continue
-        # Step 5b: the same against Kea's own host reservations (unknown → wait).
-        if kea_res is None:
-            skipped.append({"ip": ip, "reason": "kea reservations unknown"})
-            continue
-        kea_ip_macs, kea_mac_ips = kea_res
-        if not any(addr in k[0] for k in kea_nets):
-            skipped.append({"ip": ip, "reason": "not in a kea subnet"})
-            continue
-        if ip in kea_ip_macs:
-            if kea_ip_macs[ip] == {mac}:
-                skipped.append({"ip": ip, "reason": "already reserved"})
-            else:
-                conflicts.append({"ip": ip, "mac": mac, "reason": "reserved in kea for another mac"})
-            continue
-        if kea_mac_ips.get(mac):
-            conflicts.append({"ip": ip, "mac": mac,
-                              "reason": "mac reserved in kea at another address"})
-            continue
-        # Step 6: any Kea lease for the IP or the MAC means not static. A
-        # declined lease has no MAC; HA peers may disagree (one declined,
-        # one leased), which is reported as its own conflict.
-        lease_macs = lease_macs_by_ip.get(ip)
-        if lease_macs:
-            if lease_macs == {mac}:
-                skipped.append({"ip": ip, "reason": "dynamic lease"})
-            elif lease_macs == {""}:
-                conflicts.append({"ip": ip, "mac": mac, "reason": "address declined in kea"})
-            elif "" in lease_macs:
-                conflicts.append({"ip": ip, "mac": mac,
-                                  "reason": "kea leases disagree (declined and leased)"})
-            else:
-                conflicts.append({"ip": ip, "mac": mac, "reason": "leased to another mac"})
-            continue
-        if mac in leased_macs:
-            skipped.append({"ip": ip, "reason": "mac holds a lease"})
-            continue
-        # Step 7: a sweep-only host needs positive evidence — an IP outside
-        # every Kea pool (a DHCP client always holds a pool address). An
-        # agent's "static" is not pool-checked: a static host inside a pool
-        # is the very clash this pass prevents.
-        if "agent" not in m["sources"]:
-            kea = next((k for k in kea_nets if addr in k[0]), None)
-            if kea is None or kea[1] is None:
-                skipped.append({"ip": ip, "reason": "kea pools unknown"})
-                continue
-            if any(lo <= int(addr) <= hi for lo, hi in kea[1]):
-                skipped.append({"ip": ip, "reason": "inside a dhcp pool"})
-                continue
         reserve.append({"ip_id": row.get("id"), "ip": ip, "mac": mac,
-                        "source": ",".join(sorted(x for x in m["sources"] if x)),
-                        "before": {k: cf.get(k) for k in FIELDS}})
-    return {"reserve": reserve, "conflicts": conflicts, "skipped": skipped}
+                        "source": source, "before": before})
+    return {"reserve": reserve, "replace": replace_rows, "pending_replace": pending,
+            "conflicts": conflicts, "skipped": skipped}
 
 
 def _fields(cf: Dict[str, Any]) -> Dict[str, Any]:
@@ -426,9 +527,98 @@ def compare_and_set(engine, ip_id: Any, expect: Dict[str, Any],
         return "failed", str(e) or type(e).__name__
 
 
+# Where each kind of object holding an interface MAC lives in pynetbox.
+_MAC_HOLDERS = {"dcim.interface": ("dcim", "interfaces"),
+                "virtualization.vminterface": ("virtualization", "interfaces"),
+                "dcim.macaddress": ("dcim", "mac_addresses")}
+
+
+def _holder_endpoint(engine, kind: str):
+    """The pynetbox endpoint for ``kind`` (see ``_MAC_HOLDERS``), or None."""
+    app, name = _MAC_HOLDERS.get(kind) or (None, None)
+    return getattr(getattr(engine.nb, app), name) if app else None
+
+
+def interface_mac_holder(engine, ip_id: Any, old_mac: str) -> Optional[Dict[str, Any]]:
+    """The object that holds the MAC of the interface IP ``ip_id`` is
+    assigned to, when that MAC is ``old_mac``: ``{object, id}``, else None.
+
+    NetBox 4.2+ keeps MACs as ``dcim.mac-addresses`` records and shows the
+    interface's ``primary_mac_address``; the record itself is edited, since
+    the interface's ``mac_address`` is read-only there (see
+    ``SyncMixin._set_iface_mac``). Older NetBox has no
+    ``primary_mac_address`` and keeps a writable ``mac_address`` on the
+    interface. An interface with another MAC, or none, is left alone.
+    Raises on a NetBox error.
+    """
+    ip_obj = engine.nb.ipam.ip_addresses.get(int(ip_id))
+    kind = str(getattr(ip_obj, "assigned_object_type", "") or "")
+    oid = getattr(ip_obj, "assigned_object_id", None)
+    if kind not in ("dcim.interface", "virtualization.vminterface") or oid in (None, ""):
+        return None
+    iface = _holder_endpoint(engine, kind).get(int(oid))
+    if not iface:
+        return None
+    primary = getattr(iface, "primary_mac_address", None)
+    if primary:
+        pid = primary.get("id") if isinstance(primary, dict) else getattr(primary, "id", None)
+        pmac = (primary.get("mac_address") if isinstance(primary, dict)
+                else getattr(primary, "mac_address", None))
+        if pid is not None and _norm_mac(pmac) == old_mac:
+            return {"object": "dcim.macaddress", "id": pid}
+        return None
+    if _norm_mac(getattr(iface, "mac_address", None)) == old_mac:
+        return {"object": kind, "id": int(oid)}
+    return None
+
+
+def mac_compare_and_set(engine, holder: Dict[str, Any], expect: str,
+                        new: str) -> Tuple[str, str]:
+    """Set ``mac_address`` on ``holder`` (``{object, id}``) to ``new`` only
+    if it still is ``expect``. Outcomes as :func:`compare_and_set`."""
+    try:
+        ep = _holder_endpoint(engine, str(holder.get("object") or ""))
+        obj = ep.get(int(holder["id"])) if ep is not None else None
+        if not obj:
+            return "gone", "interface mac deleted since it was read"
+        current = _norm_mac(getattr(obj, "mac_address", None))
+        if current == _norm_mac(new):
+            return "already", ""
+        if current != _norm_mac(expect):
+            return "changed", "interface mac changed in netbox since it was read"
+        obj.mac_address = new
+        obj.save()
+        return "written", ""
+    except Exception as e:  # noqa: BLE001 — reported, never raised
+        return "failed", str(e) or type(e).__name__
+
+
+def _undo(engine, c: Dict[str, Any]) -> Tuple[str, str]:
+    """Undo one change: its interface MAC (a replacement) first, then the
+    IP. The worst outcome wins: ``failed``, then ``kept``, else ``done``."""
+    outcomes = []
+    iface = c.get("interface")
+    if isinstance(iface, dict) and "after" in iface:
+        outcomes.append(mac_compare_and_set(
+            engine, iface, (iface.get("after") or {}).get("mac_address"),
+            (iface.get("before") or {}).get("mac_address")))
+    outcomes.append(compare_and_set(engine, c["ip_id"], c.get("after") or {},
+                                    c.get("before") or {}))
+    for worst in (("failed",), ("changed", "gone")):
+        hit = next((d for o, d in outcomes if o in worst), None)
+        if hit is not None:
+            if len(outcomes) == 2:
+                # Say what happened to each object, not only the worst.
+                hit = "; ".join(f"{name}: {d or 'restored'}"
+                                for name, (_o, d) in zip(("interface", "ip"), outcomes))
+            return ("failed" if worst == ("failed",) else "kept"), hit
+    return "done", ""
+
+
 def roll_back(engine, changes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Undo ``changes`` (newest first): restore ``before`` where NetBox still
-    holds ``after``.
+    holds ``after``. A replacement also restores its interface MAC
+    (``interface``: ``{object, id, before, after}``) the same way.
 
     Returns ``{status, rolled_back, rollback_kept, rollback_failed}``:
     restored (or already back to ``before``, so a repeated rollback is
@@ -441,11 +631,10 @@ def roll_back(engine, changes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     for c in reversed(list(changes or [])):
         if not isinstance(c, dict) or c.get("ip_id") in (None, ""):
             continue
-        outcome, detail = compare_and_set(engine, c["ip_id"], c.get("after") or {},
-                                          c.get("before") or {})
-        if outcome in ("written", "already"):
+        outcome, detail = _undo(engine, c)
+        if outcome == "done":
             done.append(c)
-        elif outcome in ("changed", "gone"):
+        elif outcome == "kept":
             kept.append({**c, "reason": detail})
         else:
             failed.append({**c, "error": detail})
@@ -457,29 +646,73 @@ def roll_back(engine, changes: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             "rollback_kept": kept, "rollback_failed": failed}
 
 
+def _write_replacement(engine, r: Dict[str, Any]) -> Tuple[str, str, Optional[Dict]]:
+    """Move the IP's reservation from ``old_mac`` to ``mac``, then the MAC
+    of the interface the IP is assigned to when it is ``old_mac``.
+
+    Returns ``(outcome, detail, interface)``. ``interface`` is the interface
+    write ``{object, id, before, after}`` (also when that write failed, so
+    the rollback covers it), or ``{object, id, left: reason}``
+    when the interface already held the new MAC or changed in between, or
+    None when no interface held the old MAC. An outcome of ``failed`` with
+    the IP already written comes back as ``partial``, so the caller rolls
+    the IP write back too.
+    """
+    after = {"mac_address": r["mac"], "dhcp_reservation": True}
+    outcome, detail = compare_and_set(engine, r["ip_id"], r["before"], after)
+    if outcome != "written":
+        return outcome, detail, None
+    try:
+        holder = interface_mac_holder(engine, r["ip_id"], r["old_mac"])
+    except Exception as e:  # noqa: BLE001 — reported, never raised
+        return "partial", str(e) or type(e).__name__, None
+    if holder is None:
+        return "written", "", None
+    iface = {**holder, "before": {"mac_address": r["old_mac"]},
+             "after": {"mac_address": r["mac"]}}
+    io, idetail = mac_compare_and_set(engine, holder, r["old_mac"], r["mac"])
+    if io == "failed":
+        # NetBox may have taken the write before failing: the rollback
+        # compare-and-sets it back too (a no-op if it still holds old_mac).
+        return "partial", idetail, iface
+    if io == "written":
+        return "written", "", iface
+    # Already moved, or changed or gone in between: the IP still moves, the
+    # interface is left alone and the row says why (it holds no undo).
+    return "written", "", {**holder, "left": idetail or "interface already has the new mac"}
+
+
 def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, float],
                          now: float) -> Dict[str, Any]:
     """One pass over the tenants the hub sent (blocking; run in a thread).
 
-    ``data``: ``{tenants: [{ref, filters, agent_addresses, sweep, kea}],
-    kea: {key: {leases, subnets}}, max_writes}``. ``ref`` is an opaque label
-    the hub maps back to its tenant; ``kea`` names the tenant's entry in the
-    shared ``kea`` map, so a Kea serving several tenants is sent once.
+    ``data``: ``{tenants: [{ref, filters, agent_addresses, sweep, kea,
+    replace_watch}], kea: {key: {leases, subnets}}, max_writes,
+    auto_replace}``. ``ref`` is an opaque label the hub maps back to its
+    tenant; ``kea`` names the tenant's entry in the shared ``kea`` map, so a
+    Kea serving several tenants is sent once. ``replace_watch`` is the hub's
+    view of each pending device replacement (``{ip, old_mac, new_mac,
+    first_seen_age, old_unseen_age}``); ``auto_replace`` turns automatic
+    replacement on (off when absent). ``force`` (``{ip, old_mac,
+    new_mac}``) is set only by :func:`replace_reservation_mac`.
 
     ``failed_writes`` (``{"<filters>|<ip>": when}``) carries the write
     backoff between passes.
 
-    Returns ``{status, evaluated, changes, conflicts, errors, skipped,
-    deferred}``; ``status`` is ERROR whenever ``errors`` is not empty. An IP
-    another writer changed (or deleted) after the read is a conflict and
-    the rest of the pass goes on. When a write fails, the pass stops,
-    ``changes`` is empty and the earlier writes are in ``rolled_back``,
-    ``rollback_kept`` or ``rollback_failed`` (see :func:`roll_back`).
+    Returns ``{status, evaluated, changes, replaced, pending_replace,
+    conflicts, errors, skipped, deferred}``; ``status`` is ERROR whenever
+    ``errors`` is not empty. An IP another writer changed (or deleted) after
+    the read is a conflict and the rest of the pass goes on. When a write
+    fails, the pass stops, ``changes`` and ``replaced`` are empty and the
+    earlier writes are in ``rolled_back``, ``rollback_kept`` or
+    ``rollback_failed`` (see :func:`roll_back`).
     """
     report: Dict[str, Any] = {"status": "SUCCESS", "evaluated": [], "changes": [],
+                              "replaced": [], "pending_replace": [],
                               "conflicts": [], "errors": [], "skipped": 0, "deferred": 0}
     max_writes = int(data.get("max_writes") or DEFAULT_MAX_WRITES)
     kea = data.get("kea") or {}
+    force = data.get("force") or None
     for key in [k for k, at in failed_writes.items() if now - at >= WRITE_BACKOFF]:
         del failed_writes[key]
 
@@ -504,17 +737,39 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
             report["errors"].append({"ref": ref, "error": "netbox read: "
                                      + str((bad or {}).get("message") or "failed")})
             continue
-        plan = plan_static_reservations(pfx.get("prefixes"), ips.get("ip_addresses"),
-                                        state["leases"], candidates(t), state["subnets"])
+        watch = {str(w.get("ip")): w for w in t.get("replace_watch") or []
+                 if isinstance(w, dict)}
+        plan = plan_static_reservations(
+            pfx.get("prefixes"), ips.get("ip_addresses"), state["leases"], candidates(t),
+            state["subnets"], {"auto": bool(data.get("auto_replace")) and not force,
+                               "watch": watch, "force": force})
         report["evaluated"].append(ref)
+        fkey = "|".join(f"{k}={filters[k]}" for k in sorted(filters))
+        if force:
+            # The button: only the one replacement; say why when there is none.
+            planned.extend((ref, f"{fkey}|{r['ip']}", "replace", r) for r in plan["replace"])
+            if not plan["replace"]:
+                report["message"] = _why_not(plan, str(force.get("ip") or ""))
+                # NetBox already reserves this IP for the one MAC the
+                # sources report and the replacement's checks still pass:
+                # a repeat of the button.
+                report["_force_already"] = any(
+                    s.get("ip") == force.get("ip") and s.get("reason") == "already replaced"
+                    for s in plan["skipped"])
+            continue
         report["skipped"] += len(plan["skipped"])
         report["conflicts"].extend({"ref": ref, **c} for c in plan["conflicts"])
-        fkey = "|".join(f"{k}={filters[k]}" for k in sorted(filters))
-        planned.extend((ref, f"{fkey}|{r['ip']}", r) for r in plan["reserve"])
+        report["pending_replace"].extend({"ref": ref, **p} for p in plan["pending_replace"])
+        rows = [("reserve", r) for r in plan["reserve"]] + [("replace", r) for r in plan["replace"]]
+        rows.sort(key=lambda kr: ipaddress.ip_address(kr[1]["ip"]))
+        planned.extend((ref, f"{fkey}|{r['ip']}", kind, r) for kind, r in rows)
 
     # Write, capped; a failure rolls back this pass's earlier writes.
-    for ref, key, r in planned:
-        if len(report["changes"]) >= max_writes:
+    writes: List[Dict[str, Any]] = []
+    used = 0
+    for ref, key, kind, r in planned:
+        need = REPLACE_WRITES if kind == "replace" else 1
+        if used + need > max_writes:
             report["deferred"] += 1
             continue
         if r.get("ip_id") is None:
@@ -525,17 +780,23 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
                                      "error": "earlier write failed; retry after backoff"})
             continue
         after = {"mac_address": r["mac"], "dhcp_reservation": True}
-        outcome, detail = compare_and_set(engine, r["ip_id"], r["before"], after)
+        if kind == "replace":
+            outcome, detail, iface = _write_replacement(engine, r)
+        else:
+            (outcome, detail), iface = compare_and_set(engine, r["ip_id"], r["before"], after), None
         if outcome in ("changed", "gone"):
             # Another writer got there first: hold this IP back, keep the rest.
             report["conflicts"].append({"ref": ref, "ip": r["ip"], "mac": r["mac"],
                                         "reason": detail})
             continue
-        if outcome == "failed":
+        if outcome in ("failed", "partial"):
             failed_writes[key] = now
             report["errors"].append({"ref": ref, "ip": r["ip"], "error": detail})
-            undo = roll_back(engine, report["changes"])
-            report.update(changes=[], rolled_back=undo["rolled_back"],
+            if outcome == "partial":
+                writes.append({"ref": ref, "ip": r["ip"], "ip_id": r["ip_id"],
+                               "before": r["before"], "after": after, "interface": iface})
+            undo = roll_back(engine, writes)
+            report.update(changes=[], replaced=[], rolled_back=undo["rolled_back"],
                           rollback_kept=undo["rollback_kept"],
                           rollback_failed=undo["rollback_failed"],
                           message=f"write for {r['ip']} failed; earlier writes of this "
@@ -546,14 +807,153 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
         failed_writes.pop(key, None)
         if outcome == "already":
             report["skipped"] += 1
+            if force and kind == "replace":
+                # Another run moved the IP between the read and the write
+                # (after this run's checks passed): finished like a repeat.
+                report["_force_already"] = True
             continue
-        report["changes"].append({"ref": ref, "ip": r["ip"], "ip_id": r["ip_id"],
-                                  "mac": r["mac"], "source": r["source"],
-                                  "before": r["before"], "after": after})
-        logger.info("static reservations: reserved %s (%s)", r["ip"], r["source"])
+        used += need
+        if kind == "replace":
+            row = {"ref": ref, "ip": r["ip"], "ip_id": r["ip_id"], "old_mac": r["old_mac"],
+                   "new_mac": r["mac"], "source": r["source"], "before": r["before"],
+                   "after": after, "interface": iface}
+            report["replaced"].append(row)
+            logger.info("static reservations: %s moved to a new mac (%s)%s", r["ip"],
+                        r["source"], " with its interface" if iface else "")
+        else:
+            row = {"ref": ref, "ip": r["ip"], "ip_id": r["ip_id"], "mac": r["mac"],
+                   "source": r["source"], "before": r["before"], "after": after}
+            report["changes"].append(row)
+            logger.info("static reservations: reserved %s (%s)", r["ip"], r["source"])
+        writes.append(row)
     # ERROR whenever anything went wrong, so "every read failed" never reads
     # as an empty success; the rows say what.
     if report["errors"]:
         report["status"] = "ERROR"
         report.setdefault("message", f"{len(report['errors'])} error(s); see errors")
     return report
+
+
+def _why_not(plan: Dict[str, List], ip: str) -> str:
+    """Why the button's replacement for ``ip`` was not planned."""
+    for c in plan["conflicts"]:
+        if c.get("ip") == ip:
+            return f"cannot replace: {c.get('replace') or c.get('reason')}"
+    for s in plan["skipped"]:
+        if s.get("ip") == ip:
+            return f"cannot replace: {s.get('reason')}"
+    return "cannot replace: the new mac is not seen at this address now"
+
+
+def _already_moved(engine, data: Dict[str, Any], ip: str, new: str) -> Any:
+    """The NetBox id of ``ip`` when NetBox already reserves it for ``new``
+    in the request's tenant scope (the button's move was done before), else
+    None."""
+    t = (data.get("tenants") or [{}])[0] or {}
+    filters = {k: v for k, v in (t.get("filters") or {}).items()
+               if k in ("tenant", "tenant_group") and v}
+    if not filters:
+        return None
+    ips = engine.get_ip_addresses(**filters)
+    if not isinstance(ips, dict) or ips.get("status") != "SUCCESS":
+        return None
+    rows = [r for r in ips.get("ip_addresses") or [] if _host(r.get("address")) == ip]
+    cf = (rows[0].get("custom_fields") or {}) if len(rows) == 1 else {}
+    if cf.get("dhcp_reservation") and _norm_mac(cf.get("mac_address")) == new:
+        return rows[0].get("id")
+    return None
+
+
+def _finish_moved(engine, res: Dict[str, Any], ref: str, ip: str, ip_id: Any, old: str,
+                  new: str) -> Dict[str, Any]:
+    """A repeated button request: the IP already has ``new``. Finish its
+    interface if an earlier run stopped between the two writes, and report
+    the move as a ``replaced`` row like a fresh one, so the hub can still
+    roll it back (its interface is the one that holds ``new`` now)."""
+    left = None
+    try:
+        holder = interface_mac_holder(engine, ip_id, old)
+        if holder is None:
+            # Nothing to move. An interface already on the new MAC may not
+            # have been changed by this feature, so it is never undone.
+            holder = interface_mac_holder(engine, ip_id, new)
+            if holder is not None:
+                left = {**holder, "left": "interface already has the new mac"}
+        else:
+            # Move it; after the write the known holder is reported, not re-read.
+            io, detail = mac_compare_and_set(engine, holder, old, new)
+            if io in ("changed", "gone"):
+                # Changed or deleted in between: left alone, as in a fresh run.
+                left = {**holder, "left": detail}
+            elif io == "already":
+                # Another writer moved it in between: not this run's to undo.
+                left = {**holder, "left": "interface already has the new mac"}
+            elif io == "failed":
+                # NetBox may have saved before failing: put it back (a
+                # no-op when it still holds old).
+                back, bdetail = mac_compare_and_set(engine, holder, new, old)
+                out = dict(res, status="ERROR", message=(
+                    f"{ip} already has the new mac but its interface could not be "
+                    f"updated: {detail}"))
+                if back not in ("written", "already"):
+                    # Changed or deleted since: kept, like any rollback;
+                    # refused: failed.
+                    key = "rollback_failed" if back == "failed" else "rollback_kept"
+                    out[key] = list(res.get(key) or []) + [{
+                        "ref": ref, "ip": ip, "interface": {
+                            **holder, "before": {"mac_address": old},
+                            "after": {"mac_address": new}},
+                        ("error" if back == "failed" else "reason"): bdetail}]
+                return out
+    except Exception as e:  # noqa: BLE001 — reported, never raised
+        return dict(res, status="ERROR", message=(
+            f"{ip} already has the new mac but its interface could not be read: "
+            f"{str(e) or type(e).__name__}"))
+    iface = left or ({**holder, "before": {"mac_address": old}, "after": {"mac_address": new}}
+                     if holder is not None else None)
+    row = {"ref": ref, "ip": ip, "ip_id": ip_id, "old_mac": old, "new_mac": new,
+           "source": "button", "before": {"mac_address": old, "dhcp_reservation": True},
+           "after": {"mac_address": new, "dhcp_reservation": True}, "interface": iface}
+    return dict(res, status="SUCCESS", already=True, replaced=[row],
+                message=f"{ip} is already reserved for the new mac")
+
+
+def replace_reservation_mac(engine, data: Dict[str, Any], failed_writes: Dict[str, float],
+                            now: float) -> Dict[str, Any]:
+    """``NETBOX_REPLACE_RESERVATION_MAC``: the "Use new MAC" button.
+
+    ``data`` is one tenant in the pass format (``tenants``, ``kea``) plus
+    ``ip``, ``old_mac`` and ``new_mac``. Moves that IP's reservation (and
+    its interface MAC) from ``old_mac`` to ``new_mac`` now, without the
+    automatic waits but with every other check and the same compare-and-set
+    and rollback. Writes nothing else. Returns the pass report; ``status``
+    is ERROR (with a ``message``) unless ``replaced`` has the one row, or
+    this run wrote and failed nothing, the sources pass every check and
+    report only ``new_mac``, and NetBox already reserves the IP for it
+    (``already: true``, so a repeated request is harmless; an
+    interface still on ``old_mac`` is moved then). ``replaced`` then holds
+    the move as a fresh run would report it, for the hub's rollback.
+    """
+    ip = _host(data.get("ip"))
+    old, new = _mac(data.get("old_mac")), _mac(data.get("new_mac"))
+    if not ip or not old or not new or old == new or len(data.get("tenants") or []) != 1:
+        return {"status": "ERROR", "message": "need one tenant, an ip and two different macs",
+                "replaced": [], "errors": []}
+    res = reserve_static_hosts(
+        engine, {"tenants": data.get("tenants"), "kea": data.get("kea"),
+                 "max_writes": REPLACE_WRITES,
+                 "force": {"ip": ip, "old_mac": old, "new_mac": new}},
+        failed_writes, now)
+    clean = res.pop("_force_already", False) and not any(
+        res.get(k) for k in ("replaced", "changes", "errors", "rolled_back",
+                             "rollback_kept", "rollback_failed"))
+    ip_id = _already_moved(engine, data, ip, new) if clean else None
+    if ip_id is not None:
+        # A repeated request after a success (say its reply was lost).
+        ref = str(((data.get("tenants") or [{}])[0] or {}).get("ref") or "")
+        return _finish_moved(engine, res, ref, ip, ip_id, old, new)
+    if not res["replaced"]:
+        res["status"] = "ERROR"
+        lost = next((c.get("reason") for c in res["conflicts"] if c.get("ip") == ip), None)
+        res.setdefault("message", f"cannot replace: {lost}" if lost else "cannot replace")
+    return res

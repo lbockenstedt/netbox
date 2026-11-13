@@ -108,16 +108,52 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
     conservative, conflicts are reported and never overwritten) and writes.
   - **Payload**: `{"tenants": [{"ref": "<opaque label>", "filters":
     {"tenant"|"tenant_group": "<slug>"}, "agent_addresses": [{"ip", "mac",
-    "mode"}], "sweep": [{"ip", "mac", "seen_age", "arp_age"}], "kea": "<key>"}],
-    "kea": {"<key>": {"leases": [...], "subnets": [...]}}, "max_writes": 25}`.
-    A Kea serving several tenants is sent once under its key.
+    "mode"}], "sweep": [{"ip", "mac", "seen_age", "arp_age"}], "kea": "<key>",
+    "replace_watch": [{"ip", "old_mac", "new_mac", "first_seen_age",
+    "old_unseen_age"}]}], "kea": {"<key>": {"leases": [...], "subnets": [...]}},
+    "max_writes": 25, "auto_replace": true}`. A Kea serving several tenants is
+    sent once under its key. `auto_replace` absent means off.
   - **Response**: `{"status": "SUCCESS", "evaluated": ["<ref>"], "changes":
     [{"ref", "ip", "ip_id", "mac", "source", "before": {"mac_address",
-    "dhcp_reservation"}, "after": {...}}], "conflicts": [{"ref", "ip", "mac",
-    "reason"}], "errors": [{"ref", "ip"?, "error"}], "skipped": N, "deferred":
-    N}`. `status` is `"ERROR"` (with a `message`) whenever `errors` is not
-    empty, so a pass where every read failed never looks like an empty
-    success.
+    "dhcp_reservation"}, "after": {...}}], "replaced": [{"ref", "ip", "ip_id",
+    "old_mac", "new_mac", "source", "before", "after", "interface": {"object",
+    "id", "before": {"mac_address"}, "after": {...}} | {"object", "id",
+    "left": "<reason>"} | null}],
+    "pending_replace": [{"ref", "ip", "old_mac", "new_mac", "first_seen_age"}],
+    "conflicts": [{"ref", "ip", "mac", "old_mac"?, "reason", "replace"?}],
+    "errors": [{"ref", "ip"?, "error"}], "skipped": N, "deferred": N}`.
+    `status` is `"ERROR"` (with a `message`) whenever `errors` is not empty,
+    so a pass where every read failed never looks like an empty success.
+    This spoke always sends `replaced` and `pending_replace` (empty lists
+    when there are none); a hub reads their absence as an older spoke.
+  - **Device replacement**: an IP NetBox reserves for old MAC A whose host
+    now answers with new MAC B (a new NIC, server, iLO or switch at the same
+    address) is a conflict with `old_mac: A` and a `replace` reason, unless
+    it can be replaced. It is replaced (reported in `replaced`) only when
+    `auto_replace` is on, the IP has `dhcp_reservation: true`, every source
+    reports exactly B and says static, B passes every check a new
+    reservation needs (with Kea's reservation of A at this IP allowed, since
+    the sync pushed it from NetBox), A holds no Kea lease, is reserved at no
+    other address in NetBox or Kea and is not reported by any source in this
+    pass, and the hub's `replace_watch` row for the IP names the same A and B
+    with `first_seen_age` ≥ 1800 (B seen on two passes 30 minutes apart) and
+    `old_unseen_age` ≥ 86400 (A unseen for a day; null means the hub cannot
+    vouch, so no). Otherwise an eligible IP is listed in `pending_replace`.
+    The hub keeps that waiting state (see lm `docs/dhcp.md`); this spoke
+    keeps none. A replacement compare-and-sets the IP's fields A→B, then the
+    MAC of the interface the IP is assigned to when it is A: the primary
+    `dcim.mac-addresses` record on NetBox 4.2+ (the interface's own
+    `mac_address` is read-only there), or the interface's `mac_address` on
+    older NetBox (`dcim.interface` or `virtualization.vminterface`). It takes
+    two of the `max_writes` slots. If that interface changed in between,
+    the IP still moves and `interface` is `{"object", "id", "left": reason}`
+    (no undo). If the interface write fails, the rollback also
+    compare-and-sets the interface back, in case NetBox took it before
+    failing. The IP is written first: if the spoke process stops between
+    the two writes, the interface keeps A and is fixed by hand or by a repeated replace request for that
+    IP; later passes see the IP as already reserved. DHCP is unaffected,
+    since Kea reads only the IP's fields. Host
+    reservations held only in Kea are never touched.
   - **Reversible**: each write is a compare-and-set on the two fields,
     compared exactly as stored (other custom fields are kept). An IP that
     another writer changed or deleted after the read is a conflict
@@ -133,9 +169,42 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
     `rollback_kept` were left alone with a `reason` because NetBox changed
     since (a later edit is never undone) or the IP is gone; only
     `rollback_failed` (NetBox refused, with an `error`) makes the status
-    `ERROR`. The IP list cache is dropped after any write.
+    `ERROR`. A replacement rolls back its interface MAC first, then the IP,
+    each only where NetBox still holds `after`; when either is kept or
+    fails, the `reason`/`error` names both (`interface: ...; ip: ...`), and
+    any kept or failed rollback still drops the IP list cache. The IP list cache is dropped
+    after any write.
   - **Older spokes** answer `Unknown command: NETBOX_RESERVE_STATIC_HOSTS`;
     the hub then reports the feature as unsupported and writes nothing.
+
+- **`NETBOX_REPLACE_RESERVATION_MAC`**
+  - **Purpose**: The "Use new MAC" button (lm System → Sync): moves one
+    IP's reservation, and its interface MAC, from `old_mac` to `new_mac`
+    now. It skips the waits of the automatic replacement (`first_seen_age`,
+    `old_unseen_age`) but keeps every other check, the compare-and-set and
+    the rollback, and writes nothing else. The IP must already be a
+    reservation (`dhcp_reservation: true`) for `old_mac`.
+  - **Payload**: one tenant in the `NETBOX_RESERVE_STATIC_HOSTS` format plus
+    the IP: `{"tenants": [{"ref", "filters", "agent_addresses", "sweep",
+    "kea"}], "kea": {...}, "ip", "old_mac", "new_mac"}`.
+  - **Response**: the pass report. `status: "SUCCESS"` with the one row in
+    `replaced`; `status: "SUCCESS"` with `already: true` when this run
+    wrote and failed nothing, the sources report only `new_mac`, NetBox
+    already reserves the IP for it (a repeated request, or another run
+    moved the IP between this run's checks and its write) and the
+    replacement still passes every new- and old-MAC check (Kea may already
+    hold `new_mac` there). An interface still on `old_mac` is moved then;
+    if that write fails it is put back (or listed in `rollback_failed`).
+    `replaced` then holds the move as a fresh run would report it, so the
+    hub can still roll the IP back. An interface found already on
+    `new_mac` is reported as `{object, id, left: "interface already has
+    the new mac"}` and never undone, since this run cannot tell who set it;
+    else `status: "ERROR"` with a `message` such as `cannot
+    replace: old mac holds a lease` or `cannot replace: macs changed since
+    the last pass; refresh`. The hub undoes it with
+    `NETBOX_RESERVE_STATIC_HOSTS {"rollback": [<replaced row>]}` if the
+    DHCP sync after it fails. Identical requests in flight share one run.
+  - **Older spokes** answer `Unknown command: NETBOX_REPLACE_RESERVATION_MAC`.
 
 ### Tenancy
 - **`NETBOX_GET_TENANTS`**
