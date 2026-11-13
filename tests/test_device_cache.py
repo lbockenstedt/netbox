@@ -717,3 +717,39 @@ def test_access_tracker_does_not_use_another_tenants_switch_on_the_same_ip():
     (switch,) = [d for d in f.db["devices"].values() if "sw-core" in str(d.get("name")).lower()]
     assert switch["tenant_id"] == 1
     assert not [i for i in f.db["interfaces"].values() if i["device_id"] == 100 and i["id"] != 7]
+
+
+def test_lldp_prefers_the_tenants_cached_device_over_an_untenanted_one():
+    f = _world()
+    _device(f, 50, "SW1")
+    _device(f, 60, "AAA", tenant_id=None, mac_address=MAC)  # listed first
+    _device(f, 61, "ZZZ", mac_address=MAC)
+    eng = _lldp_engine(f)
+    res = eng.sync_lldp_links(LINK, tenant_slug="t1")
+    assert res["cabled"] == 1, res
+    assert eng.cabled == [(50, 61)]
+
+
+def test_lldp_looks_up_an_unknown_end_by_its_serial():
+    f = _world()
+    _device(f, 50, "SW1")
+    eng = _lldp_engine(f)
+    eng._all_devices_cached()
+    _device(f, 100, "BOX", serial="S9")  # added in NetBox since the cache was built
+    res = eng.sync_lldp_links([{"a": {"name": "sw1"}, "a_port": "1",
+                                "b": {"name": "nbr.example.com", "serial": "S9"},
+                                "b_port": "eth0"}], tenant_slug="t1")
+    assert res["cabled"] == 1 and res["created"] == 0, res
+    assert eng.cabled == [(50, 100)]
+
+
+def test_lldp_refuses_a_tenant_netbox_does_not_have():
+    f = _world()
+    _device(f, 50, "SW1", tenant_id=2)
+    _device(f, 100, f"DEVICE-{MAC}", tenant_id=2, mac_address=MAC)
+    eng = _lldp_engine(f)
+    eng._all_devices_cached()
+    f.log.clear()
+    res = eng.sync_lldp_links(LINK, tenant_slug="gone")
+    assert res["status"] == "ERROR" and "gone" in res["message"], res
+    assert eng.cabled == [] and not [x for x in f.log if x[0] != "GET"]

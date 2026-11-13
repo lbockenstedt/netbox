@@ -601,6 +601,10 @@ class DcimMixin:
 
         # Tenant and lazily resolved defaults for created devices.
         tenant = self._resolve_tenant_ci(tenant_slug) if tenant_slug else None
+        if tenant_slug and tenant is None:
+            # Unscoped matching would reach every tenant's devices.
+            return {"status": "ERROR", "message": f"NetBox tenant '{tenant_slug}' not found",
+                    **counters}
         tenant_id = getattr(tenant, "id", None)
         role = dtype = site = None
         created_device = False
@@ -608,7 +612,10 @@ class DcimMixin:
         # Identity index over the tenant's devices (and untenanted ones), plus
         # every tenant's MACs and serials so a box another tenant holds is
         # recognised, not duplicated (it is then left alone, see resolve()).
-        every_row, rows = rows, [r for r in rows if self._tenant_rank(r, tenant_id) < 2]
+        # The tenant's own rows first, so they win a key an untenanted row shares.
+        every_row = rows
+        rows = sorted((r for r in rows if self._tenant_rank(r, tenant_id) < 2),
+                      key=lambda r: self._tenant_rank(r, tenant_id))
         idx = self._index_existing_devices(rows)
         if tenant_id:
             self._add_global_identities(idx["by_mac"], idx["by_serial"], rows=every_row)
@@ -676,14 +683,16 @@ class DcimMixin:
                 # Unknown to the cache and about to be created: ask NetBox by
                 # MAC and name first, in case someone added the device there.
                 if not row and create_missing and _lldp_creatable_name(name):
-                    hits = self._lookup_devices(macs=macs, names=[name] if name else [],
-                                                tenant_id=tenant_id)
+                    hits = self._lookup_devices(serials=[end.get("serial")], macs=macs,
+                                                names=[name] if name else [], tenant_id=tenant_id)
                     # The tenant's own device first, then an untenanted one;
-                    # a MAC match before a name match; then the lowest id.
+                    # a serial or MAC match before a name match; then the lowest id.
+                    serial = str(end.get("serial") or "").strip().lower()
                     row = min(hits, default=None, key=lambda r: (
                         self._tenant_rank(r, tenant_id),
-                        self._norm_mac((r.get("custom_fields") or {}).get("mac_address") or "")
-                        not in macs,
+                        not ((serial and str(r.get("serial") or "").strip().lower() == serial)
+                             or self._norm_mac((r.get("custom_fields") or {})
+                                               .get("mac_address") or "") in macs),
                         r.get("id") or 0))
             except Exception as e:
                 # Resolution failed.
