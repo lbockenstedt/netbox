@@ -35,12 +35,17 @@ logger = logging.getLogger("NetboxEngine")
 # Owner tags (custom_fields.discovered_from) of the network scanner. For these
 # devices the cache is the source of truth: the daily reconcile pushes the
 # cached scanner-owned fields back over edits made in NetBox and recreates
-# ones deleted there. Devices with any other tag (or none) are never written
-# by the reconcile; the cache just takes NetBox's copy.
+# ones deleted there while the scanner still sees them. Devices with any other
+# tag (or none) are never written by the reconcile; the cache just takes
+# NetBox's copy. Changing discovered_from in NetBox releases a device.
 SCANNER_SOURCES = frozenset({"Network Devices", "LLDP"})
 # Fields the network scanner owns on its devices (see SCANNER_SOURCES).
 SCANNER_FIELDS = ("name", "serial")
-SCANNER_CUSTOM_FIELDS = ("nw_device_id", "mac_address", "discovered_from")
+SCANNER_CUSTOM_FIELDS = ("nw_device_id", "mac_address")
+# A scanner device deleted in NetBox is recreated only when its cached
+# last_seen is this recent (the staleness sweep's default stale_days), so a
+# device that left the network and was deleted by hand stays deleted.
+RECREATE_SEEN_WITHIN_S = 7 * 86400
 # Feeds that push a few hand-probed devices at a time (the console spokes'
 # SYNC_DEVICES). A non-replace batch from one of them, up to
 # _TARGETED_LOOKUP_MAX records, first reads its devices from NetBox by serial /
@@ -191,6 +196,8 @@ class _DeviceSyncRun:
     by_mac: Dict[str, dict] = field(default_factory=dict)     # cf.mac_address → row
     by_serial: Dict[str, dict] = field(default_factory=dict)  # serial.lower() → row
     owned_ips: set = field(default_factory=set)  # primary IPs of devices we own
+    # The batch's identities were already read from NetBox (a targeted lookup).
+    looked_up: bool = False
     # Names created/refreshed THIS batch: a 2nd create with the same name would
     # 400 on (name, site, tenant), and by_name can't see these.
     used_names: set = field(default_factory=set)
@@ -898,7 +905,8 @@ class SyncMixin:
             with cache.build_lock:
                 if not cache.load():
                     logger.info("device cache: building from NetBox (every device, once)")
-                    cache.rebuild(self._api_get_all("/api/dcim/devices/", {"limit": 500}))
+                    with cache.walking():
+                        cache.rebuild(self._api_get_all("/api/dcim/devices/", {"limit": 500}))
         return cache.rows()
 
     def _tenant_devices_cached(self, tenant_slug: str) -> list:
@@ -977,11 +985,13 @@ class SyncMixin:
         slug = tenant["slug"]
         # Step 1: the cached copy and NetBox's.
         cached = {r["id"]: r for r in self._tenant_devices_cached(slug)}
-        live = self._api_get_all("/api/dcim/devices/",
-                                 {"limit": 500, "tenant_id": tenant["id"] or "null"})
+        with cache.walking():
+            live = self._api_get_all("/api/dcim/devices/",
+                                     {"limit": 500, "tenant_id": tenant["id"] or "null"})
+            cache.replace_tenant(slug, live)
         live_by_id = {r["id"]: r for r in live}
-        cache.replace_tenant(slug, live)
         records: list = []
+        errors = 0
         # Steps 2 and 3: scanner-owned devices only.
         for dev_id, row in cached.items():
             if not _scanner_owned(row):
@@ -989,21 +999,32 @@ class SyncMixin:
             try:
                 if dev_id not in live_by_id:
                     # The GET re-files a device that only changed tenant.
-                    if self.nb.dcim.devices.get(dev_id) is None:
+                    if self.nb.dcim.devices.get(dev_id) is None and self._seen_recently(row):
                         records.append(self._recreate_cached_device(row))
                 elif _scanner_owned(live_by_id[dev_id]):
                     rec = self._revert_scanner_fields(row, live_by_id[dev_id])
                     if rec:
                         records.append(rec)
             except Exception as e:  # noqa: BLE001 - one device must not stop the rest
+                # Keep the cached values, so the next reconcile tries again
+                # instead of adopting the drift.
+                errors += 1
                 logger.warning("device reconcile: device %s: %s", dev_id, e)
+                if dev_id in live_by_id:
+                    cache.upsert([row], force=True)
         # Log and keep the before/after records; schedule the next run.
         self._write_reconcile_records(slug, records)
         cache.mark_reconciled(slug)
-        logger.info("device reconcile: tenant %s: %d device(s) checked, %d reverted or recreated",
-                    slug or "(none)", len(cached), len(records))
-        return {"status": "SUCCESS", "tenant": slug, "checked": len(cached),
-                "changed": len(records)}
+        logger.info("device reconcile: tenant %s: %d device(s) checked, %d reverted or "
+                    "recreated, %d failed", slug or "(none)", len(cached), len(records), errors)
+        return {"status": "ERROR" if errors else "SUCCESS", "tenant": slug,
+                "checked": len(cached), "changed": len(records), "errors": errors}
+
+    def _seen_recently(self, row: dict) -> bool:
+        """True when the row's last_seen is within RECREATE_SEEN_WITHIN_S."""
+        seen = self._parse_iso_cf((row.get("custom_fields") or {}).get("last_seen"))
+        return (seen is not None
+                and (datetime.now(timezone.utc) - seen).total_seconds() <= RECREATE_SEEN_WITHIN_S)
 
     def _recreate_cached_device(self, row: dict) -> dict:
         """Create a scanner-owned device again from its cached row (it was
@@ -1016,8 +1037,10 @@ class SyncMixin:
         kw = {"name": row.get("name"), "device_type": ref("device_type"), "role": ref("role"),
               "site": ref("site"), "tenant": ref("tenant"), "serial": row.get("serial") or "",
               "status": (status.get("value") if isinstance(status, dict) else status) or "active",
+              # Every cached custom field, last_seen included, so the
+              # staleness sweep still ages the device out.
               "custom_fields": {k: v for k, v in (row.get("custom_fields") or {}).items()
-                                if k in SCANNER_CUSTOM_FIELDS and v}}
+                                if v not in (None, "")}}
         new = self.nb.dcim.devices.create(**{k: v for k, v in kw.items() if v not in (None, "")})
         logger.info("device reconcile: recreated deleted device %s as %s", row.get("id"), new.id)
         return {"action": "recreate", "device": row.get("id"), "new_device": new.id,
@@ -1665,10 +1688,12 @@ class SyncMixin:
         unscoped). Raises when the cache can't be built.
 
         The cache is the source of truth for the discovery feeds, so this
-        reads nothing from NetBox. A small non-replace batch from a
+        reads nothing from NetBox up front. A small non-replace batch from a
         ``TARGETED_SOURCES`` feed (a console-probed device) first reads its
         records' serials, MACs and names from NetBox, so a device someone
-        added there since the last reconcile is matched, not duplicated."""
+        added or changed there since the last reconcile is matched; other
+        feeds ask NetBox per record only before creating a device
+        (``_index_looked_up_devices``)."""
         # Targeted lookup for a small, non-authoritative batch.
         if (not replace and run.source_tag in TARGETED_SOURCES
                 and len(incoming) <= _TARGETED_LOOKUP_MAX):
@@ -1677,6 +1702,7 @@ class SyncMixin:
                                  macs=[d.mac for d in recs],
                                  names=[d.hostname for d in recs],
                                  tenant_id=getattr(run.tenant, "id", None))
+            run.looked_up = True
         all_rows = self._all_devices_cached()
         # Unscoped sync: every device is indexed; no separate global list needed.
         if not run.tenant_slug:
@@ -1848,6 +1874,23 @@ class SyncMixin:
             self._refresh_matched_device(run, d, row)
         else:
             self._create_discovered_device(run, d)
+
+    def _index_looked_up_devices(self, run: "_DeviceSyncRun", d: "_IncomingDevice") -> bool:
+        """Read the record's serial, MAC and hostname from NetBox
+        (``_lookup_devices``) and add devices the cache did not have to the
+        run's indexes. True when any was added."""
+        tenant_id = getattr(run.tenant, "id", None)
+        found = self._lookup_devices(serials=[d.serial], macs=[d.mac],
+                                     names=[d.hostname] if d.has_hostname else [],
+                                     tenant_id=tenant_id)
+        new = [r for r in found if r.get("id") not in run.device_rows]
+        # This sync's own scope is indexed fully; other tenants only by MAC/serial.
+        own = [r for r in new if not tenant_id or (r.get("tenant") or {}).get("id") == tenant_id]
+        self._index_sync_rows(run, own)
+        self._add_global_identities(run.by_mac, run.by_serial,
+                                    rows=[r for r in new if r not in own])
+        run.device_rows.update((r["id"], r) for r in own)
+        return bool(new)
 
     def _match_existing_device(self, run: "_DeviceSyncRun",
                                d: "_IncomingDevice") -> Optional[dict]:
@@ -2334,6 +2377,13 @@ class SyncMixin:
         if d.real_ip and self._ip_on_vm(d.real_ip):
             run.skipped += 1  # the hypervisor sync owns VM addresses
             return
+        # Ask NetBox before creating: a device someone added there since the
+        # last reconcile is matched and updated, not duplicated.
+        if not run.looked_up and self._index_looked_up_devices(run, d):
+            row = self._match_existing_device(run, d)
+            if row:
+                self._refresh_matched_device(run, d, row)
+                return
         # Choose a free name (possibly reclaiming one from our own stale copy).
         name = self._claim_create_name(run, d, d.default_name)
         # A prior create already 400'd on a missing site — the same 400 hits
@@ -2683,27 +2733,31 @@ class SyncMixin:
             is_mgmt = ident_role in _MGMT_ROLE_SLUGS
             try:
                 # From the cache; again after a stale row's 404 dropped it;
-                # finally after asking NetBox by serial / MAC / name, in case
-                # someone added the device there since the last reconcile.
-                for ask_netbox in (False, False, True):
-                    if ask_netbox:
-                        self._lookup_devices(serials=[serial], macs=[base_mac], names=[name],
-                                             tenant_id=getattr(tenant, "id", None))
+                # and after asking NetBox by serial / MAC / name when the cache
+                # has no match, in case someone added the device there since
+                # the last reconcile.
+                looked_up, devobj = False, None
+                for _attempt in range(3):
                     idx, existing = self._resolve_nw_device(
                         tenant, is_mgmt, serial=serial, mac=base_mac, nw_device_id=nw_id,
                         ip=mgmt_ip, hostname=name)
-                    devobj = self.nb.dcim.devices.get(existing["id"]) if existing else None
+                    if existing is None:
+                        if looked_up:
+                            break
+                        self._lookup_devices(serials=[serial], macs=[base_mac], names=[name],
+                                             tenant_id=getattr(tenant, "id", None))
+                        looked_up = True
+                        continue
+                    devobj = self.nb.dcim.devices.get(existing["id"])
                     if devobj is not None:
                         break
                     # A cached device NetBox no longer has (deleted outside LM):
                     # the GET's 404 dropped it from the cache; it is created again.
-                    if existing is not None:
-                        logger.info("sync_nw_device: device %s was deleted in NetBox",
-                                    existing["id"])
+                    logger.info("sync_nw_device: device %s was deleted in NetBox", existing["id"])
                     existing = None
             except Exception as e:
                 return {"status": "ERROR",
-                        "message": f"failed to list NetBox devices: {e}",
+                        "message": f"failed to look up the NetBox device: {e}",
                         "pushed": 0, "errors": 0, "skipped": 0, "deleted": 0,
                         "interfaces_total": len(interfaces or []), "device_id": None}
 
@@ -3469,6 +3523,11 @@ class SyncMixin:
                     return row
                 # New switch: pick a unique name from the NAS name or IP and reserve it.
                 name = (nas_name or f"switch-{nas_ip}").strip() or f"switch-{nas_ip}"
+                # Unless NetBox already has it (added since the last reconcile).
+                for found in self._lookup_devices(names=[name], tenant_id=getattr(tenant, "id", None)):
+                    if _primary_addr(found) == nas_ip:
+                        switch_by_ip[nas_ip] = found
+                        return found
                 name = self._uniq_device_name(name, "", nas_ip, existing_by_name, used_names)
                 used_names.add(name.lower())
                 # Create payload with role, type, site and tenant when known.

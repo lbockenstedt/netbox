@@ -5,6 +5,7 @@ and the daily reconcile of scanner-owned devices."""
 import json
 import os
 import sys
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -79,14 +80,16 @@ def test_cache_is_built_once_and_reused_after_a_restart():
     restarted._api_get_all.assert_not_called()
 
 
-@pytest.mark.parametrize("damage", ["corrupt tenant file", "missing meta", "old version",
-                                    "missing directory"])
+@pytest.mark.parametrize("damage", ["corrupt tenant file", "missing tenant file",
+                                    "missing meta", "old version", "missing directory"])
 def test_damaged_cache_is_rebuilt_once(damage):
     _mock_engine(ROWS)._all_devices_cached()
     d = netbox_device_cache.CACHE_DIR
     if damage == "corrupt tenant file":
         with open(os.path.join(d, "t1.json"), "w") as fh:
             fh.write("{not json")
+    elif damage == "missing tenant file":
+        os.remove(os.path.join(d, "t1.json"))
     elif damage == "missing meta":
         os.remove(os.path.join(d, "_meta.json"))
     elif damage == "old version":
@@ -131,6 +134,30 @@ def test_tenant_file_corrupted_while_running_rebuilds_once():
         fh.write("garbage")
     assert [r["name"] for r in eng._tenant_devices_cached("t2")] == ["B"]
     assert eng._api_get_all.call_count == 2
+
+
+def test_tenant_file_deleted_while_running_rebuilds_once():
+    eng = _mock_engine(ROWS)
+    eng._all_devices_cached()
+    os.remove(os.path.join(netbox_device_cache.CACHE_DIR, "t2.json"))
+    assert [r["name"] for r in eng._tenant_devices_cached("t2")] == ["B"]
+    assert eng._api_get_all.call_count == 2
+
+
+def test_a_write_made_while_netbox_is_paged_is_kept():
+    # The listing was read before the device was created; the hook saw the create.
+    eng = _mock_engine([])
+    cache = eng._device_cache()
+    new = dict(ROWS[0], last_updated="2026-01-02T00:00:00Z")
+
+    def walk(*_a, **_k):
+        resp = MagicMock(status_code=201, ok=True)
+        resp.request.method, resp.request.url = "POST", "http://nb/api/dcim/devices/"
+        resp.json.return_value = new
+        cache.on_response(resp)
+        return [ROWS[1]]
+    eng._api_get_all.side_effect = walk
+    assert sorted(r["id"] for r in eng._all_devices_cached()) == [1, 2]
 
 
 def test_writes_are_atomic(tmp_path, monkeypatch):
@@ -219,6 +246,26 @@ def test_console_sync_finds_a_device_added_in_netbox_since_the_cache_was_built()
     assert _listings(f) == []
 
 
+def test_feed_sync_asks_netbox_before_creating_a_device():
+    # An opnsense batch is not looked up up front; the record the cache does
+    # not know is looked up before the create and matched instead.
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _device(f, 100, "BOX", serial="SER1")  # added in the NetBox UI
+    _device(f, 101, "KNOWN", serial="SER2")
+    eng._lookup_devices(serials=["SER2"])
+    f.log.clear()
+    res = eng.sync_devices([{"ip": "", "mac": "", "hostname": "box", "serial": "SER1"},
+                            {"ip": "", "mac": "", "hostname": "known", "serial": "SER2"}],
+                           tenant_slug="t1", source="opnsense", defaults={"site": "lab"})
+    assert res["status"] == "SUCCESS", res
+    assert sorted(f.db["devices"]) == [100, 101]
+    lookups = [q for m, p, q, _ in f.log if m == "GET" and p == "/api/dcim/devices/"]
+    assert lookups and all("SER2" not in q and "known" not in q for q in lookups), lookups
+    assert _listings(f) == []
+
+
 def test_nw_device_deleted_in_netbox_is_recreated_on_its_next_push():
     # Used to return "existing nw device vanished" until the cache caught up.
     f = _world()
@@ -234,10 +281,15 @@ def test_nw_device_deleted_in_netbox_is_recreated_on_its_next_push():
 
 # ── daily reconcile ─────────────────────────────────────────────────────────
 
+def _ago(seconds):
+    """An ISO timestamp ``seconds`` ago."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds))
+
+
 def _reconcile_world():
     f = _world()
     _device(f, 100, "SW1", serial="S1", discovered_from="Network Devices",
-            nw_device_id="nw-1", mac_address="aa:bb:cc:00:00:01")
+            nw_device_id="nw-1", mac_address="aa:bb:cc:00:00:01", last_seen=_ago(3600))
     _device(f, 101, "HUMAN")
     eng = make_engine(NetboxEngine, f)
     eng._all_devices_cached()
@@ -282,9 +334,46 @@ def test_reconcile_recreates_a_scanner_device_deleted_outside_lm():
     assert new["name"] == "SW1" and new["serial"] == "S1"
     assert new["custom_fields"]["nw_device_id"] == "nw-1"
     assert new["custom_fields"]["discovered_from"] == "Network Devices"
+    # last_seen comes back too, so the staleness sweep can still retire it.
+    assert new["custom_fields"]["last_seen"] == f.db["devices"][new["id"]]["custom_fields"]["last_seen"]
+    assert new["custom_fields"]["last_seen"]
     assert _records()[0]["action"] == "recreate"
     # The human device is not recreated; it just leaves the cache.
     assert sorted(r["id"] for r in eng._all_devices_cached()) == [new["id"]]
+
+
+def test_reconcile_leaves_deleted_a_scanner_device_not_seen_for_a_week():
+    f, eng = _reconcile_world()
+    f.db["devices"][100]["custom_fields"]["last_seen"] = _ago(8 * 86400)
+    eng._drop_device_cache()
+    eng._all_devices_cached()
+    del f.db["devices"][100]
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert 100 not in {r["id"] for r in eng._all_devices_cached()}
+    assert [d["name"] for d in f.db["devices"].values()] == ["HUMAN"]
+
+
+def test_retagging_a_device_in_netbox_releases_it_from_the_scanner():
+    f, eng = _reconcile_world()
+    f.db["devices"][100]["custom_fields"]["discovered_from"] = "manual"
+    f.db["devices"][100]["name"] = "MINE-NOW"
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert f.db["devices"][100]["name"] == "MINE-NOW"
+
+
+def test_a_failed_revert_is_reported_and_tried_again_next_time():
+    f, eng = _reconcile_world()
+    f.db["devices"][100]["name"] = "DRIFTED"
+    f.fail.add(("PATCH", "devices", 100))
+    res = eng.reconcile_device_cache("t1")
+    assert res["status"] == "ERROR" and res["errors"] == 1, res
+    assert f.db["devices"][100]["name"] == "DRIFTED"
+    # The cache kept the scanner's value, so the next run reverts it.
+    f.fail.clear()
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 1 and f.db["devices"][100]["name"] == "SW1", res
 
 
 def test_reconcile_runs_only_for_a_due_tenant():

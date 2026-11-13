@@ -143,6 +143,16 @@ def _vm_row(vm: Dict) -> Dict:
 _SEED_CATALOG_PATH = Path(__file__).parent / "seed_catalog.json"
 
 
+def _lldp_creatable_name(name: str) -> bool:
+    """True when an LLDP neighbour name can become a new device: a hostname
+    of 3+ characters, not an IP address and not a bare MAC."""
+    name = name or ""
+    return (len(name) >= 3 and ".." not in name
+            and bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name))
+            and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name)
+            and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())))
+
+
 class DcimMixin:
     """DCIM sites/racks/devices + health + universal search methods for NetboxEngine."""
 
@@ -657,9 +667,9 @@ class DcimMixin:
                 if not row and name:
                     short = name.lower().split(".", 1)[0] if "." in name and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) else name.lower()
                     row = by_short.get(short)
-                # Unknown to the cache: ask NetBox by MAC and name before a
-                # create, in case someone added the device there.
-                if not row and create_missing and (macs or name):
+                # Unknown to the cache and about to be created: ask NetBox by
+                # MAC and name first, in case someone added the device there.
+                if not row and create_missing and _lldp_creatable_name(name):
                     hits = self._lookup_devices(macs=macs, names=[name] if name else [],
                                                 tenant_id=getattr(tenant, "id", None))
                     row = hits[0] if hits else None
@@ -689,9 +699,7 @@ class DcimMixin:
                 except Exception as e:
                     # Update failed.
                     logger.debug(f"failed to update custom fields for device {row['id']}: {e}")
-            elif create_missing and len(name) >= 3 and ".." not in name \
-                    and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$", name) and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", name) \
-                    and not re.match(r"^[0-9a-f]{12}$", re.sub(r"[:.\-]", "", name.lower())):
+            elif create_missing and _lldp_creatable_name(name):
                 # First creation: provision custom fields and resolve role/type/site once.
                 if not created_device:
                     try:

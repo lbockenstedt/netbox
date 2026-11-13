@@ -27,6 +27,7 @@ import re
 import threading
 import time
 import zlib
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
@@ -103,6 +104,11 @@ class DeviceCache:
         self._meta: Dict[str, Any] = {}
         # Tenant rows held in memory instead, when the directory can't be written.
         self._mem: Optional[Dict[str, List[dict]]] = None
+        # While NetBox is being paged (rebuild or tenant listing), the writes
+        # the hook sees are kept here and replayed over the listing, which may
+        # have been read before them.
+        self._walks = 0
+        self._journal: List[tuple] = []
 
     # ── files ──────────────────────────────────────────────────────────────
 
@@ -125,16 +131,24 @@ class DeviceCache:
         return data["rows"]
 
     def _write_tenant(self, key: str, rows: List[dict]) -> None:
-        """Replace one tenant's file (removed when it has no devices left)."""
+        """Replace one tenant's file (removed when it has no devices left),
+        keeping the meta file's list of tenant files in step."""
         if self._mem is not None:
             self._mem[key] = rows
-        elif rows:
+            return
+        if rows:
             write_json(self._path(key), {"version": VERSION, "rows": rows})
         else:
             try:
                 os.remove(self._path(key))
             except FileNotFoundError:
                 pass
+        # The meta file lists every tenant file, so a lost file is noticed.
+        tenants = set(self._meta.get("tenants") or [])
+        if (key in tenants) != bool(rows):
+            self._meta["tenants"] = sorted(tenants ^ {key})
+            if self._index is not None:  # a rebuild writes the meta file last itself
+                self._save_meta()
 
     def _save_meta(self) -> None:
         """Persist the meta file (best-effort)."""
@@ -160,12 +174,12 @@ class DeviceCache:
                     meta = json.load(f)
                 if meta.get("version") != VERSION or meta.get("netbox") != self.netbox_url:
                     return False
-                # Every tenant file builds the slim index.
+                # Every tenant file the meta file lists builds the slim index
+                # (a missing one fails the load).
                 index: Dict[Any, dict] = {}
-                for name in os.listdir(self.dir):
-                    if name.endswith(".json") and not name.startswith("_meta"):
-                        for row in self._read_tenant(name[:-5]):
-                            index[row.get("id")] = slim_row(row)
+                for key in meta["tenants"]:
+                    for row in self._read_tenant(key):
+                        index[row.get("id")] = slim_row(row)
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                 logger.info("device cache: unreadable (%s), rebuilding from NetBox", e)
                 return False
@@ -189,7 +203,7 @@ class DeviceCache:
                 by_tenant.setdefault(tenant_key(row), []).append(trim_row(row))
             # Meta last, so a crash part-way leaves a cache that rebuilds again.
             self._meta = {"version": VERSION, "netbox": self.netbox_url, "built": now,
-                          "reconcile": {}}
+                          "reconcile": {}, "tenants": sorted(by_tenant)}
             try:
                 for key, trows in by_tenant.items():
                     self._write_tenant(key, trows)
@@ -201,6 +215,7 @@ class DeviceCache:
                                self.dir, e)
                 self._mem = by_tenant
             self._index = {r["id"]: slim_row(r) for t in by_tenant.values() for r in t}
+            self._replay_journal()
 
     def clear(self) -> None:
         """Forget everything (memory and disk); the next load fails and rebuilds."""
@@ -228,35 +243,39 @@ class DeviceCache:
             return [dict(r) for r in (self._index or {}).values()]
 
     def tenant_rows(self, slug: str) -> List[dict]:
-        """Full rows of one tenant (``""`` = no tenant). An unreadable file
-        clears the cache and raises, so the caller's next load rebuilds."""
+        """Full rows of one tenant (``""`` = no tenant). A missing or
+        unreadable file clears the cache and raises, so the caller's next
+        load rebuilds."""
         key = tenant_key({"tenant": {"slug": slug}})
         with self.lock:
+            if self._mem is None and key not in (self._meta.get("tenants") or []):
+                return []  # no devices in this tenant
             try:
                 return self._read_tenant(key)
-            except FileNotFoundError:
-                return []
             except (OSError, ValueError, KeyError, TypeError) as e:
                 self.clear()
                 raise RuntimeError(f"device cache file for {key} unreadable: {e}") from e
 
     def full_row(self, dev_id: Any) -> Optional[dict]:
-        """One device's full row from its tenant's file, or None."""
+        """One device's full row from its tenant's file, or None. A missing or
+        unreadable file clears the cache (the next read rebuilds it)."""
         with self.lock:
             slim = (self._index or {}).get(dev_id)
             if slim is None:
                 return None
             try:
-                rows = self._read_tenant(tenant_key(slim))
-            except (OSError, ValueError, KeyError, TypeError):
+                rows = self.tenant_rows((slim.get("tenant") or {}).get("slug") or "")
+            except RuntimeError as e:
+                logger.warning("%s; rebuilding on the next read", e)
                 return None
             return next((r for r in rows if r.get("id") == dev_id), None)
 
     # ── writes ─────────────────────────────────────────────────────────────
 
-    def upsert(self, rows: Iterable[dict]) -> None:
+    def upsert(self, rows: Iterable[dict], force: bool = False) -> None:
         """Store fresh NetBox rows (a write response or a filtered read),
-        moving a device between tenant files when its tenant changed."""
+        moving a device between tenant files when its tenant changed.
+        ``force`` stores a row even when its last_updated is unchanged."""
         with self.lock:
             if not self.load():
                 return  # nothing to update; the next read rebuilds anyway
@@ -269,7 +288,7 @@ class DeviceCache:
                 key = tenant_key(row)
                 old = self._index.get(row["id"])
                 # Unchanged since we stored it (a read of a known device): skip.
-                if (old is not None and row.get("last_updated")
+                if (not force and old is not None and row.get("last_updated")
                         and old.get("last_updated") == row.get("last_updated")
                         and tenant_key(old) == key):
                     continue
@@ -311,6 +330,34 @@ class DeviceCache:
             trimmed = [trim_row(r) for r in rows]
             self._write_tenant(key, trimmed)
             self._index.update((r["id"], slim_row(r)) for r in trimmed)
+            self._replay_journal()
+
+    @contextmanager
+    def walking(self):
+        """Wrap a NetBox listing that will be passed to ``rebuild`` or
+        ``replace_tenant``: writes the hook sees meanwhile are replayed over
+        it, so a device written during the walk is not lost or rolled back."""
+        with self.lock:
+            self._walks += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self._walks -= 1
+                if not self._walks:
+                    self._journal = []
+
+    def _replay_journal(self) -> None:
+        """Apply the writes seen during the current walk again, skipping a
+        row older than the one the listing brought."""
+        for op, payload in list(self._journal):
+            if op == "remove":
+                self.remove(payload)
+                continue
+            newer = [r for r in payload
+                     if str(r.get("last_updated") or "")
+                     >= str((self._index.get(r.get("id")) or {}).get("last_updated") or "")]
+            self.upsert(newer)
 
     def _safe_read(self, key: str) -> List[dict]:
         """A tenant's rows, or [] when its file is missing or unreadable."""
@@ -365,18 +412,23 @@ class DeviceCache:
             dev_id = int(m.group(1)) if m.group(1) else None
             # A device that is gone: drop it.
             if resp.status_code == 404 and dev_id is not None:
-                self.remove([dev_id])
+                op = ("remove", [dev_id])
             elif not resp.ok:
-                pass
+                return resp
             # Deleted (one, or a bulk delete listing ids in the body).
             elif req.method == "DELETE":
                 body = json.loads(req.body) if dev_id is None and req.body else []
-                self.remove([dev_id] if dev_id is not None
-                            else [b.get("id") for b in body if isinstance(b, dict)])
+                op = ("remove", [dev_id] if dev_id is not None
+                      else [b.get("id") for b in body if isinstance(b, dict)])
             # Created, updated or read: the response is the new row (or rows).
             else:
                 data = resp.json()
-                self.upsert(data if isinstance(data, list) else [data])
+                op = ("upsert", [r for r in (data if isinstance(data, list) else [data])
+                                 if isinstance(r, dict)])
+            with self.lock:
+                if self._walks:
+                    self._journal.append(op)
+                (self.remove if op[0] == "remove" else self.upsert)(op[1])
         except Exception as e:  # noqa: BLE001 - see docstring
-            logger.debug("device cache: response hook skipped: %s", e)
+            logger.warning("device cache: response hook skipped: %s", e)
         return resp
