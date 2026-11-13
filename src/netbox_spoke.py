@@ -759,7 +759,7 @@ class NetboxSpoke(BaseSpoke):
     _SHARED_READS = frozenset({
         "NETBOX_GET_PREFIXES", "NETBOX_GET_IPS", "NETBOX_GET_DEVICES",
         "NETBOX_GET_RACKS", "NETBOX_GET_TENANTS", "NETBOX_GET_TENANT_GROUPS",
-        "NETBOX_LIST_STUBS"})
+        "NETBOX_LIST_STUBS", "NETBOX_COUNT"})
     _SHARED_RUNS = frozenset({
         "NETBOX_SYNC_DEVICES", "NETBOX_SYNC_NW_DEVICE", "NETBOX_AUTORACK_SWEEP",
         "NETBOX_STALENESS_SWEEP"})
@@ -1168,6 +1168,13 @@ class NetboxSpoke(BaseSpoke):
                 data.get("name", ""), data.get("cluster", ""),
                 data.get("vcpus", 2), data.get("ram", 4096),
             )
+
+        # Device, prefix and IP counts for a tenant (the admin overview).
+        if normalized == "NETBOX_COUNT":
+            return await self._run_list(
+                f"COUNT|{data.get('tenant')}|{data.get('tenant_group')}",
+                self.engine.count_tenant_objects,
+                tenant=data.get("tenant"), tenant_group=data.get("tenant_group"))
 
         # Tenant picklist (cached).
         if normalized == "NETBOX_GET_TENANTS":
