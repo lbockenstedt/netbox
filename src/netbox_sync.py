@@ -1698,6 +1698,15 @@ class SyncMixin:
 
     # ── step 2: index what NetBox already has ────────────────────────────────
 
+    def _row_identity(self, row: dict) -> tuple:
+        """The fields the indexes key a device row by: name, serial, MAC and
+        primary IP."""
+        cf = row.get("custom_fields") or {}
+        return (str(row.get("name") or "").strip().lower(),
+                str(row.get("serial") or "").strip().lower(),
+                self._norm_mac(cf.get("mac_address", "")),
+                _primary_addr(row))
+
     def _index_sync_rows(self, run: "_DeviceSyncRun", rows: list) -> None:
         """Build the pre-batch lookup indexes from the device listing.
 
@@ -1941,13 +1950,15 @@ class SyncMixin:
 
     def _index_looked_up_devices(self, run: "_DeviceSyncRun", d: "_IncomingDevice") -> bool:
         """Read the record's serial, MAC and hostname from NetBox
-        (``_lookup_devices``) and add devices the cache did not have to the
-        run's indexes. True when any was added."""
+        (``_lookup_devices``) and add devices the cache did not have, or whose
+        name, serial, MAC or primary IP changed in NetBox since the run's
+        rows were read, to the run's indexes. True when any was added."""
         tenant_id = getattr(run.tenant, "id", None)
         found = self._lookup_devices(serials=[d.serial], macs=[d.mac],
                                      names=[d.hostname] if d.has_hostname else [],
                                      tenant_id=tenant_id, ips=[d.real_ip])
-        new = [r for r in found if r.get("id") not in run.device_rows]
+        new = [r for r in found if r.get("id") not in run.device_rows
+               or self._row_identity(r) != self._row_identity(run.device_rows[r["id"]])]
         # This sync's own scope is indexed fully; other tenants only by MAC/serial.
         own = [r for r in new if not tenant_id or (r.get("tenant") or {}).get("id") == tenant_id]
         self._index_sync_rows(run, own)

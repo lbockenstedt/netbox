@@ -567,3 +567,21 @@ def test_device_deleted_outside_lm_is_recreated_after_the_reconcile():
     eng.reconcile_device_cache("t1")
     eng.sync_devices(feed, tenant_slug="t1", defaults={"site": "lab"})
     assert sorted(d["name"] for d in f.db["devices"].values()) == ["WS-00", "WS-01"]
+
+
+def test_mac_added_in_netbox_since_the_cache_matches_instead_of_creating():
+    # The cache holds device 100 without a MAC. Someone adds its MAC in
+    # NetBox; a record with that MAC (new IP, no hostname) must update 100.
+    # The lookup before create used to drop rows whose id the run already
+    # had, so the stale indexes missed the MAC and a duplicate was created.
+    f, _ = _world()
+    _add_device(f, 100, "PRINTER", "", "10.1.0.50", "printer", {}, ip_cf={})
+    eng = make_engine(NetboxEngine, f)
+    assert 100 in {r["id"] for r in eng._all_devices_cached()}
+    mac = "aa:bb:cc:00:09:99"
+    f.db["devices"][100]["custom_fields"]["mac_address"] = mac
+    f.db["devices"][100]["last_updated"] = f._stamp()
+    res = eng.sync_devices([{"ip": "10.1.0.99", "mac": mac}], tenant_slug="t1",
+                           defaults={"site": "lab"})
+    assert res["status"] == "SUCCESS", res
+    assert set(f.db["devices"]) == {100}, sorted(f.db["devices"])
