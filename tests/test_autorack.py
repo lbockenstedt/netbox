@@ -202,6 +202,21 @@ def test_sweep_ilo_without_back_link_yields_u_to_server_that_links_it():
     assert res["conflicts"] == [] and res["cannot"] == []
 
 
+def test_sweep_ilo_whose_link_misses_server_name_yields_u_to_server_that_links_it():
+    # netbox#266: the iLO's link holds the host's agent hostname, not its NetBox name.
+    rows = [{"id": 1, "name": "MIPBE-SSPLM-PXMX01", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "hypervisor"}, "rack": {"id": 1},
+             "position": 18, "face": {"value": "front"},
+             "custom_fields": {"linked_device": "MIPBE-SSPLM-PXMX01-N31-R18-ILO"}},
+            {"id": 2, "name": "MIPBE-SSPLM-PXMX01-N31-R18-ILO", "site": {"id": 10}, "device_type": {"id": 5},
+             "status": {"value": "active"}, "role": {"slug": "bmc"},
+             "custom_fields": {"linked_device": "pxmx01.lab.example"}}]
+    eng = _engine(rows, [{"id": 5, "u_height": 1}], [{"id": 1, "name": "N31", "u_height": 48, "site": {"id": 10}}])
+    eng.nb.dcim.devices.get.side_effect = lambda i: MagicMock()
+    res = eng.autorack_sweep(dry_run=True)
+    assert res["conflicts"] == [] and res["cannot"] == []
+
+
 def test_half_name_flag_puts_lower_numbered_device_left_front_and_next_right_rear():
     from netbox_autorack import plan, parse_rack_name
     assert parse_rack_name("MIPBE-SSPLM-N31-R43H-GW01")["half"] is True
