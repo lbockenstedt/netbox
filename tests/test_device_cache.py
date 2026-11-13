@@ -753,3 +753,44 @@ def test_lldp_refuses_a_tenant_netbox_does_not_have():
     res = eng.sync_lldp_links(LINK, tenant_slug="gone")
     assert res["status"] == "ERROR" and "gone" in res["message"], res
     assert eng.cabled == [] and not [x for x in f.log if x[0] != "GET"]
+
+
+def test_lldp_hardware_match_beats_the_tenants_name_match():
+    # The MAC is another tenant's box; the tenant's device only shares the name.
+    f = _world()
+    _device(f, 50, "SW1")
+    eng = _lldp_engine(f)
+    eng._all_devices_cached()
+    _device(f, 100, "BOX", tenant_id=2, mac_address=MAC)
+    _device(f, 101, "nbr.example.com")
+    res = eng.sync_lldp_links(LINK, tenant_slug="t1")
+    assert res["cabled"] == 0 and res["created"] == 0, res
+    assert eng.cabled == []
+
+
+def test_lldp_refusal_is_not_reused_for_another_end_with_the_same_name():
+    f = _world()
+    _device(f, 50, "SW1")
+    _device(f, 100, "BOX", tenant_id=2, mac_address=MAC)
+    _device(f, 101, "OURS", mac_address="aa:bb:cc:00:00:0a")
+    eng = _lldp_engine(f)
+    res = eng.sync_lldp_links(LINK + [
+        {"a": {"name": "sw1"}, "a_port": "2",
+         "b": {"name": "nbr.example.com", "macs": ["aa:bb:cc:00:00:0a"]}, "b_port": "eth0"}],
+        tenant_slug="t1")
+    assert eng.cabled == [(50, 101)], res
+
+
+def test_access_tracker_names_its_switch_freely_beside_another_tenants_device():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _hand_made_device_with_ip(f, "10.0.0.254/24")
+    f.db["devices"][100].update(tenant_id=2, name="sw-core")
+    eng.sync_access_tracker(
+        sessions=[{"mac": "AA:BB:CC:DD:EE:FF", "ip": "10.0.0.5", "nas_ip": "10.0.0.254",
+                   "nas_port": "Ethernet1/0/12", "nas_name": "sw-core",
+                   "start_time": "2026-06-30T10:00:00"}],
+        tenant_slug="t1", defaults={"site": "lab"})
+    assert "sw-core" in [str(d["name"]).lower() for d in f.db["devices"].values()
+                         if d["tenant_id"] == 1]

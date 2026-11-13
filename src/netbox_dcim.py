@@ -685,14 +685,14 @@ class DcimMixin:
                 if not row and create_missing and _lldp_creatable_name(name):
                     hits = self._lookup_devices(serials=[end.get("serial")], macs=macs,
                                                 names=[name] if name else [], tenant_id=tenant_id)
-                    # The tenant's own device first, then an untenanted one;
-                    # a serial or MAC match before a name match; then the lowest id.
+                    # As the ladder: a serial or MAC match before a name match;
+                    # then the tenant's own device, an untenanted one; lowest id.
                     serial = str(end.get("serial") or "").strip().lower()
                     row = min(hits, default=None, key=lambda r: (
-                        self._tenant_rank(r, tenant_id),
                         not ((serial and str(r.get("serial") or "").strip().lower() == serial)
                              or self._norm_mac((r.get("custom_fields") or {})
                                                .get("mac_address") or "") in macs),
+                        self._tenant_rank(r, tenant_id),
                         r.get("id") or 0))
             except Exception as e:
                 # Resolution failed.
@@ -705,8 +705,7 @@ class DcimMixin:
             if row and self._tenant_rank(row, tenant_id) == 2:
                 messages.append(f"{name or key}: device {row.get('id')} belongs to "
                                 f"another tenant; left alone")
-                if key:
-                    cache[key] = None
+                # Not memoised: the key may be a name another end shares.
                 return None
 
             # Existing device: backfill its MAC and adopt the LLDP name.

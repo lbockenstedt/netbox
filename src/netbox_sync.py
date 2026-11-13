@@ -3669,8 +3669,10 @@ class SyncMixin:
                             and self._tenant_rank(found, getattr(tenant, "id", None)) < 2):
                         switch_by_ip[nas_ip] = found
                         return found
-                # A device with that name but another IP keeps its name.
+                # A device of this tenant with that name but another IP keeps its name.
                 for found in found_rows:
+                    if self._tenant_rank(found, getattr(tenant, "id", None)) == 2:
+                        continue
                     existing_by_name.setdefault(str(found.get("name") or "").lower(), found)
                 name = self._uniq_device_name(name, "", nas_ip, existing_by_name, used_names)
                 used_names.add(name.lower())
