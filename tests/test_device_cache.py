@@ -42,7 +42,7 @@ def _listings(f):
     """Unfiltered device listings (full walks) in the fake's request log."""
     return [q for m, p, q, _ in f.log if m == "GET" and p == "/api/dcim/devices/"
             and not any(k in q for k in ("serial=", "name__ie=", "cf_mac_address=",
-                                         "tenant_id="))]
+                                         "tenant_id=", "id="))]
 
 
 def _mock_engine(rows):
@@ -160,6 +160,42 @@ def test_a_write_made_while_netbox_is_paged_is_kept():
     assert sorted(r["id"] for r in eng._all_devices_cached()) == [1, 2]
 
 
+def test_upsert_keeps_the_order_of_a_tenants_rows():
+    eng = _mock_engine([dict(ROWS[0], id=i, name=f"D{i}") for i in (1, 2, 3)])
+    eng._all_devices_cached()
+    cache = eng._device_cache()
+    cache.upsert([dict(ROWS[0], id=1, name="D1-NEW"), dict(ROWS[0], id=4, name="D4")], force=True)
+    assert [r["name"] for r in cache.tenant_rows("t1")] == ["D1-NEW", "D2", "D3", "D4"]
+
+
+def test_a_tenant_listing_takes_a_moved_device_out_of_its_old_file():
+    eng = _mock_engine(ROWS)
+    eng._all_devices_cached()
+    cache = eng._device_cache()
+    # Device 1 moved from t1 to t2; t2 is listed before t1 is.
+    cache.replace_tenant("t2", [ROWS[1], dict(ROWS[0], tenant={"id": 2, "slug": "t2"})])
+    assert cache.tenant_rows("t1") == []
+    assert sorted(r["id"] for r in cache.tenant_rows("t2")) == [1, 2]
+    assert sorted(r["id"] for r in cache.rows()) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("write", ["upsert", "remove"])
+def test_a_damaged_file_during_a_write_rebuilds_instead_of_truncating(write):
+    eng = _mock_engine(ROWS)
+    eng._all_devices_cached()
+    cache = eng._device_cache()
+    with open(os.path.join(netbox_device_cache.CACHE_DIR, "t1.json"), "w") as fh:
+        fh.write("garbage")
+    if write == "upsert":
+        cache.upsert([dict(ROWS[0], name="A2")], force=True)
+    else:
+        cache.remove([1])
+    # The cache was cleared rather than left with a one-row t1 file.
+    assert not os.path.exists(os.path.join(netbox_device_cache.CACHE_DIR, "t1.json"))
+    assert sorted(r["id"] for r in eng._all_devices_cached()) == [1, 2, 3]
+    assert eng._api_get_all.call_count == 2
+
+
 def test_writes_are_atomic(tmp_path, monkeypatch):
     path = str(tmp_path / "t1.json")
     write_json(path, {"rows": [1]})
@@ -263,6 +299,23 @@ def test_feed_sync_asks_netbox_before_creating_a_device():
     assert sorted(f.db["devices"]) == [100, 101]
     lookups = [q for m, p, q, _ in f.log if m == "GET" and p == "/api/dcim/devices/"]
     assert lookups and all("SER2" not in q and "known" not in q for q in lookups), lookups
+    assert _listings(f) == []
+
+
+def test_nw_push_finds_a_device_added_in_netbox_by_its_ip():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    eng._all_devices_cached()
+    _device(f, 100, "HAND-MADE")  # added in the NetBox UI, under another name
+    f.add("interfaces", {"id": 7, "device_id": 100, "name": "mgmt", "type": "virtual"})
+    ip = f.add("ip-addresses", {"address": "10.0.0.9/24", "assigned_object_type": "dcim.interface",
+                                "assigned_object_id": 7, "custom_fields": {}})
+    f.db["devices"][100]["primary_ip4_id"] = ip["id"]
+    f.log.clear()
+    res = eng.sync_nw_device(device={"id": "nw-9", "name": "sw9", "address": "10.0.0.9"},
+                             interfaces=[], tenant_slug="t1", defaults=NW)
+    assert res["status"] == "SUCCESS", res
+    assert sorted(f.db["devices"]) == [100]
     assert _listings(f) == []
 
 
@@ -376,9 +429,34 @@ def test_a_failed_revert_is_reported_and_tried_again_next_time():
     assert res["changed"] == 1 and f.db["devices"][100]["name"] == "SW1", res
 
 
+def test_a_failed_recreate_keeps_the_device_for_the_next_reconcile():
+    f, eng = _reconcile_world()
+    del f.db["devices"][100]
+    f.fail.add(("POST", "devices", "create"))
+    res = eng.reconcile_device_cache("t1")
+    assert res["status"] == "ERROR", res
+    f.fail.clear()
+    assert 100 in {r["id"] for r in eng._device_cache().rows()}
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 1, res
+    assert [d["name"] for d in f.db["devices"].values()].count("SW1") == 1
+
+
+def test_reconcile_leaves_deleted_a_scanner_device_without_last_seen():
+    # LLDP-created devices carry no last_seen; their feed recreates them.
+    f, eng = _reconcile_world()
+    del f.db["devices"][100]["custom_fields"]["last_seen"]
+    eng._drop_device_cache()
+    eng._all_devices_cached()
+    del f.db["devices"][100]
+    res = eng.reconcile_device_cache("t1")
+    assert res["changed"] == 0, res
+    assert [d["name"] for d in f.db["devices"].values()] == ["HUMAN"]
+
+
 def test_reconcile_runs_only_for_a_due_tenant():
     f, eng = _reconcile_world()
-    assert eng.reconcile_device_cache() == {"status": "SUCCESS", "tenant": None}
+    assert eng.reconcile_device_cache()["status"] == "SKIPPED"
     cache = eng._device_cache()
     cache._meta["built"] = 0  # built long ago: every tenant is due
     res = eng.reconcile_device_cache()

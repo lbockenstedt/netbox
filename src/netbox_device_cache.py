@@ -109,6 +109,9 @@ class DeviceCache:
         # have been read before them.
         self._walks = 0
         self._journal: List[tuple] = []
+        # The last tenant file read, parsed (LLDP and syncs read one tenant
+        # many times in a row).
+        self._last_read: Optional[tuple] = None
 
     # ── files ──────────────────────────────────────────────────────────────
 
@@ -124,11 +127,13 @@ class DeviceCache:
         """One tenant's full rows; raises when the file is unreadable."""
         if self._mem is not None:
             return [dict(r) for r in self._mem.get(key, [])]
-        with open(self._path(key)) as f:
-            data = json.load(f)
-        if data.get("version") != VERSION:
-            raise ValueError("old cache format")
-        return data["rows"]
+        if self._last_read is None or self._last_read[0] != key:
+            with open(self._path(key)) as f:
+                data = json.load(f)
+            if data.get("version") != VERSION:
+                raise ValueError("old cache format")
+            self._last_read = (key, data["rows"])
+        return [dict(r) for r in self._last_read[1]]
 
     def _write_tenant(self, key: str, rows: List[dict]) -> None:
         """Replace one tenant's file (removed when it has no devices left),
@@ -136,6 +141,7 @@ class DeviceCache:
         if self._mem is not None:
             self._mem[key] = rows
             return
+        self._last_read = None
         if rows:
             write_json(self._path(key), {"version": VERSION, "rows": rows})
         else:
@@ -223,6 +229,7 @@ class DeviceCache:
             self._index = None
             self._meta = {}
             self._mem = None
+            self._last_read = None
             try:
                 names = os.listdir(self.dir)
             except OSError:
@@ -295,13 +302,16 @@ class DeviceCache:
                 add.setdefault(key, {})[row["id"]] = trim_row(row)
                 if old is not None and tenant_key(old) != key:
                     drop.setdefault(tenant_key(old), set()).add(row["id"])
-            # Rewrite each touched file once, then the index.
+            # Rewrite each touched file once (rows keep their place, so the
+            # first-row-wins matching stays stable), then the index.
             for key in set(add) | set(drop):
-                new = add.get(key, {})
+                new = dict(add.get(key, {}))
                 gone = drop.get(key, set())
-                kept = [r for r in self._safe_read(key)
-                        if r.get("id") not in new and r.get("id") not in gone]
-                self._write_tenant(key, kept + list(new.values()))
+                old_rows = self._rows_or_clear(key)
+                if old_rows is None:
+                    return
+                rows = [new.pop(r.get("id"), r) for r in old_rows if r.get("id") not in gone]
+                self._write_tenant(key, rows + list(new.values()))
             for new in add.values():
                 for dev_id, row in new.items():
                     self._index[dev_id] = slim_row(row)
@@ -317,7 +327,10 @@ class DeviceCache:
                 if slim is not None:
                     by_key.setdefault(tenant_key(slim), set()).add(dev_id)
             for key, gone in by_key.items():
-                self._write_tenant(key, [r for r in self._safe_read(key) if r.get("id") not in gone])
+                old_rows = self._rows_or_clear(key)
+                if old_rows is None:
+                    return
+                self._write_tenant(key, [r for r in old_rows if r.get("id") not in gone])
 
     def replace_tenant(self, slug: str, rows: List[dict]) -> None:
         """Make one tenant's file exactly ``rows`` (a fresh tenant listing)."""
@@ -328,6 +341,12 @@ class DeviceCache:
             for dev_id in [i for i, s in self._index.items() if tenant_key(s) == key]:
                 del self._index[dev_id]
             trimmed = [trim_row(r) for r in rows]
+            # Devices that moved here from another tenant leave that file.
+            moved = {r["id"] for r in trimmed if r["id"] in self._index}
+            if moved:
+                self.remove(moved)
+                if self._index is None:
+                    return  # an old file was damaged: the cache was cleared
             self._write_tenant(key, trimmed)
             self._index.update((r["id"], slim_row(r)) for r in trimmed)
             self._replay_journal()
@@ -359,12 +378,15 @@ class DeviceCache:
                      >= str((self._index.get(r.get("id")) or {}).get("last_updated") or "")]
             self.upsert(newer)
 
-    def _safe_read(self, key: str) -> List[dict]:
-        """A tenant's rows, or [] when its file is missing or unreadable."""
+    def _rows_or_clear(self, key: str) -> Optional[List[dict]]:
+        """A tenant's rows before a rewrite ([] for a tenant without a file).
+        None when its file is lost or unreadable: the cache is cleared, so
+        the next read rebuilds it instead of trusting a partial file."""
         try:
-            return self._read_tenant(key)
-        except (OSError, ValueError, KeyError, TypeError):
-            return []
+            return self.tenant_rows("" if key == NO_TENANT else key)
+        except RuntimeError as e:
+            logger.warning("%s; rebuilding on the next read", e)
+            return None
 
     # ── daily reconcile schedule ───────────────────────────────────────────
 
