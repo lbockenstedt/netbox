@@ -101,6 +101,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 | `NETBOX_UPDATE_PREFIX` | `update_prefix` | Modifies prefix description, tenant, or custom fields. |
 | `NETBOX_DELETE_PREFIX` | `delete_prefix` | Deletes an IP prefix from NetBox. |
 | `NETBOX_GET_IPS` | `get_ip_addresses` | Lists IP addresses filtered by prefix, device, or tenant. |
+| `NETBOX_COUNT` | `count_tenant_objects` | Counts a tenant's devices, prefixes and IPs from NetBox's own count. |
 | `NETBOX_ALLOCATE_IP` | `allocate_ip` | Reserves the next available IP address in a prefix. |
 | `NETBOX_RELEASE_IP` | `release_ip` | Deletes an IP address record. |
 | `NETBOX_UPDATE_IP_ADDR` / `NETBOX_UPDATE_IP` | `update_ip_address` | Updates DNS name, description, status, or custom fields of an IP. |
