@@ -216,6 +216,7 @@ def test_skipped_ips_are_counted_per_reason_without_addresses():
     assert res["skipped"] == 3
     assert res["skipped_reasons"] == {"already reserved": 1, "outside any dhcp scope": 1,
                                       "no netbox ip": 1}
+    assert res["skipped_by_ref"] == {"0": res["skipped_reasons"]}
     # Another writer set the same values after the read: counted at the write.
     eng = _racing_engine(lambda st: st[2].update(mac_address=MAC2, dhcp_reservation=True))
     res = sr.reserve_static_hosts(
