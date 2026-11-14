@@ -682,6 +682,12 @@ def _write_replacement(engine, r: Dict[str, Any]) -> Tuple[str, str, Optional[Di
     return "written", "", {**holder, "left": idetail or "interface already has the new mac"}
 
 
+def _count_skip(report: Dict[str, Any], reason: str) -> None:
+    """Count one skipped IP in ``report`` under ``reason``."""
+    report["skipped"] += 1
+    report["skipped_reasons"][reason] = report["skipped_reasons"].get(reason, 0) + 1
+
+
 def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, float],
                          now: float) -> Dict[str, Any]:
     """One pass over the tenants the hub sent (blocking; run in a thread).
@@ -700,7 +706,9 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
     backoff between passes.
 
     Returns ``{status, evaluated, changes, replaced, pending_replace,
-    conflicts, errors, skipped, deferred}``; ``status`` is ERROR whenever
+    conflicts, errors, skipped, skipped_reasons, deferred}``;
+    ``skipped_reasons`` counts the skipped IPs per reason (no addresses);
+    ``status`` is ERROR whenever
     ``errors`` is not empty. An IP another writer changed (or deleted) after
     the read is a conflict and the rest of the pass goes on. When a write
     fails, the pass stops, ``changes`` and ``replaced`` are empty and the
@@ -709,7 +717,8 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
     """
     report: Dict[str, Any] = {"status": "SUCCESS", "evaluated": [], "changes": [],
                               "replaced": [], "pending_replace": [],
-                              "conflicts": [], "errors": [], "skipped": 0, "deferred": 0}
+                              "conflicts": [], "errors": [], "skipped": 0,
+                              "skipped_reasons": {}, "deferred": 0}
     max_writes = int(data.get("max_writes") or DEFAULT_MAX_WRITES)
     kea = data.get("kea") or {}
     force = data.get("force") or None
@@ -757,7 +766,8 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
                     s.get("ip") == force.get("ip") and s.get("reason") == "already replaced"
                     for s in plan["skipped"])
             continue
-        report["skipped"] += len(plan["skipped"])
+        for s in plan["skipped"]:
+            _count_skip(report, str(s.get("reason") or "unknown"))
         report["conflicts"].extend({"ref": ref, **c} for c in plan["conflicts"])
         report["pending_replace"].extend({"ref": ref, **p} for p in plan["pending_replace"])
         rows = [("reserve", r) for r in plan["reserve"]] + [("replace", r) for r in plan["replace"]]
@@ -773,7 +783,7 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
             report["deferred"] += 1
             continue
         if r.get("ip_id") is None:
-            report["skipped"] += 1
+            _count_skip(report, "no netbox ip id")
             continue
         if now - failed_writes.get(key, float("-inf")) < WRITE_BACKOFF:
             report["errors"].append({"ref": ref, "ip": r["ip"],
@@ -806,7 +816,7 @@ def reserve_static_hosts(engine, data: Dict[str, Any], failed_writes: Dict[str, 
             break
         failed_writes.pop(key, None)
         if outcome == "already":
-            report["skipped"] += 1
+            _count_skip(report, "already set at write")
             if force and kind == "replace":
                 # Another run moved the IP between the read and the write
                 # (after this run's checks passed): finished like a repeat.

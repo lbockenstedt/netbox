@@ -207,6 +207,22 @@ def test_an_ip_changed_or_deleted_after_the_read_is_a_conflict_not_a_failed_pass
         assert failed == {}
 
 
+def test_skipped_ips_are_counted_per_reason_without_addresses():
+    eng = _Engine({1: ("10.0.0.5/24", {})})
+    rows = [_static("10.0.0.5", MAC), _static("10.0.1.5", MAC2),
+            _static("10.0.0.9", "aa:bb:cc:dd:ee:03")]
+    sr.reserve_static_hosts(eng, _data(rows[:1]), {}, 1000.0)
+    res = sr.reserve_static_hosts(eng, _data(rows), {}, 2000.0)
+    assert res["skipped"] == 3
+    assert res["skipped_reasons"] == {"already reserved": 1, "outside any dhcp scope": 1,
+                                      "no netbox ip": 1}
+    # Another writer set the same values after the read: counted at the write.
+    eng = _racing_engine(lambda st: st[2].update(mac_address=MAC2, dhcp_reservation=True))
+    res = sr.reserve_static_hosts(
+        eng, _data([_static("10.0.0.5", MAC), _static("10.0.0.6", MAC2)]), {}, 1000.0)
+    assert res["skipped_reasons"] == {"already set at write": 1}
+
+
 def test_missing_kea_state_or_netbox_read_failure_is_an_error_not_an_empty_view():
     eng = _Engine({1: ("10.0.0.5/24", {})})
     data = _data([_static("10.0.0.5", MAC)])

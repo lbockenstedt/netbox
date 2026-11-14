@@ -121,7 +121,13 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
     "left": "<reason>"} | null}],
     "pending_replace": [{"ref", "ip", "old_mac", "new_mac", "first_seen_age"}],
     "conflicts": [{"ref", "ip", "mac", "old_mac"?, "reason", "replace"?}],
-    "errors": [{"ref", "ip"?, "error"}], "skipped": N, "deferred": N}`.
+    "errors": [{"ref", "ip"?, "error"}], "skipped": N,
+    "skipped_reasons": {"<reason>": N}, "deferred": N}`.
+    `skipped_reasons` counts the skipped IPs per reason across tenants
+    (counts only, no addresses): the planner's reasons (e.g. `"outside any
+    dhcp scope"`, `"no netbox ip"`, `"already reserved"`) plus `"already set
+    at write"` (NetBox already held the values at the compare-and-set) and
+    `"no netbox ip id"`.
     `status` is `"ERROR"` (with a `message`) whenever `errors` is not empty,
     so a pass where every read failed never looks like an empty success.
     This spoke always sends `replaced` and `pending_replace` (empty lists
