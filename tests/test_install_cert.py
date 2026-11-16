@@ -172,7 +172,7 @@ def test_valid_pair_with_no_agent_is_cached_not_reported_as_deployed(store):
     res = _install(sp, crt, key)
     assert res["status"] == "DEFERRED"
     assert "not installed" in res["message"]
-    assert "netbox-server" in res["message"]  # tells the operator the fix
+    assert "DEPLOY-AGENT-CERT.md" in res["message"]  # tells the operator the fix
     assert _run_commands(cp) == []
     assert sp._cert_material["fullchain"] == crt
     assert os.path.exists(store)              # survives a restart
