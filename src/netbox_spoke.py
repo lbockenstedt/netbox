@@ -751,9 +751,9 @@ class NetboxSpoke(BaseSpoke):
                            "NetBox-host agent connected to this spoke)", domain)
             return {"status": "DEFERRED",
                     "message": "cert cached but not installed: no NetBox-host agent "
-                               "is connected to this spoke. If the NetBox host runs "
-                               "the generic LM agent, add a 'netbox-server' target "
-                               "for it instead"}
+                               "is connected to this spoke. Enable the spoke's agent "
+                               "listener and point the NetBox host's agent at it "
+                               "(see DEPLOY-AGENT-CERT.md)"}
         # Deploy to each agent.
         results = [await self._deploy_cert_to_agent(a, fullchain, privkey, domain)
                    for a in agents]
