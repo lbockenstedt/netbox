@@ -95,7 +95,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 | `NETBOX_CLAIM_DEVICE` | `claim_device` | Creates a device, configures primary interface, and assigns IP. |
 | `NETBOX_GET_DEVICE_FORM_OPTIONS` | `get_device_form_options` | Returns cached picklists for roles, device types, sites, and racks. |
 | `NETBOX_DEDUPE_DEVICES` | `dedupe_devices` | Reconciles and merges duplicate device records. |
-| `NETBOX_GET_PREFIXES` | `get_prefixes` | Lists IP prefixes filtered by site, VRF, or tenant. |
+| `NETBOX_GET_PREFIXES` | `get_prefixes` | Lists IP prefixes filtered by site, VRF, or tenant. Each prefix carries its VRF name and `vrf_id` (VRF names need not be unique). |
 | `NETBOX_ALLOCATE_PREFIX` | `allocate_prefix` | Allocates the next available child subnet within a parent prefix. |
 | `NETBOX_FIND_AVAILABLE_PREFIXES` | `find_available_prefixes` | Discovers available contiguous subnets near a target anchor. |
 | `NETBOX_CLAIM_PREFIX` | `claim_prefix` | Directly reserves a specified subnet prefix for a tenant. |

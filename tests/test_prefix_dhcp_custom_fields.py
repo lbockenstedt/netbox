@@ -231,3 +231,14 @@ def test_prefix_site_cascade_failure_rolls_back_parent():
     assert eng.update_prefix(5, site_slug="mip")["status"] == "ERROR"
     assert (pfx.scope_type, pfx.scope_id) == ("dcim.site", 1)
     assert pfx.save.call_count == 2
+
+
+def test_get_prefixes_returns_vrf_id():
+    # VRF names need not be unique, so the hub compares VRFs by id.
+    eng = _engine()
+    eng._api_get_all = MagicMock(return_value=[
+        {"id": 1, "prefix": "10.0.0.0/24", "status": {"value": "active"},
+         "vrf": {"id": 7, "name": "SSPLM-VRF"}},
+        {"id": 2, "prefix": "10.1.0.0/24", "status": {"value": "active"}, "vrf": None}])
+    rows = eng.get_prefixes()["prefixes"]
+    assert [(r["vrf"], r["vrf_id"]) for r in rows] == [("SSPLM-VRF", 7), ("", None)]
