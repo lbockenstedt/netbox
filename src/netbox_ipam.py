@@ -71,6 +71,8 @@ class IpamMixin:
                     "site": _prefix_site(p).get("name", ""),
                     "site_slug": _prefix_site(p).get("slug", ""),
                     "vrf": p["vrf"]["name"] if p.get("vrf") else "",
+                    # VRF names need not be unique; the hub compares VRFs by id.
+                    "vrf_id": p["vrf"]["id"] if p.get("vrf") else None,
                     "description": p.get("description") or "",
                     "is_pool": p.get("is_pool", False),
                     # Forward custom_fields so the hub's DHCP sync can read
