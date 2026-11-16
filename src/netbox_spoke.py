@@ -741,13 +741,19 @@ class NetboxSpoke(BaseSpoke):
         # Connected agents.
         cp = self.control_plane
         agents = list(getattr(cp, "connected_agents", {}).keys()) if cp else []
-        # None connected: deploy later on connect.
+        # None connected: hold the cert for a later connect, but report DEFERRED,
+        # not SUCCESS. A SUCCESS here let the hub ledger mark the target done
+        # forever while the NetBox host kept serving the old cert until it
+        # expired (Nov 2026). DEFERRED keeps the hub retrying and shows the
+        # operator the cert is not installed yet.
         if not agents:
-            logger.info("[cert] %s → netbox: cached (no agent connected yet — will "
-                        "deploy on connect)", domain)
-            return {"status": "SUCCESS",
-                    "message": "cert cached; no NetBox-host agent connected yet — "
-                               "it will deploy automatically when one connects"}
+            logger.warning("[cert] %s → netbox: cached but NOT installed (no "
+                           "NetBox-host agent connected to this spoke)", domain)
+            return {"status": "DEFERRED",
+                    "message": "cert cached but not installed: no NetBox-host agent "
+                               "is connected to this spoke. If the NetBox host runs "
+                               "the generic LM agent, add a 'netbox-server' target "
+                               "for it instead"}
         # Deploy to each agent.
         results = [await self._deploy_cert_to_agent(a, fullchain, privkey, domain)
                    for a in agents]

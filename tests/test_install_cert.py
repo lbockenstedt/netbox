@@ -163,15 +163,16 @@ def test_mismatched_pair_rejected_before_deploy(store):
 # ── custody ──────────────────────────────────────────────────────────────────
 
 def test_valid_pair_with_no_agent_is_cached_not_reported_as_deployed(store):
-    # The IPAM spoke commonly has no NetBox-host agent attached yet. Caching is
-    # the correct outcome, but it must NOT claim an install happened.
+    # The IPAM spoke commonly has no NetBox-host agent attached. Caching is
+    # correct, but the status must be DEFERRED: a SUCCESS made the hub stop
+    # retrying while the NetBox host kept the old cert until it expired.
     crt, key = _real_pair()
     cp = _FakeControlPlane(agents=[])
     sp = _make_spoke(store, cp)
     res = _install(sp, crt, key)
-    assert res["status"] == "SUCCESS"
-    assert "cached" in res["message"]
-    assert "deploy" in res["message"]         # tells the operator what happens next
+    assert res["status"] == "DEFERRED"
+    assert "not installed" in res["message"]
+    assert "netbox-server" in res["message"]  # tells the operator the fix
     assert _run_commands(cp) == []
     assert sp._cert_material["fullchain"] == crt
     assert os.path.exists(store)              # survives a restart
@@ -307,5 +308,5 @@ def test_no_control_plane_still_takes_custody(store):
     # Custody does not depend on a control plane: the material is kept so it can
     # be deployed once one exists.
     assert sp._cert_material is not None
-    assert res["status"] == "SUCCESS"
+    assert res["status"] == "DEFERRED"
     assert "cached" in res["message"]
