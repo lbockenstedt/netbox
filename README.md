@@ -123,7 +123,7 @@ The module connects to the Lab Manager Hub over an outbound TLS/WebSocket tunnel
 | `NETBOX_SEED_CATALOG` | `seed_catalog` | Seeds bundled Aruba/HPE/Juniper hardware models into NetBox. |
 | `NETBOX_IMPORT_RACK_DETECT` | `detect_rack_sheets` | Analyzes uploaded Excel workbook for rack elevations. |
 | `NETBOX_IMPORT_RACK_COMMIT` | `import_rack_layout` | Commits mapped Excel rack elevation data to NetBox. |
-| `INSTALL_CERT` | `_persist_cert` | Stores and activates custom SSL/TLS certificates for the spoke. |
+| `INSTALL_CERT` | `_persist_cert` | Stores the cert and deploys it to the connected NetBox-host agent(s). With no agent connected it returns `DEFERRED` (not installed, the hub keeps retrying); the NetBox host's agent must connect to this spoke's agent listener (see `DEPLOY-AGENT-CERT.md`). |
 
 ---
 
