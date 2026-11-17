@@ -2,41 +2,54 @@
 # setup-agent-host.sh — provision the ipam/NetBox SPOKE to host the NetBox-host
 # Agent's /ws/agent listener (tiered Hub→Spoke→Agent cert delivery).
 #
-# Run this ON THE SPOKE BOX (the one running the lm-netbox systemd service).
+# Run this ON THE SPOKE BOX (lm-netbox, or lm-agent hosting the NetBox role).
 # It is idempotent and non-destructive:
 #   1) generates a shared agent_secret → /etc/lm-netbox-agent/config.json (0600)
 #   2) ensures a TLS cert for the /ws/agent listener (reuses the NetBox nginx cert
-#      if present on this box; else self-signs one — the Agent connects
-#      unverified until mTLS is armed)
+#      if present on this box; else requires explicit trusted cert/key paths)
 #   3) drops a systemd override that enables the listener on the lm-netbox unit
-#      (LM_NETBOX_AGENT_LISTENER=1, LM_NETBOX_AGENT_PORT=8444, LM_TLS_CERT/KEY)
+#      (LM_NETBOX_AGENT_LISTENER=1, LM_NETBOX_AGENT_PORT=8444, LM_NETBOX_TLS_CERT/KEY)
 #   4) daemon-reload + restart lm-netbox
 #
-# Then install the Agent on the NetBox host in device mode (see DEPLOY.md):
-#   Style 1 (split):     install_agent.sh --spoke-url wss://<this-spoke>:8444/ws/agent
-#   Style 2 (all-in-one) install_agent.sh --spoke-url ws://127.0.0.1:8444/ws/agent
+# Then use Load Role / netbox-server to configure its separate verified
+# certificate channel. Do not replace the main hub agent (DEPLOY-AGENT-CERT.md).
 #
-# Usage:  sudo bash setup-agent-host.sh [--port 8444] [--service lm-netbox]
+# Usage: sudo bash setup-agent-host.sh [--port 8444] [--service lm-netbox] \
+#          --tls-cert /absolute/server.crt --tls-key /absolute/server.key
 set -euo pipefail
 
 PORT=8444
 SERVICE="lm-netbox"
 CONFIG_DIR="/etc/lm-netbox-agent"
 CONFIG_JSON="$CONFIG_DIR/config.json"
-TLS_DIR="/etc/lm/netbox/agent-tls"
 NGINX_CRT="/etc/lm/netbox/tls/netbox.crt"
 NGINX_KEY="/etc/lm/netbox/tls/netbox.key"
+CRT=""; KEY=""
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --port)    PORT="$2";    shift ;;
         --service) SERVICE="$2"; shift ;;
+        --tls-cert) CRT="$2"; shift ;;
+        --tls-key) KEY="$2"; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
 done
 
 [[ "$(id -u)" -eq 0 ]] || { echo "run as root (sudo)"; exit 1; }
+# Validate before writing any config. No insecure bootstrap fallback.
+[[ "$PORT" =~ ^[0-9]+$ && "$PORT" -gt 0 && "$PORT" -le 65535 ]] || { echo "invalid port" >&2; exit 2; }
+[[ "$SERVICE" =~ ^[a-zA-Z0-9_.-]+$ ]] || { echo "invalid service" >&2; exit 2; }
+CRT="${CRT:-$NGINX_CRT}"; KEY="${KEY:-$NGINX_KEY}"
+[[ "$CRT" =~ ^/[a-zA-Z0-9_./-]+$ && "$KEY" =~ ^/[a-zA-Z0-9_./-]+$ ]] || { echo "invalid TLS paths" >&2; exit 2; }
+[[ -s "$CRT" && -s "$KEY" ]] || { echo "supply --tls-cert and --tls-key for this listener" >&2; exit 2; }
+openssl x509 -in "$CRT" -checkend 0 -noout || { echo "listener certificate expired" >&2; exit 2; }
+python3 - "$CRT" "$KEY" <<'PY'
+import ssl
+import sys
+ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(sys.argv[1], sys.argv[2])
+PY
 
 # 1) Shared agent onboarding secret (used as PSK + frame-signing key).
 mkdir -p "$CONFIG_DIR"; chmod 0700 "$CONFIG_DIR"
@@ -49,46 +62,28 @@ else
     echo "agent_secret already present → $CONFIG_JSON (unchanged)"
 fi
 
-# 2) TLS cert for the /ws/agent listener.
-if [[ -s "$NGINX_CRT" && -s "$NGINX_KEY" ]]; then
-    CRT="$NGINX_CRT"; KEY="$NGINX_KEY"
-    echo "using existing NetBox cert for /ws/agent: $CRT"
-else
-    mkdir -p "$TLS_DIR"; chmod 0700 "$TLS_DIR"
-    CRT="$TLS_DIR/agent.crt"; KEY="$TLS_DIR/agent.key"
-    if [[ ! -s "$CRT" || ! -s "$KEY" ]]; then
-        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -subj "/CN=lm-netbox-agent-listener" \
-            -keyout "$KEY" -out "$CRT" >/dev/null 2>&1
-        chmod 0600 "$KEY" "$CRT"
-        echo "self-signed /ws/agent cert → $CRT (replace with the LE wildcard for mTLS)"
-    fi
-fi
-
 # 3) systemd override enabling the listener on the spoke unit.
 DROPIN_DIR="/etc/systemd/system/${SERVICE}.service.d"
 mkdir -p "$DROPIN_DIR"
-cat > "$DROPIN_DIR/agent-listener.conf" <<EOF
+cat > "$DROPIN_DIR/netbox-agent-listener.conf" <<EOF
 [Service]
 Environment=LM_NETBOX_AGENT_LISTENER=1
 Environment=LM_NETBOX_AGENT_PORT=$PORT
-Environment=LM_TLS_CERT=$CRT
-Environment=LM_TLS_KEY=$KEY
+Environment=LM_NETBOX_TLS_CERT=$CRT
+Environment=LM_NETBOX_TLS_KEY=$KEY
 EOF
-echo "wrote $DROPIN_DIR/agent-listener.conf (listener on :$PORT)"
+echo "wrote $DROPIN_DIR/netbox-agent-listener.conf (listener on :$PORT)"
 
 # 4) apply.
 systemctl daemon-reload
-systemctl restart "$SERVICE" 2>/dev/null || echo "note: could not restart $SERVICE (start it manually)"
+systemctl restart "$SERVICE"
 
 cat <<DONE
 
 ipam spoke is now an agent host on :$PORT.
-Copy the agent_secret to the NetBox-host Agent install:
-    sudo cat $CONFIG_JSON
-Then on the NetBox host:
-    curl -fsSL <lm>/agent/install_agent.sh | sudo bash -s -- \\
-        --spoke-url wss://<this-spoke>:$PORT/ws/agent --secret <agent_secret>
-Approve the Agent in the WebUI (Setup → Spokes & Agents), then deploy the cert
-from the LE module (target: ipam) — the spoke installs it via the Agent.
+Keep the NetBox host's hub agent intact. Configure netbox-server's separate
+certificate channel with cert_spoke_url + trusted cert_ca_pem in Load Role.
+Set that channel's exact cert_agent_id on the matching IPAM instance, approve
+the channel in the WebUI, then redeploy the current LE certificate.
+See DEPLOY-AGENT-CERT.md. No PSK needs to be copied or displayed.
 DONE

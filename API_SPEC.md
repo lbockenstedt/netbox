@@ -4,6 +4,27 @@ The NetBox Spoke integrates Lab Manager with NetBox to maintain the authoritativ
 
 ## Command Set
 
+### Certificate delivery
+
+- **`UPDATE_CONFIG`** accepts `cert_agent_id`, the exact NetBox-host certificate
+  device ID associated with this IPAM instance. Empty disables delivery;
+  omission preserves the saved association. Saving persists it and schedules
+  cached replay when that device is connected. Invalid IDs or failed persistence
+  return ERROR. The hub projects this field on both instance save and reconnect.
+- **`INSTALL_CERT`**
+  - Payload: `{"domain": "<name>", "fullchain": "<PEM>", "privkey": "<PEM>"}`.
+  - Validates the pair and persists encrypted custody. Only the explicit
+    `cert_agent_id`, authenticated and connected to this spoke, receives it.
+  - SUCCESS requires WRITE_FILE `status=SUCCESS`, `result.ok=true` for both PEMs, then a SUCCESS
+    RUN_COMMAND reply with helper `rc=0` and `OK` output.
+  - DEFERRED means no associated device is connected (cached, not installed).
+    Cache persistence, file-write and helper/reload failures return ERROR.
+    No other connected device is a fallback; Unknown command requires updating
+    the device, never success.
+  - Reconnect replay returns the same delivery result and is scheduled outside
+    the registration hook's awaited RPC path. See `DEPLOY-AGENT-CERT.md` for the
+    separate managed service, CA trust and initial association contract.
+
 ### IPAM & Device Management
 - **`NETBOX_GET_CABLES`**
   - **Purpose**: Returns physical device-to-device cable connections, flattened
