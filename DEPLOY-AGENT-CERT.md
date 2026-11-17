@@ -1,73 +1,116 @@
-# NetBox cert delivery — deployment (tiered Hub → Spoke → Agent)
+# NetBox certificate delivery: Hub → IPAM spoke → certificate device
 
-The cert is delivered to the **ipam spoke**, which holds all the install logic and
-drives a dumb **Agent** on the NetBox host to place the cert + reload nginx. The
-Agent only ever talks to the spoke (never the hub) and only runs generic
-primitives (`RUN_COMMAND` / `WRITE_FILE`). The `netbox-server` role still
-provisions nginx + the `/usr/local/bin/lm-netbox-install-cert` helper.
+The NetBox server keeps its **hub-connected `lm-agent`** for NetBox SSO/admin
+operations. Do not reinstall that service in device mode.
 
-Two supported topologies:
+## Initial listener setup (IPAM spoke host)
 
-| | Style 1 — split | Style 2 — all-in-one |
-|---|---|---|
-| ipam spoke | box A | same box |
-| NetBox + Agent | box B | same box |
-| Agent → spoke | `wss://A:8444/ws/agent` | `ws://127.0.0.1:8444/ws/agent` |
-| Hub → NetBox host | **not required** | n/a |
-
-Both use the same two steps.
-
-## 1) Make the ipam spoke an agent host (on the spoke box)
+The generic agent's `netbox` role and standalone `lm-netbox` both use the shared
+`AgentHostingControlPlane`. Opt in to the NetBox-specific listener:
 
 ```bash
-sudo bash netbox/setup-agent-host.sh        # port 8444, service lm-netbox
-sudo cat /etc/lm-netbox-agent/config.json   # copy the agent_secret
-```
-This generates the shared `agent_secret`, ensures a TLS cert for `/ws/agent`
-(reuses the NetBox nginx cert if present, else self-signs), enables the listener
-(`LM_NETBOX_AGENT_LISTENER=1`, `LM_NETBOX_AGENT_PORT=8444`) via a systemd
-override, and restarts `lm-netbox`. It's opt-in — existing ipam spokes are
-untouched until you run it.
-
-## 2) Install the Agent on the NetBox host (device mode)
-
-Ensure the NetBox host has the `netbox-server` role (provisions nginx + the cert
-helper), then install the Agent pointed at the spoke:
-
-**Style 1 (split):**
-```bash
-curl -fsSL <lm>/agent/install_agent.sh | sudo bash -s -- \
-    --spoke-url wss://<spoke-A>:8444/ws/agent --secret <agent_secret>
+sudo bash setup-agent-host.sh --service lm-agent --port 8444 \
+  --tls-cert /path/to/listener-fullchain.pem --tls-key /path/to/listener-key.pem
 ```
 
-**Style 2 (all-in-one):**
-```bash
-curl -fsSL <lm>/agent/install_agent.sh | sudo bash -s -- \
-    --spoke-url ws://127.0.0.1:8444/ws/agent --secret <agent_secret>
+For a standalone spoke use `--service lm-netbox`. The script preserves
+`/etc/lm-netbox-agent/config.json` and writes only a service drop-in containing
+`LM_NETBOX_AGENT_LISTENER`, `LM_NETBOX_AGENT_PORT`, `LM_NETBOX_TLS_CERT` and
+`LM_NETBOX_TLS_KEY`. It validates the certificate/key and expiry, then restarts
+the chosen service (failure exits nonzero). It no longer creates a CN-only
+self-signed certificate or asks an agent to use unverified TLS.
+
+Use an existing trusted listener certificate, or a separately provisioned CA
+and SAN certificate. Its SAN must cover the exact DNS name or private IP in
+the configured URL. Do not copy a PSK or display a private key. The listener
+uses its own approval PSK, never Proxmox's config/PSK.
+Changing or clearing the association cancels old replay and serializes with
+direct installs. An RPC already dispatched cannot be recalled from a device;
+the change is acknowledged only after the in-flight delivery stops or completes.
+
+With the updated shared LM framework, the IPAM listener checks for changed TLS
+files every 60 seconds and rebinds only after the new pair validates. Connected
+devices briefly reconnect; invalid or missing files are retried while the old
+listener remains up. Update shared LM before the standalone spoke; an older
+framework logs that the watcher is unavailable and needs a service restart
+after renewal. The renewed name and issuer must remain trusted by the device.
+
+## Managed server channel (existing Load Role UI/API)
+
+Deploy the updated NetBox role before enabling its listener. The updated generic
+host refuses to expose older, unscoped certificate-broadcasting role code.
+
+On the NetBox server's hub-agent row, Load Role → **NetBox Server** accepts:
+
+```json
+{
+  "role": "netbox-server",
+  "config": {
+    "cert_spoke_url": "wss://spoke.example.com:8444/ws/agent",
+    "cert_ca_pem": "<trusted CA certificate PEM, not a private key>"
+  }
+}
 ```
 
-Omit `--secret` for zero-touch: the Agent appears **pending** in the WebUI
-(Setup → Spokes & Agents); approve it and the spoke pushes the secret.
+This is the existing `LOAD_ROLE` payload, relayed by the existing authorized
+agent load-role API. A running NetBox install is not reinstalled: the same
+operation configures/repairs its certificate channel and leaves SSO intact.
+New installs configure the channel only after the app installer succeeds.
+Read the deploy status for background installation failures; starting a
+deployment is not completion.
 
-## 3) Deploy the cert
+The separate `lm-netbox-cert-agent.service` runs the **existing generic
+device-mode agent** from `/opt/lm/agent`, via
+`control_plane.py --device-config /etc/lm-netbox-cert-agent/channel.json`.
+Its ID is `<base-hub-agent-id>-netbox-cert`. The directory is 0700, its runtime
+config is 0600, and each destination URL gets independent CA/PSK/install-UUID
+state. Changing the URL requires explicit CA input; a previously unseen URL
+starts unapproved and never receives the old spoke's PSK. Omitted values preserve saved settings.
+Unchanged re-loads start rather than restart the service. Agent/NetBox
+installer reruns do not replace this independent unit or its saved channel.
 
-From the LE module, deploy to target **ipam**. The spoke validates, caches it
-(Fernet-encrypted), and installs it on the NetBox host via the Agent. Any Agent
-that connects later auto-gets the current cached cert.
+The channel checks the CA and hostname on every connection and never enters
+device mode's legacy unverified-TLS recovery. Public and private URLs work;
+the deployment must supply reachability and a matching SAN. Private IPs are
+intentionally allowed for this device endpoint; it is not a hub web fetch.
 
-## mTLS (optional, later)
+## Associate, approve, deploy
 
-Once the LE **wildcard** is distributed to the hub + spokes + this `/ws/agent`
-listener (replace the self-signed cert), open **System → Active Sessions →
-Mutual TLS**. When the readiness dot is green, flip **Enable mutual TLS**. If a
-cert later expires, the Agent self-heals: it falls back to the PSK channel just
-long enough for the spoke to re-deploy a fresh cert, then resumes mTLS.
+1. In Setup → IPAM, edit the intended instance, already bound to its intended
+   IPAM spoke. Select the certificate agent by name in **Certificate agent**
+   (the dropdown stores its exact `cert_agent_id`). Save. The field is delivered both on save and reconnect;
+   the spoke persists it for offline restarts. Blank disables delivery.
+2. Approve the separate pending device on that IPAM spoke through the existing
+   WebUI approval flow. Pending/unrelated agents receive no certificate.
+3. Redeploy the current LE certificate to that exact IPAM target.
 
-## Notes / troubleshooting
+`INSTALL_CERT {domain, fullchain, privkey}` validates the pair, persists it
+encrypted and sends acknowledged `WRITE_FILE` commands followed by
+`RUN_COMMAND sudo -n /usr/local/bin/lm-netbox-install-cert …`. The helper validates,
+swaps nginx's cert/key, tests nginx, and reloads. Any failed/unacknowledged write,
+bad helper reply, failed validation or reload returns ERROR. An offline/unset
+association returns DEFERRED, never cached-only SUCCESS.
 
-- Spoke listener port is **8444** (distinct from pxmx's 8443). Pass the port in
-  the `--spoke-url`; `--spoke-ip <host>` alone assumes `:443`.
-- The spoke needs `/etc/lm-netbox-agent/config.json` (step 1) and the NetBox host
-  needs the same `agent_secret` (step 2) — or use zero-touch approval.
-- Hub → NetBox host reachability is **not** required in Style 1; the Agent dials
-  the spoke, and everything relays up through the spoke.
+On authenticated reconnect, cached replay is scheduled **after registration
+returns**, allowing the listener to read RPC replies. It returns/logs its
+actual result, not a fire-and-forget success. Old peers lacking WRITE_FILE or
+RUN_COMMAND must be updated; their error is not treated as an install.
+Unrelated connected agents are never selected as a fallback.
+
+Historical cached-only SUCCESS entries in the hub ledger need an explicit
+redeploy after setup. Reconnect replay repairs the host but does not rewrite
+that ledger or the existing certificate-monitor telemetry. Verify nginx's
+served leaf/expiry and check SSO/login after deployment.
+
+## Trust and rollback caveats
+
+- Trust for this channel is independent of NetBox nginx's expiring leaf. Keep
+  the listener certificate/CA valid; an expired listener fails closed and needs
+  renewal through its existing management path, not unverified bootstrap.
+- This managed channel uses verified server TLS plus the existing PSK approval
+  framework. It does not provision/present a client certificate; a listener
+  enforcing **strict mTLS** is not supported by this provisioning path.
+- A provisioning/service failure is ERROR and restores previous config files.
+  Inspect systemd status before retrying; failure is never reported as deployed.
+- All live setup, reachability changes, approvals and verification are operator
+  work; source tests do not contact live systems.
