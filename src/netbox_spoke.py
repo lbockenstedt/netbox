@@ -15,12 +15,15 @@ import hashlib
 import httpx
 import json
 import os
+import re
 import ssl
 import tempfile
 import time
+import uuid
 # Type hints.
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor
+from dotenv import dotenv_values
 # BaseSpoke lives at the top level when deployed, under core.src in the repo.
 try:
     from base_spoke import BaseSpoke
@@ -95,17 +98,24 @@ class NetboxSpoke(BaseSpoke):
                  control_plane: Any = None):
         """Initialize NetBox spoke with configuration, engine, and cert custodian."""
         super().__init__(spoke_id, config)
-        # Reference to the NetboxControlPlane so the API-only INSTALL_CERT
-        # handler can relay the cert install to the netbox-server agent via
-        # request_to_hub (HUB_REQUEST RELAY_NETBOX_CERT). None when constructed
-        # standalone (tests) — the handler then returns a clear ERROR instead
-        # of relaying. Mirrors the le_spoke control_plane pattern.
+        # INSTALL_CERT uses the local agent host, never a direct hub-agent
+        # bounce. A missing host keeps delivery DEFERRED, not successful.
         self.control_plane = control_plane
         # Cert custodian: hold the current NetBox-host cert, persist it Fernet-
         # encrypted (key derived from the spoke secret), and deploy it to the
         # hosted Agent(s) on receipt AND on new-agent connect. Loaded on startup
         # so a spoke restart still deploys to reconnecting agents.
         self._cert_material = None  # {"domain","fullchain","privkey"}
+        # A hosted role does not load the standalone control plane's .env.
+        # Read only our own saved non-secret association, without changing
+        # process-wide environment shared with other roles.
+        saved = dotenv_values(os.path.join(os.path.dirname(__file__), "..", ".env"))
+        self.cert_agent_id = str(config.get("cert_agent_id",
+            saved.get("NETBOX_CERT_AGENT_ID", os.getenv("NETBOX_CERT_AGENT_ID", ""))) or "").strip()
+        self._cert_replay_tasks = {}
+        self._cert_lock = asyncio.Lock()
+        self._cert_association_lock = asyncio.Lock()
+        self._cert_update_pending = False
         self._cert_store = os.getenv("LM_NETBOX_CERT_STORE",
                                      "/var/lib/lm/netbox/cert.enc")
         self._load_persisted_cert()
@@ -184,13 +194,27 @@ class NetboxSpoke(BaseSpoke):
             # Append it if missing.
             if not found:
                 new_lines.append(f"{key}={value}\n")
-            # Write the file back.
-            with open(env_path, "w") as f:
-                f.writelines(new_lines)
+            # Reconnect projections commonly repeat the same values.
+            if new_lines == lines:
+                return True
+            # Preserve the old configuration on write failure; protect secrets
+            # already present in .env before putting any content in the temp.
+            with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(env_path),
+                                             delete=False) as f:
+                tmp = f.name
+                try:
+                    f.writelines(new_lines)
+                    f.flush()
+                    os.replace(tmp, env_path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
             logger.info(f"Persisted {key} to .env")
+            return True
         except Exception as e:
             # Could not write.
             logger.warning(f"Could not persist {key} to .env: {e}")
+            return False
 
     # Default gateway used when a NetBox scope carries none — also the value
     # tracked in _kea_synced so a later gateway edit is detected as a delta.
@@ -223,6 +247,8 @@ class NetboxSpoke(BaseSpoke):
         every netbox update left the old loops running the old code next to the
         new ones, repeating NetBox writes and full device listings."""
         tasks = [t for t in (self._sync_task, self._nw_flush_task) if t]
+        tasks.extend(getattr(self, "_cert_replay_tasks", {}).values())
+        self._cert_replay_tasks = {}
         self._sync_task = None
         self._nw_flush_task = None
         for t in tasks:
@@ -616,13 +642,16 @@ class NetboxSpoke(BaseSpoke):
                 os.makedirs(d, mode=0o700, exist_ok=True)
             # Write to a temp file with 0600 and swap it in.
             tmp = self._cert_store + ".tmp"
-            with open(tmp, "wb") as f:
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
                 f.write(enc)
-            os.chmod(tmp, 0o600)
             os.replace(tmp, self._cert_store)
+            return True
         except Exception as e:  # noqa: BLE001 - best-effort persist
             # Persist failed.
             logger.warning("[cert] custodian persist failed: %s", e)
+            return False
 
     def _load_persisted_cert(self):
         """Load and decrypt stored TLS certificate material from disk."""
@@ -647,15 +676,28 @@ class NetboxSpoke(BaseSpoke):
         cp = self.control_plane
         if cp is None or not hasattr(cp, "send_to_agent"):
             return {"status": "ERROR", "message": "spoke is not an agent host"}
+        # An approved channel alone is not an instance/host association.
+        if (self._cert_update_pending or agent_id != self.cert_agent_id
+                or agent_id not in getattr(cp, "connected_agents", {})):
+            return {"status": "ERROR", "message": "certificate agent is not associated and connected"}
         # Unique temp paths on the agent.
-        ts = str(int(time.time() * 1000))
+        ts = uuid.uuid4().hex
         crt_tmp, key_tmp = f"/tmp/lm-netbox-{ts}.crt.pem", f"/tmp/lm-netbox-{ts}.key.pem"
         try:
             # Write the cert and key, then run the install helper.
-            await cp.send_to_agent("WRITE_FILE", {"path": crt_tmp, "content": fullchain,
-                                                  "mode": 0o600}, agent_id=agent_id, timeout=20.0)
-            await cp.send_to_agent("WRITE_FILE", {"path": key_tmp, "content": privkey,
-                                                  "mode": 0o600}, agent_id=agent_id, timeout=20.0)
+            for path, content in ((crt_tmp, fullchain), (key_tmp, privkey)):
+                if self._cert_update_pending or agent_id != self.cert_agent_id:
+                    return {"status": "ERROR", "message": "certificate association changed"}
+                reply = await cp.send_to_agent(
+                    "WRITE_FILE", {"path": path, "content": content, "mode": 0o600},
+                    agent_id=agent_id, timeout=20.0)
+                result = reply.get("result") if isinstance(reply, dict) else None
+                if (not isinstance(reply, dict) or reply.get("status") != "SUCCESS"
+                        or not isinstance(result, dict) or result.get("ok") is not True):
+                    return {"status": "ERROR",
+                            "message": "certificate WRITE_FILE was not acknowledged; check/update the device agent"}
+            if self._cert_update_pending or agent_id != self.cert_agent_id:
+                return {"status": "ERROR", "message": "certificate association changed"}
             cmd = f"sudo -n {_NETBOX_INSTALL_CERT_HELPER} {crt_tmp} {key_tmp}"
             res = await cp.send_to_agent("RUN_COMMAND", {"command": cmd, "allow_shell": True,
                                                          "timeout": 30}, agent_id=agent_id, timeout=40.0)
@@ -672,15 +714,22 @@ class NetboxSpoke(BaseSpoke):
             except Exception:  # noqa: BLE001 - cleanup best-effort
                 pass
         # Read the helper's result.
-        runner = (res or {}).get("result", {}) if isinstance(res, dict) else {}
-        out = (runner.get("stdout") or "").strip()
+        res = res if isinstance(res, dict) else {}
+        runner = res.get("result")
+        if not isinstance(runner, dict):
+            return {"status": "ERROR", "message": "invalid certificate helper reply; check/update the device agent"}
+        out, err = runner.get("stdout") or "", runner.get("stderr") or ""
+        if not isinstance(out, str) or not isinstance(err, str):
+            return {"status": "ERROR", "message": "invalid certificate helper output"}
+        out = out.strip()
         # Helper reported OK.
-        if runner.get("rc") == 0 and out.startswith("OK"):
+        if (res.get("status") == "SUCCESS" and runner.get("rc") == 0
+                and (out == "OK" or out.startswith("OK "))):
             logger.info("[cert] %s → netbox agent %s: installed — %s",
                         domain, agent_id, out[2:].strip() or out)
             return {"status": "SUCCESS", "message": out[2:].strip() or "installed on netbox"}
         # Anything else is a failure.
-        msg = (runner.get("stderr") or out or (res or {}).get("message")
+        msg = (err or out or (res or {}).get("message")
                or "cert helper failed on agent")
         logger.warning("[cert] %s → netbox agent %s: FAILED — %s", domain, agent_id, msg)
         return {"status": "ERROR", "message": msg}
@@ -688,18 +737,43 @@ class NetboxSpoke(BaseSpoke):
     async def deploy_cached_cert_to_agent(self, agent_id):
         """Deploy the currently-cached cert to a newly-connected agent (called from
         NetboxControlPlane._on_agent_registered)."""
-        # Nothing cached: nothing to deploy.
-        c = self._cert_material
-        if not c:
+        async with self._cert_lock:
+            # Snapshot custody only after earlier installs finish.
+            c = self._cert_material
+            if not c:
+                return {"status": "DEFERRED", "message": "no certificate cached"}
+            logger.info("[cert] deploying cached cert (%s) to newly-connected agent %s",
+                        c.get("domain"), agent_id)
+            return await self._deploy_cert_to_agent(agent_id, c.get("fullchain", ""),
+                                                   c.get("privkey", ""), c.get("domain", ""))
+
+    def schedule_cached_cert_to_agent(self, agent_id):
+        """Replay after registration returns so the listener can consume RPC replies."""
+        # Never hand certificate material to an unrelated authenticated host.
+        if self._cert_update_pending or agent_id != self.cert_agent_id:
             return
-        # Deploy the cached cert.
-        logger.info("[cert] deploying cached cert (%s) to newly-connected agent %s",
-                    c.get("domain"), agent_id)
-        await self._deploy_cert_to_agent(agent_id, c.get("fullchain", ""),
-                                         c.get("privkey", ""), c.get("domain", ""))
+        tasks = self._cert_replay_tasks
+        if agent_id not in tasks or tasks[agent_id].done():
+            tasks[agent_id] = asyncio.create_task(self._replay_cached_cert(agent_id))
+
+    async def _replay_cached_cert(self, agent_id):
+        """Consume and log replay failures without dropping the approved connection."""
+        try:
+            result = await self.deploy_cached_cert_to_agent(agent_id)
+        except Exception:  # Never include an RPC exception's potentially sensitive payload.
+            logger.error("[cert] cached certificate replay failed for agent %s", agent_id)
+            return {"status": "ERROR", "message": "cached certificate replay failed"}
+        log = logger.info if result["status"] == "SUCCESS" else logger.warning
+        log("[cert] cached replay agent %s: %s", agent_id, result["status"])
+        return result
 
     async def _handle_install_cert(self, data):
-        """Validate → persist → deploy to all connected agents (cert custodian)."""
+        """Serialize custody and installation with replay and association changes."""
+        async with self._cert_lock:
+            return await self._handle_install_cert_locked(data)
+
+    async def _handle_install_cert_locked(self, data):
+        """Validate, persist, then deliver only to the explicitly associated host."""
         # Read the cert material.
         domain = data.get("domain", "") or ""
         fullchain = data.get("fullchain", "") or ""
@@ -735,12 +809,26 @@ class NetboxSpoke(BaseSpoke):
 
         # Custody: persist (encrypted) so a restart / late-connecting agent gets it.
         # Cache and persist the cert.
+        previous = self._cert_material
         self._cert_material = {"domain": domain, "fullchain": fullchain, "privkey": privkey}
-        self._persist_cert()
+        # A cancelled coroutine must not release the custody lock while its
+        # background filesystem write is still using the shared temp file.
+        persist = asyncio.create_task(asyncio.to_thread(self._persist_cert))
+        try:
+            persisted = await asyncio.shield(persist)
+        except asyncio.CancelledError:
+            persisted = await persist
+            if not persisted:
+                self._cert_material = previous
+            raise
+        if not persisted:
+            self._cert_material = previous
+            return {"status": "ERROR", "message": "certificate cache could not be persisted"}
 
         # Connected agents.
         cp = self.control_plane
-        agents = list(getattr(cp, "connected_agents", {}).keys()) if cp else []
+        agents = ([self.cert_agent_id] if cp and self.cert_agent_id
+                  and self.cert_agent_id in getattr(cp, "connected_agents", {}) else [])
         # None connected: hold the cert for a later connect, but report DEFERRED,
         # not SUCCESS. A SUCCESS here let the hub ledger mark the target done
         # forever while the NetBox host kept serving the old cert until it
@@ -751,13 +839,13 @@ class NetboxSpoke(BaseSpoke):
                            "NetBox-host agent connected to this spoke)", domain)
             return {"status": "DEFERRED",
                     "message": "cert cached but not installed: no NetBox-host agent "
-                               "is connected to this spoke. Enable the spoke's agent "
+                               "is associated and connected to this spoke. Set cert_agent_id, enable the spoke's agent "
                                "listener and point the NetBox host's agent at it "
                                "(see DEPLOY-AGENT-CERT.md)"}
-        # Deploy to each agent.
+        # Deliver to the single, explicitly associated agent.
         results = [await self._deploy_cert_to_agent(a, fullchain, privkey, domain)
                    for a in agents]
-        # Success if any agent installed it.
+        # Report success only when that host installed it.
         ok = sum(1 for r in results if r.get("status") == "SUCCESS")
         if ok:
             return {"status": "SUCCESS",
@@ -852,6 +940,41 @@ class NetboxSpoke(BaseSpoke):
 
         # Config push: repoint NetBox and/or Kea.
         if normalized == "UPDATE_CONFIG":
+            # A blank value explicitly disables delivery; omitted values preserve it.
+            if "cert_agent_id" in data:
+                agent_id = str(data["cert_agent_id"] or "").strip()
+                if agent_id and not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", agent_id):
+                    return {"status": "ERROR", "message": "invalid cert_agent_id"}
+                async with self._cert_association_lock:
+                    changed = agent_id != self.cert_agent_id
+                    if changed:
+                        # Prevent fresh replay and interrupt the old replay before
+                        # waiting for any concurrent install to leave custody.
+                        self._cert_update_pending = True
+                    try:
+                        if changed:
+                            tasks = [t for t in self._cert_replay_tasks.values() if not t.done()]
+                            for task in tasks:
+                                task.cancel()
+                            if tasks:
+                                await asyncio.gather(*tasks, return_exceptions=True)
+                        async with self._cert_lock:
+                            persist = asyncio.create_task(asyncio.to_thread(
+                                self._persist_env, "NETBOX_CERT_AGENT_ID", agent_id))
+                            try:
+                                persisted = await asyncio.shield(persist)
+                            except asyncio.CancelledError:
+                                # Keep memory and disk consistent before unlocking.
+                                if await persist:
+                                    self.cert_agent_id = agent_id
+                                raise
+                            if not persisted:
+                                return {"status": "ERROR", "message": "could not persist certificate agent association"}
+                            self.cert_agent_id = agent_id
+                    finally:
+                        self._cert_update_pending = False
+                    if agent_id in getattr(self.control_plane, "connected_agents", {}):
+                        self.schedule_cached_cert_to_agent(agent_id)
             # New URL and token, if sent.
             url = data.get("netbox_url") or data.get("url")
             token = data.get("api_token")
