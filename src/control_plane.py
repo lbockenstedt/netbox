@@ -97,6 +97,9 @@ class NetboxControlPlane(AgentHostingControlPlane):
     AGENT_LOOPBACK_PORT = 8444
     AGENT_WSS_PORT = 8444
     AGENT_FALLBACK_PORT = 8767
+    AGENT_LISTENER_REQUIRE_TLS = True
+    AGENT_TLS_CERT_ENV = "LM_NETBOX_TLS_CERT"
+    AGENT_TLS_KEY_ENV = "LM_NETBOX_TLS_KEY"
 
     def __init__(self, spoke_id: str, secret: str, hub_secret: str = None, hub_url: str = None):
         """Store Hub identity and load NetBox/KEA connection settings from .env."""
@@ -143,11 +146,24 @@ class NetboxControlPlane(AgentHostingControlPlane):
         # remote wss / Style 2 loopback). Gated by AGENT_LISTENER_OPT_IN + the env.
         if self._agent_listener_enabled():
             self._start_agent_server_task()
+            start_watch = getattr(self, "_start_ipam_tls_watch", None)
+            if start_watch:
+                start_watch()
+            else:
+                logger.warning("IPAM listener TLS renewal watcher unavailable; update the shared LM framework")
             logger.info("NetBox agent listener started (spoke hosts the NetBox-host Agent).")
         # Run the Hub control loop until it exits; always stop the KEA sync afterwards.
         try:
             await super().run()
         finally:
+            stop_watch = getattr(self, "_stop_ipam_tls_watch", None)
+            if stop_watch:
+                await stop_watch()
+            server = self._agent_server_task
+            self._agent_server_task = None
+            if server is not None:
+                server.cancel()
+                await asyncio.gather(server, return_exceptions=True)
             await netbox_spoke.stop_kea_sync()
             await netbox_spoke.stop_nw_flush()
 
@@ -156,11 +172,8 @@ class NetboxControlPlane(AgentHostingControlPlane):
         deploy the spoke's cached cert to it immediately (cert-custodian model)."""
         # Only possible once run() has created the NetBox module.
         if self._netbox_spoke is not None:
-            try:
-                await self._netbox_spoke.deploy_cached_cert_to_agent(agent_id)
-            # Cert push failure must not block the agent from registering.
-            except Exception as e:  # noqa: BLE001 - never break registration
-                logger.debug("cert auto-deploy on agent %s connect skipped: %s", agent_id, e)
+            # RPC replies are read only after this hook returns.
+            self._netbox_spoke.schedule_cached_cert_to_agent(agent_id)
 
 
 # Script entry point: parse the command line and run the control plane.

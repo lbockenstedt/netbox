@@ -29,11 +29,69 @@ You rarely have to enter data into NetBox by hand: this module is the landing zo
 
 - NetBox REST via `pynetbox` (`NetboxEngine`). Default `http://localhost:8000`; gunicorn `127.0.0.1:8001` behind nginx :80 in full-app mode.
 - Kea Control Agent REST (`subnet4-add`) at `KEA_CTRL_URL` (default `http://localhost:8000`; `install_kea.sh` pins to **8760**).
-- Serves no port itself.
+- Optional NetBox-host certificate-agent listener: `:8444/ws/agent`, enabled
+  by `LM_NETBOX_AGENT_LISTENER=1` for standalone **or generic-hosted** NetBox.
+  Uses `/etc/lm-netbox-agent/config.json`, never the Proxmox PSK/config.
+
+### Managed certificate channel
+
+Keep the NetBox server's main `lm-agent` connected to the hub: SSO and admin
+operations depend on it. The `netbox-server` deploy role accepts
+`config.cert_spoke_url` (explicit `wss://host:port/ws/agent`) and
+`config.cert_ca_pem` (trusted listener CA PEM). It installs a separate
+`lm-netbox-cert-agent` device-mode service using the existing agent code,
+with independent identity `<hub-agent-id>-netbox-cert`, approval secret and
+install UUID under `/etc/lm-netbox-cert-agent/`. It does not replace `lm-agent`.
+Re-loading an installed `netbox-server` configures/repairs the channel without
+reinstalling NetBox; omitted channel fields preserve its saved association.
+Initial provisioning and a change of destination require explicit trust input.
+
+In **Setup → IPAM** or Managed Devices, select the certificate agent by name
+from the roster for the instance's associated IPAM spoke. A saved selection
+remains available while its agent is offline or the roster cannot be loaded.
+Changing spokes clears the previous spoke's selection; choose again. Saving and reconnecting
+both push this association. A blank association disables delivery; no connected
+host is selected implicitly. An unnamed pending row cannot be selected until
+approval supplies a hostname, avoiding ambiguous choices. Approve the separate device on that spoke through
+the existing agent approval flow. Only an authenticated, connected, explicitly
+associated agent receives private certificate material, including cached replay.
+The existing Setup Agents/My Devices roster and loopback admin roster include
+IPAM-hosted devices; their existing tenant filters and owning-spoke approval
+routing still apply. IPAM is not a hypervisor/VM resolver candidate.
+The deployment URL can use public DNS or private VNet reachability; its hostname
+must match the listener certificate. Trust is explicit: no unverified TLS or
+plaintext bootstrap. Listener setup can target `lm-agent` with
+`setup-agent-host.sh --service lm-agent` and explicit TLS certificate/key paths.
+Upgrade the NetBox role before enabling the listener: the generic host refuses
+to expose older role code without the scoped replay contract.
+
+On standalone and generic-hosted IPAM, the updated shared LM framework polls
+the listener certificate and key every 60 seconds. A changed, valid matching
+pair rebinds only the IPAM listener; connected devices briefly disconnect and
+reconnect. Missing, unreadable or mismatched renewal files leave the existing
+listener running and are retried; check the warning logs and certificate expiry.
+Install the shared LM update before the standalone NetBox update. Older shared
+frameworks log that the renewal watcher is unavailable and require a listener
+service restart after renewal. Renewals must retain a name and CA trusted by the
+certificate device; the watcher does not alter its trust bundle.
+
+`INSTALL_CERT` returns `DEFERRED` when the associated agent is offline or unset,
+`ERROR` for cache/write/helper/reload failures, and `SUCCESS` only after both
+file-write replies acknowledge `status=SUCCESS` and `result.ok=true`, followed
+by a successful install-helper reply. Reconnect
+replay runs after registration without blocking the listener's reply reader and
+logs its result. An older device returning Unknown command fails clearly.
+Historical hub ledger entries that falsely recorded cached-only SUCCESS require
+an explicit redeploy of the current certificate after setup; replay repairs the
+host but does not rewrite the ledger or certificate-monitor telemetry.
+Association changes cancel and await any old replay and serialize with direct
+installs; each subsequent sensitive operation rechecks the association. An RPC
+already dispatched to a device cannot be recalled remotely, so a change waits
+for an in-flight direct install to stop or complete before it is acknowledged.
 
 ## Environment variables
 
-`NETBOX_URL` (`http://localhost:8000`), `NETBOX_API_TOKEN` (required), `KEA_CTRL_URL` (`http://localhost:8000` — override to 8760 on hub-colocated), `SPOKE_SECRET`, `HUB_SECRET`. `_persist_env()` writes `NETBOX_API_TOKEN`/`NETBOX_URL` back to `.env` on `UPDATE_CONFIG`.
+`NETBOX_URL` (`http://localhost:8000`), `NETBOX_API_TOKEN` (required), `KEA_CTRL_URL` (`http://localhost:8000` — override to 8760 on hub-colocated), `SPOKE_SECRET`, `HUB_SECRET`. `_persist_env()` writes `NETBOX_API_TOKEN`/`NETBOX_URL` back to `.env` on `UPDATE_CONFIG`. Certificate hosting uses `LM_NETBOX_AGENT_LISTENER`, `LM_NETBOX_AGENT_PORT` (8444), and `LM_NETBOX_TLS_CERT`/`LM_NETBOX_TLS_KEY`; the non-secret `NETBOX_CERT_AGENT_ID` association is saved from the instance's `cert_agent_id`.
 
 ## Install flags
 
@@ -47,17 +105,23 @@ Sync family:
 - `NETBOX_SYNC_DHCP` — background KEA sync loop (`_kea_sync_loop`, 300s): `get_dhcp_prefixes` → POST `subnet4-add` per scope with derived pool range + routers option.
 - `NETBOX_SYNC_VMS` — `sync_vms(vms, tenant_slug, replace, source_of_truth)`: Proxmox→NetBox VM sync; matches by `proxmox_unique_id` cf; tag-driven tenant attribution; `replace=True` deletes proxmox-sourced VMs absent from the pull; `source_of_truth` `external` (Proxmox overwrites) or `netbox` (only-add-missing).
 - `NETBOX_SYNC_DEVICES` — `sync_devices(devices, tenant_slug, replace, defaults, source, source_of_truth)`: discovery-source (opnsense DHCP/ARP or nw ARP) → DCIM device + IP upsert; `source` stamps `discovered_from` and scopes replace-delete; a device stamped with `last_seen` is never replace-deleted, it ages out via the staleness sweep (offline at 7 days, deleted 30 days later).
-- `NETBOX_SYNC_NW_DEVICE` — `sync_nw_device(device, interfaces, …)`: per-switch/gateway POLL NOW upsert into `dcim.device` + `dcim.interfaces` + per-interface IPs; matches by `nw_device_id` cf; marks interfaces `nw_managed`. Matching reads the spoke's device cache (see **Device cache** below), not NetBox; only a box the cache doesn't know is looked up by serial / MAC / name before it is created. A cached device NetBox no longer has (deleted in the UI) is created again on its next push.
-- `NETBOX_SYNC_ACCESS_TRACKER` — `sync_access_tracker(...)`: ClearPass sessions → only-add-missing (replace always False): device per MAC, NIC interface, framed IP, cable to a switch port interface.
+- `NETBOX_SYNC_NW_DEVICE` — `sync_nw_device(device, interfaces, …)`: per-switch/gateway POLL NOW upsert into `dcim.device` + `dcim.interfaces` + per-interface IPs; matches by `nw_device_id` cf; marks interfaces `nw_managed`. Interface MACs (here, in the VM sync and on access-tracker NICs) are written as NetBox 4.2+ `dcim.mac-addresses` records set as the interface's primary MAC, and only when the MAC NetBox shows differs: the interface's own `mac_address` field is read-only, and writing it re-PATCHed every interface on every poll.
+  Matching reads the spoke's device cache, not NetBox; only a box the cache doesn't know is looked up by serial / MAC / name before it is created. A cached device NetBox no longer has (deleted in the UI) is created again on its next push.
 - `NETBOX_SYNC_LLDP` — `sync_lldp_links(links, tenant_slug)`: hub topology links → cables via `_cable_devices` (never overwrites a human's cable). Matches ends against the device cache (an unknown end is looked up by serial / MAC / name before it is created). A `tenant_slug` NetBox does not have returns `status: ERROR` and writes nothing. With a `tenant_slug`, names, IPs, fleet ids and short names match only that tenant's devices and untenanted ones; MACs and serials match every tenant, so a box another tenant holds is recognised and never created again, but it is left alone: no update, no rename and no cable, and the end is skipped with a message. When a lookup returns several devices a serial or MAC match beats a name match (as in the ladder, so another tenant's hardware is refused even when one of the tenant's devices shares the name), then the tenant's own device wins (also in the cached index, where it beats an untenanted device with the same key), then an untenanted one, then the lowest id. A refused end is not remembered by name, so another end with that name and the tenant's own MAC is still matched and lists each device's interfaces once per push, so an unchanged link costs no per-port requests. A missing cached port is checked by device ID and name before creation; a concurrent interface-create conflict is recovered by re-reading that exact port and checking its cable. Newly resolved ports stay in the batch index even when cabling is skipped or fails.
-- `NETBOX_RESERVE_STATIC_HOSTS` — `netbox_static_reservations.reserve_static_hosts(engine, data, …)`: the static-hosts → DHCP reservations pass (lm `docs/dhcp.md`). The hub relays per tenant the raw agent `GET_HOST_ADDRESSING` rows, sweep/ARP observations and a strict Kea lease/subnet read; this spoke reads the tenant's prefixes/IPs, plans (`plan_static_reservations`; conflicts are reported, never overwritten) and writes `mac_address` + `dhcp_reservation` as exact compare-and-sets, reporting each as `{before, after}`. An IP changed or deleted by another writer since the read is a conflict; a write NetBox refuses rolls back the pass's earlier writes; `{"rollback": changes}` undoes a pass where NetBox still holds `after` and reports later edits it left alone as `rollback_kept`. At most `max_writes` (25) per pass; a failed address waits an hour. The report's `skipped_reasons` counts skipped IPs per reason (no addresses), and `skipped_by_ref` the same per tenant ref, so the hub can say why nothing was reserved and show each tenant only its own counts. Runs as a background command (paced) and drops the list cache after a write.
+- `NETBOX_SYNC_ACCESS_TRACKER` — `sync_access_tracker(...)`: ClearPass sessions → only-add-missing (replace always False): device per MAC, NIC interface, framed IP, cable to a switch port interface.
+- `NETBOX_RESERVE_STATIC_HOSTS` — `netbox_static_reservations.reserve_static_hosts(engine, data, …)`: the static-hosts → DHCP reservations pass (lm [docs/dhcp.md](dhcp.md#static-hosts-become-reservations)). The hub relays per tenant the raw agent `GET_HOST_ADDRESSING` rows, sweep/ARP observations and a strict Kea lease/subnet read; this spoke reads the tenant's prefixes/IPs, plans (`plan_static_reservations`; conflicts are reported, never overwritten) and writes `mac_address` + `dhcp_reservation` as exact compare-and-sets, reporting each as `{before, after}`. An IP changed or deleted by another writer since the read is a conflict; a write NetBox refuses rolls back the pass's earlier writes; `{"rollback": changes}` undoes a pass where NetBox still holds `after` and reports later edits it left alone as `rollback_kept`. At most `max_writes` (25) per pass; a failed address waits an hour. The report's `skipped_reasons` counts skipped IPs per reason (no addresses), and `skipped_by_ref` the same per tenant ref, so the hub can say why nothing was reserved and show each tenant only its own counts. Runs as a background command (paced) and drops the list cache after a write.
 - `NETBOX_REPLACE_RESERVATION_MAC` — `netbox_static_reservations.replace_reservation_mac(engine, data, …)`: device replacement. An IP NetBox reserves for old MAC A whose host now answers with B is moved A→B on the IP and on its interface's MAC (the primary `dcim.mac-addresses` record on NetBox 4.2+, else the interface's `mac_address`), both as compare-and-sets with `{before, after}` and the same rollback. The pass does it automatically (`auto_replace`) once the hub's `replace_watch` shows B for 30 minutes over two passes and A unseen for a day; this command is the "Use new MAC" button, which skips those waits but keeps every other check. Contract in `API_SPEC.md`.
 - `NETBOX_STALENESS_SWEEP` — `staleness_sweep(stale_days=7, delete_days=30)`: not seen `stale_days` → offline + `decommissioned_at`; offline + aged `delete_days` → deleted (IPs freed).
 - `NETBOX_TENANT_VMID_RANGE` — tenant `vmid_start`/`vmid_end` cf + in-use `proxmox_vmid` for hub VMID auto-allocation.
 - `NETBOX_PROVISION_CUSTOM_FIELDS` — `force=True` re-run of `_ensure_custom_fields` (WebUI "Apply schema changes" button).
 - `NETBOX_GET_TENANT_GROUPS` — `get_tenant_groups()`: every NetBox tenant group with its **transitive** member tenants (a group owns its own tenants plus those of all descendant groups). Feeds the hub's tenant-group pseudo-tenants; see below.
 
+Auto-rack: `NETBOX_AUTORACK_SWEEP` (dry-run / apply / cached report of the rack-from-name sweep), `NETBOX_NW_DEVICE` (stores a polled device in the on-disk NW inventory; applied by the scheduled flush), `NETBOX_LIST_STUBS` / `NETBOX_MERGE_STUB` (duplicate-stub merge, see below; `NETBOX_MERGE_STUB` is a `_PICKLIST_MUTATIONS` member).
+
+Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
+
 **Device cache** (`src/netbox_device_cache.py`). Paging every NetBox device to answer "does this box exist?" was about 60% of NetBox's load, so the spoke keeps its own copy and treats NetBox as a write target for the discovery feeds:
+
 - *Layout.* A slim identity index in memory (id, tenant, name, serial, role slug, primary IPv4, last_updated and the `mac_address` / `nw_device_id` / `discovered_from` custom fields). Full rows on disk, one JSON file per tenant: `/var/lib/lm/netbox/devices/<tenant-slug>.json` (`_none.json` for no tenant; `LM_NETBOX_DEVICE_CACHE_DIR` overrides the directory), keeping id, name, serial, role, device_type, status, site, tenant, rack, primary_ip4, url, last_updated and custom_fields. Every file is written atomically (temp file, then rename).
 - *Following writes.* A `requests` response hook on the engine's NetBox session applies every device create, update (including bulk PATCH), delete and single-device read the spoke makes. Every device delete LM makes goes through that session and so leaves the cache: a single `Record.delete()` (`NETBOX_DELETE_DEVICE`, `replace=True` deletes, sibling-stub and live-poll merges, dedupe merges, the staleness sweep) and a bulk `devices.delete([...])` (the ids are read from the request body). No code deletes devices with a raw HTTP call, and the session is only replaced in `__init__` and `reconnect`, which hook the new one at once; so the reconcile never recreates a device LM itself deleted. A read (a single-device GET or a lookup) never overwrites a cached scanner-owned device, so an edit made in NetBox is not adopted before the reconcile puts it back. Nothing polls NetBox. Writes seen while NetBox is being paged (a rebuild or a reconcile listing) are replayed over the listing, so they are not lost or rolled back.
 - *Rebuild.* `_meta.json` lists the tenant files. NetBox is paged in full only when `_meta.json` or a listed tenant file is missing or unreadable (at start-up or while running), from an older format (including the single `device_cache.json` of earlier releases, removed on rebuild), or for another NetBox URL. That is one walk.
@@ -68,13 +132,11 @@ Sync family:
   Every revert or recreate is logged (device id and field names) and appended with before/after values to `_reconcile.jsonl` in the cache directory (rolled to `.1` past 1 MB). Devices that are not scanner-owned (human-made, or from other feeds) are never written by the reconcile; the cache takes NetBox's copy. One of those deleted in NetBox drops out of the cache and its feed creates it again on its next sync.
 - *Known gaps.* A tenant is reconciled only once it has a cached device; devices added in NetBox to a tenant LM has never written to are found by the lookups before create. NetBox clears a device's `primary_ip4` server-side when the IP is reassigned or deleted elsewhere; the cached value can lag until that tenant's next reconcile. A device that is not scanner-owned and was moved to another tenant in NetBox drops out of the cache at the old tenant's reconcile until the new tenant's reconcile, or a lookup before create, finds it again.
 
-Auto-rack: `NETBOX_AUTORACK_SWEEP` (dry-run / apply / cached report of the rack-from-name sweep), `NETBOX_NW_DEVICE` (stores a polled device in the on-disk NW inventory; applied by the scheduled flush), `NETBOX_LIST_STUBS` / `NETBOX_MERGE_STUB` (duplicate-stub merge, see below; `NETBOX_MERGE_STUB` is a `_PICKLIST_MUTATIONS` member).
-
-Plus `GET_VERSION`, `UPDATE_CONFIG`, `SPOKE_UPDATE`.
-
 ## Key files
 
-`src/netbox_spoke.py` (dispatch, KEA loop, `_persist_env`), `src/netbox_engine.py` (~154-line composition class `NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, TenancyMixin)` — the work lives in the mixin modules: `netbox_dcim.py`, `netbox_ipam.py`, `netbox_vmsync.py` (also `_ensure_custom_fields`), `netbox_sync.py` (the largest — `sync_devices`/`sync_vms`/`sync_nw_device`/`sync_access_tracker`/`_journal`), `netbox_staleness.py` (`staleness_sweep`), `netbox_changelog.py`, `netbox_tenancy.py`), `src/netbox_static_reservations.py` (static hosts → DHCP reservations: planner, compare-and-set writes, rollback), `src/netbox_autorack.py` (`parse_rack_name`, pure `plan()`, `resolve_rack`, the sweep), `src/netbox_xlsx.py` (pure-parse Excel rack-layout detection — `detect_rack_sheets` for both sheet shapes + `parse_one_rack_sheet`/`parse_summary_block_by_name` commit-time re-parse; lazy openpyxl), `src/custom_fields_spec.py` (pure-data `CUSTOM_FIELDS_SPEC` — single source of truth for the engine self-heal, the Django shell block, and the REST provisioning block), `src/control_plane.py`, `install.sh`, `install_kea.sh`, `API_SPEC.md`.
+`src/netbox_device_cache.py` maintains the device cache; `src/netbox_static_reservations.py` implements static-host planning, compare-and-set writes and rollback.
+
+`src/netbox_spoke.py` (dispatch, KEA loop, `_persist_env`), `src/netbox_engine.py` (~154-line composition class `NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin, StalenessMixin, TenancyMixin)` — the work lives in the mixin modules: `netbox_dcim.py`, `netbox_ipam.py`, `netbox_vmsync.py` (also `_ensure_custom_fields`), `netbox_sync.py` (the largest — `sync_devices`/`sync_vms`/`sync_nw_device`/`sync_access_tracker`/`_journal`), `netbox_staleness.py` (`staleness_sweep`), `netbox_changelog.py`, `netbox_tenancy.py`), `src/netbox_autorack.py` (`parse_rack_name`, pure `plan()`, `resolve_rack`, the sweep), `src/netbox_xlsx.py` (pure-parse Excel rack-layout detection — `detect_rack_sheets` for both sheet shapes + `parse_one_rack_sheet`/`parse_summary_block_by_name` commit-time re-parse; lazy openpyxl), `src/custom_fields_spec.py` (pure-data `CUSTOM_FIELDS_SPEC` — single source of truth for the engine self-heal, the Django shell block, and the REST provisioning block), `src/control_plane.py`, `install.sh`, `install_kea.sh`, `API_SPEC.md`.
 
 ## Notable behaviors & gotchas
 
@@ -201,7 +263,7 @@ backend), `TENANT` the tenant group. A trailing `R` on the RU means **rear**.
   racked immediately**, then runs an autorack sweep. Device polls run every 6 h
   by default, so a rename typically shows up racked within one flush after the
   next poll (the first rename test took about 15-45 minutes end to end).
-  When the agent reloads the role (every netbox update), it calls
+  When the agent reloads the role (every NetBox update), it calls
   `stop_background_loops()`, which cancels this flush loop and the Kea sync loop
   so the old code does not keep running next to the new.
 - **Report.** `GET /api/netbox/autorack` (tenant-scoped) feeds **NetBox → Rack
@@ -230,8 +292,11 @@ keeps its history; the stub's few changelog entries are lost).
    those in the same /16 as the device, probes each stub IP through the device's
    own nw spoke (`NW_GET_DEVICE_INFO` with an `address` override, so the
    device's credentials are tried against that IP) and, when the returned serial
-   equals the device's, sends `NETBOX_MERGE_STUB`. Limits: one probe per
-   stub/device pair per 24 h and 5 probes per call. A stub that has since gained
+   equals the device's, sends `NETBOX_MERGE_STUB`. Limits: one probe per stub
+   per login (agent, driver, vault credential, username) per 24 h, whose answered
+   serial is reused by every device with that login; a failed probe (timeout,
+   login refused, spoke offline) is retried after 1 h. At most 5 probes per call;
+   stubs over that budget wait for the next call. A stub that has since gained
    a different serial is never merged.
 
 ## Rack elevation view
