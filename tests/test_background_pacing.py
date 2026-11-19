@@ -56,9 +56,13 @@ def test_user_requests_are_not_paced(monkeypatch):
     _slow_netbox(monkeypatch)
     adapter = netbox_engine._DefaultTimeoutHTTPAdapter(30)
     netbox_engine.run_as_background(adapter.send, None)  # a feed just used NetBox
+    # Put the next background turn 5s away, so a paced user request would wait
+    # about 5s while an unpaced one takes REQUEST_S. The 2.5s bound sits far
+    # from both, so a busy CI runner can't flip it (fleet rule 9.4).
+    monkeypatch.setattr(netbox_engine, "_background_next", time.monotonic() + 5.0)
     start = time.monotonic()
     adapter.send(None)
-    assert time.monotonic() - start < REQUEST_S * 1.8
+    assert time.monotonic() - start < 2.5
 
 
 def test_only_background_commands_run_paced():
