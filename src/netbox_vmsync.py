@@ -536,12 +536,8 @@ class VmSyncMixin:
                 if iface is None:
                     # New interface (the MAC is set below).
                     kw: Dict[str, Any] = {"virtual_machine": vm_obj.id, "name": name}
-                    # Create and journal it.
+                    # Create interface (journal dropped — NetBox does not support journal entries on interfaces).
                     iface = self.nb.virtualization.interfaces.create(**kw)
-                    self._journal("virtualization.vminterface", iface.id,
-                                   "hypervisor-vm-sync",
-                                   note=f"vminterface {name} for VM "
-                                        f"{getattr(vm_obj, 'name', '')}")
                 # Set the MAC when NetBox doesn't show it yet; failure is only logged.
                 try:
                     self._set_iface_mac(iface, mac, "virtualization.vminterface")
@@ -576,13 +572,14 @@ class VmSyncMixin:
                         hostname=vm_name,
                         mac=mac, source="hypervisor-vm-sync",
                         iface_type="virtualization.vminterface")
-                    # Journal the IP.
-                    self._journal("ipam.ipaddress", ip_obj.id,
-                                   "hypervisor-vm-sync",
-                                   note=f"VM {vm_name} {name}")
-                    # Remember the first IP for primary_ip4.
-                    if first_ip_id is None:
-                        first_ip_id = getattr(ip_obj, "id", None)
+                    # Journal the IP if successfully created/reused.
+                    if ip_obj is not None:
+                        self._journal("ipam.ipaddress", ip_obj.id,
+                                       "hypervisor-vm-sync",
+                                       note=f"VM {vm_name} {name}")
+                        # Remember the first IP for primary_ip4.
+                        if first_ip_id is None:
+                            first_ip_id = getattr(ip_obj, "id", None)
                 except Exception as e:
                     # Record the failure.
                     _record_fail(f"IP {ip_str} on {name} for VM {vm_name} failed", e)

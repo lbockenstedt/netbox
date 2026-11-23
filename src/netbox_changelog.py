@@ -1,11 +1,12 @@
 """Change-log journaling + IP-reuse/reassign helpers for NetboxEngine."""
 # Standard-library logging; shares the "NetboxEngine" logger with the engine.
+import ipaddress
 import logging
 import os
 # datetime/timezone build and parse the UTC timestamps written to NetBox.
 from datetime import datetime, timezone
 # Type hints.
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 # Same logger name as the engine so all NetBox messages appear together.
 logger = logging.getLogger("NetboxEngine")
@@ -25,14 +26,54 @@ def _aot(ipobj: Any) -> Any:
     return aot
 
 
-def _ref_id(ref: Any) -> Any:
+def _is_unassignable_or_non_host_ip(addr: str) -> bool:
+    """Return True if *addr* is loopback, multicast, link-local, unspecified,
+    reserved, 0.0.0.0/8, or a subnet network/broadcast (prefix < 31 v4 / < 127 v6).
+    Private and ULA host addresses return False."""
+    if not addr:
+        return True
+    try:
+        iface = ipaddress.ip_interface(str(addr).strip())
+    except (ValueError, TypeError):
+        return True
+
+    ip = iface.ip
+    prefixlen = iface.network.prefixlen
+
+    if ip.is_loopback or ip.is_multicast or ip.is_link_local or ip.is_unspecified or ip.is_reserved:
+        return True
+    if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.IPv4Network("0.0.0.0/8"):
+        return True
+
+    net = iface.network
+    if isinstance(ip, ipaddress.IPv4Address):
+        if prefixlen < 31:
+            if ip == net.network_address or ip == net.broadcast_address:
+                return True
+    else:
+        if prefixlen < 127:
+            if ip == net.network_address:
+                return True
+
+    return False
+
+
+def _ref_id(ref: Any) -> Optional[int]:
     """Id of a pynetbox reference: a Record, a nested dict, or a bare id.
-    (A Record never equals an int, so compare ids, not objects.)"""
-    # Nested dict reference: take its "id" key.
+    Returns integer ID or None."""
+    if ref is None:
+        return None
     if isinstance(ref, dict):
-        return ref.get("id")
-    # Record: use .id; a bare id has no .id and is returned unchanged.
-    return getattr(ref, "id", ref)
+        ref = ref.get("id")
+    else:
+        ref = getattr(ref, "id", ref)
+    if ref is None:
+        return None
+    try:
+        val = int(ref)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
 
 
 class ChangelogMixin:
@@ -40,21 +81,141 @@ class ChangelogMixin:
 
     # ── change-log + IP-reuse helpers (shared by the external-source syncs) ────
 
+    def _conflict_memo(self) -> Dict[int, Optional[int]]:
+        """Bounded memo mapping ip_id -> parent_device_id when IP is a primary IP (or None if not)."""
+        m = getattr(self, "_primary_ip_conflict_memo", None)
+        if m is None:
+            m = self._primary_ip_conflict_memo = {}
+        if len(m) > 1000:
+            m.clear()
+        return m
+
+    def _conflict_log_set(self) -> Set[tuple]:
+        """Bounded set of (ip_id, dev_id, target_iface_id) logged keys."""
+        s = getattr(self, "_logged_primary_conflicts", None)
+        if s is None:
+            s = self._logged_primary_conflicts = set()
+        if len(s) > 1000:
+            s.clear()
+        return s
+
+    def _is_primary_ip_conflict(
+        self,
+        ipobj: Any,
+        target_iface_id: int,
+        iface_type: str,
+        source: str,
+        addr: str,
+    ) -> bool:
+        """Return True if *ipobj* is the designated primary IP of its parent
+        device and must not be reassigned to *target_iface_id* on a device."""
+        assigned_to = _ref_id(getattr(ipobj, "assigned_object_id", None))
+        if assigned_to == target_iface_id:
+            return False
+        if iface_type != "dcim.interface":
+            return False
+
+        ip_id = _ref_id(getattr(ipobj, "id", None))
+        if ip_id is None:
+            return False
+
+        memo = self._conflict_memo()
+        dev_id: Optional[int] = None
+        dev_name = ""
+        if ip_id in memo:
+            dev_id = memo[ip_id]
+            if dev_id is None:
+                return False
+        else:
+            old_aot = _aot(ipobj)
+            if old_aot != "dcim.interface" or not assigned_to:
+                memo[ip_id] = None
+                return False
+
+            assigned_obj = getattr(ipobj, "assigned_object", None)
+            if isinstance(assigned_obj, dict):
+                dev_ref = assigned_obj.get("device")
+                dev_id = _ref_id(dev_ref)
+                if isinstance(dev_ref, dict):
+                    dev_name = dev_ref.get("name", "")
+            elif assigned_obj is not None:
+                dev_ref = getattr(assigned_obj, "device", None)
+                dev_id = _ref_id(dev_ref)
+                dev_name = getattr(dev_ref, "name", "")
+
+            if not dev_id:
+                try:
+                    iface = self.nb.dcim.interfaces.get(assigned_to)
+                    if iface:
+                        dev_ref = getattr(iface, "device", None)
+                        dev_id = _ref_id(dev_ref)
+                        if isinstance(dev_ref, dict):
+                            dev_name = dev_ref.get("name", "")
+                        elif dev_ref:
+                            dev_name = getattr(dev_ref, "name", "")
+                except Exception as e:
+                    logger.debug("%s: lookup interface %s for IP %s failed: %s",
+                                 source, assigned_to, addr, e)
+
+            if not dev_id:
+                memo[ip_id] = None
+                return False
+
+            is_primary = False
+            dev_row = None
+            if hasattr(self, "_device_cache"):
+                try:
+                    dev_row = self._device_cache().full_row(dev_id)
+                except Exception:
+                    dev_row = None
+            if dev_row:
+                dev_name = dev_row.get("name") or dev_name
+                p4 = _ref_id(dev_row.get("primary_ip4"))
+                p6 = _ref_id(dev_row.get("primary_ip6"))
+                if p4 == ip_id or p6 == ip_id:
+                    is_primary = True
+            else:
+                try:
+                    dev_obj = self.nb.dcim.devices.get(dev_id)
+                    if dev_obj:
+                        dev_name = getattr(dev_obj, "name", "") or dev_name
+                        p4 = _ref_id(getattr(dev_obj, "primary_ip4", None))
+                        p6 = _ref_id(getattr(dev_obj, "primary_ip6", None))
+                        if p4 == ip_id or p6 == ip_id:
+                            is_primary = True
+                except Exception as e:
+                    logger.debug("%s: lookup device %s for primary IP check failed: %s",
+                                 source, dev_id, e)
+
+            memo[ip_id] = dev_id if is_primary else None
+            if not is_primary:
+                return False
+
+        key = (ip_id, dev_id, target_iface_id)
+        log_set = self._conflict_log_set()
+        if key not in log_set:
+            log_set.add(key)
+            logger.info(
+                "%s: skip reassigning IP %s (id=%s) to interface %s: "
+                "designated as primary IP for device %s (id=%s)",
+                source, addr, ip_id, target_iface_id,
+                dev_name or dev_id, dev_id,
+            )
+        return True
+
     def _journal(self, content_type: str, object_id: Any, module: str,
                  note: str = "") -> None:
         """Write a NetBox **journal entry** on ``object_id`` (of NetBox content
-        type ``dcim.device`` / ``ipam.ipaddress`` / ``dcim.interface`` /
+        type ``dcim.device`` / ``ipam.ipaddress`` /
         ``virtualization.virtualmachine`` / ``dcim.cable``) recording which LM
-        sync module created it and when. The Journal tab is NetBox's native
-        per-object change log, so this is the audit trail the user asked for
-        ("comments to the change log for what module added the entry and when").
+        sync module created it and when.
 
-        Best-effort by design: a journal failure (older NetBox without the
-        journal endpoint, a content-type mismatch, a transient 4xx) must NEVER
-        break a sync — it's logged at DEBUG and swallowed.
+        Best-effort by design: a journal failure must NEVER break a sync.
         """
-        # Nothing was created, so there is nothing to journal.
-        if not object_id:
+        oid = _ref_id(object_id)
+        if not oid or oid <= 0:
+            return
+        if content_type.endswith(".interface") or content_type.endswith(".vminterface"):
             return
         # Journal errors are logged and swallowed below (see docstring).
         try:
@@ -79,7 +240,7 @@ class ChangelogMixin:
                             bare_ip: str, iface_id: int, tenant: Any = None,
                             hostname: str = "", mac: str = "",
                             source: str = "sync",
-                            iface_type: str = "dcim.interface") -> Any:
+                            iface_type: str = "dcim.interface") -> Optional[Any]:
         """Return an ``ipam.ip_address`` for ``addr`` (``host/prefix``), reusing
         an existing **global** record when one already exists and reassigning it
         to ``iface_id``, else creating a new one.
@@ -113,6 +274,11 @@ class ChangelogMixin:
             # No tenant at all: look anywhere.
             lookup = {}
 
+        # Skip unassignable or non-host addresses before lookup
+        if _is_unassignable_or_non_host_ip(addr) or _is_unassignable_or_non_host_ip(bare_ip):
+            logger.debug("%s: skip unassignable or non-host IP %s", source, addr)
+            return None
+
         # 1) Proactive reuse: an exact host/prefix match already exists.
         # Look up the exact address; a lookup error just means "not found".
         ipobj = None
@@ -122,6 +288,8 @@ class ChangelogMixin:
             logger.debug("%s: existing-IP lookup %s failed: %s", source, addr, e)
         # Found an existing record: move it to this interface instead of creating one.
         if ipobj:
+            if self._is_primary_ip_conflict(ipobj, iface_id, iface_type, source, addr):
+                return None
             ok = self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, addr,
                                    iface_type)
             # Reassign failed: raise so the caller records the error.
@@ -153,6 +321,8 @@ class ChangelogMixin:
                 raise create_err
             # Reuse the first match and move it to this interface.
             ipobj = matches[0]
+            if self._is_primary_ip_conflict(ipobj, iface_id, iface_type, source, bare_ip):
+                return None
             ok = self._reassign_ip(ipobj, iface_id, tenant, hostname, mac, source, bare_ip,
                                    iface_type)
             # Reassign failed: raise so the caller records the error.
