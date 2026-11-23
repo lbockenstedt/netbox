@@ -965,7 +965,13 @@ class SyncMixin:
         name_scope = {"tenant_id": tenant_id} if tenant_id else {}
         for key, vals, scope in (("serial", serials, {}), ("cf_mac_address", macs, {}),
                                  ("name__ie", names, name_scope)):
-            vals = sorted({str(v).strip() for v in vals if str(v or "").strip()})
+            if key == "serial":
+                vals = sorted(
+                    {s for v in vals if str(v or "").strip()
+                     for s in (str(v).strip(), str(v).strip().lower(), str(v).strip().upper())}
+                )
+            else:
+                vals = sorted({str(v).strip() for v in vals if str(v or "").strip()})
             if vals:
                 found += self._api_get_all("/api/dcim/devices/", {"limit": 500, key: vals, **scope})
         if found:
