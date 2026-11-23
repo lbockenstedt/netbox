@@ -370,9 +370,12 @@ class DcimMixin:
             # Cable them.
             return self._cable_devices(dev_a, a_port, dev_b, b_port, status)
         except Exception as e:
-            # Log and return the error.
-            logger.error("sync_cable failed: %s", e)
-            return {"status": "ERROR", "message": str(e)}
+            err_str = str(e)
+            if "404" in err_str or "not found" in err_str.lower():
+                logger.warning("sync_cable skipped: %s", e)
+            else:
+                logger.error("sync_cable failed: %s", e)
+            return {"status": "ERROR", "message": err_str}
 
     def _device_by_name(self, name: str):
         """A NetBox device by name, ignoring case and the domain suffix:
@@ -513,9 +516,15 @@ class DcimMixin:
             return {"status": "SUCCESS",
                     "message": f"cabled {a_device}:{a_port} <-> {b_device}:{b_port}"}
         except Exception as e:
-            # Log and return the error.
-            logger.error("sync_cable failed: %s", e)
-            return {"status": "ERROR", "message": str(e)}
+            if port_index is not None:
+                port_index.pop(getattr(dev_a, "id", None), None)
+                port_index.pop(getattr(dev_b, "id", None), None)
+            err_str = str(e)
+            if "404" in err_str or "not found" in err_str.lower():
+                logger.warning("sync_cable skipped (interface not found): %s", e)
+            else:
+                logger.error("sync_cable failed: %s", e)
+            return {"status": "ERROR", "message": err_str}
 
     def normalize_device_names(self, tenant_slug: str = "") -> Dict[str, Any]:
         """Upper-case every existing device name (``NETBOX_NORMALIZE_DEVICE_NAMES``).

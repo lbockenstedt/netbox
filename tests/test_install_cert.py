@@ -117,8 +117,8 @@ def _make_spoke(store, control_plane=None):
     sp._cert_store = store
     sp.cert_agent_id = "agent-1"
     sp._cert_replay_tasks = {}
-    sp._cert_lock = asyncio.Lock()
-    sp._cert_association_lock = asyncio.Lock()
+    sp._cert_lock_obj = None
+    sp._cert_association_lock_obj = None
     sp._cert_update_pending = False
     return sp
 

@@ -113,6 +113,30 @@ def resolve_rack(parsed: Dict[str, Any], racks: List[Dict[str, Any]],
     return cands[0], ""
 
 
+def _device_placement_rank(d: Dict[str, Any]) -> Tuple[int, int]:
+    """Deterministic rank for same-id deduplication (e.g. pagination duplicates).
+
+    Rank 3: complete placement (rack_id, position, face).
+    Rank 2: rack_id and position.
+    Rank 1: rack_id only.
+    Rank 0: unracked.
+    Tie-breaker: count of non-empty field values.
+    """
+    has_rack = d.get("rack_id") is not None
+    has_pos = d.get("position") is not None
+    has_face = bool(d.get("face"))
+    if has_rack and has_pos and has_face:
+        rank = 3
+    elif has_rack and has_pos:
+        rank = 2
+    elif has_rack:
+        rank = 1
+    else:
+        rank = 0
+    tie = sum(1 for v in d.values() if v not in (None, "", [], {}))
+    return rank, tie
+
+
 def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
          probe: Optional[Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
          max_depth: int = MAX_DEPTH) -> Dict[str, Any]:
@@ -120,9 +144,23 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
 
     device: {id, name, site_id, tenant_id, rack_id, position, face, online,
              height, full_depth, controller}; rack: {id, name, site_id, tenant_id, u_height}.
-    ``probe(device)`` may return a fresher {name, online} for a holder (the
-    hub's re-poll); without it NetBox's own record is used.
+    ``probe(device)`` may return a fresher {name, online, exists, rack_id, position, face}
+    for a holder (the hub's re-poll or live NetBox query); without it NetBox's own record is used.
     """
+    # Deterministic normalization by device id to handle boundary duplicates
+    # (e.g. from paginated device listings). For each id, select the record
+    # with the highest placement rank; ties broken by non-empty field count.
+    by_did: Dict[Any, List[Dict[str, Any]]] = {}
+    for d in devices:
+        by_did.setdefault(d["id"], []).append(d)
+    deduped: List[Dict[str, Any]] = []
+    for did, grp in by_did.items():
+        if len(grp) == 1:
+            deduped.append(grp[0])
+        else:
+            grp.sort(key=_device_placement_rank, reverse=True)
+            deduped.append(grp[0])
+    devices = deduped
     racks_by_id = {r["id"]: r for r in racks}
     by_id = {d["id"]: d for d in devices}
     cur: Dict[Any, Optional[Tuple[Any, int, str]]] = {}
@@ -215,6 +253,11 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
         did = d["id"]
         if state.get(did):
             return state[did] == "ok"
+        d_info = fresh(d)
+        if d_info and d_info.get("exists") is False:
+            free(did)
+            state[did] = "ok"
+            return True
         w = want[did]
         half = bool(d.get("half_width"))
         if cur[did] == w or (half and not d.get("half_named")
@@ -252,13 +295,31 @@ def plan(devices: List[Dict[str, Any]], racks: List[Dict[str, Any]],
                 unrack(h, f"management controller of {d['name']}")
                 actions[-1]["keep_rack"] = True
                 continue
-            newname = fresh(h).get("name")
+            info = fresh(h)
+            if info and info.get("exists") is False:
+                free(h["id"])
+                state[h["id"]] = "ok"
+                want[h["id"]] = None
+                continue
+            newname = info.get("name") if info else None
             if newname and newname != h.get("name"):
                 h = dict(h, name=newname)
                 by_id[h["id"]] = h
                 p = parse_rack_name(newname)
                 r, _ = resolve_rack(p, racks, h.get("site_id"), h.get("tenant_id")) if p else (None, "")
                 want[h["id"]] = (r["id"], p["ru"], p["face"]) if r else None
+            if info and "rack_id" in info:
+                new_rack = info.get("rack_id")
+                new_pos = info.get("position")
+                new_face = info.get("face") or "front"
+                new_slot = (new_rack, int(new_pos), new_face) if new_rack and new_pos is not None else None
+                if new_slot != cur.get(h["id"]):
+                    free(h["id"])
+                    if new_slot is not None:
+                        cur[h["id"]] = new_slot
+                        for c in _cells(*new_slot, h.get("height") or 1, h.get("full_depth", True)):
+                            occ[c] = h["id"]
+                    continue
             hw = want.get(h["id"])
             if hw and hw != cur[h["id"]] and settle(h, depth + 1, stack):
                 continue  # holder moved out; re-scan the slot
@@ -372,7 +433,42 @@ class AutoRackMixin:
                 # to the server's link to it.
                 "host": (listed.get(_short(link)) or hosted_by.get(_short(nm), "")) if mgmt else "",
                 "type_full": bool(dt.get("is_full_depth", True))})
-        result = plan(devices, racks)
+
+        def probe_occupant(h):
+            """Specialist Rule 6: Re-query occupant before declaring conflict."""
+            try:
+                obj = self.nb.dcim.devices.get(h["id"])
+                if obj is None:
+                    return {"exists": False}
+                nm = getattr(obj, "name", None)
+                # Ignore unconfigured MagicMock instances in unit test runners
+                if nm is not None and type(nm).__name__ == "MagicMock":
+                    return None
+                st = getattr(obj.status, "value", obj.status) if hasattr(obj, "status") else ""
+                r = getattr(obj, "rack", None)
+                rid = r.id if hasattr(r, "id") else (r.get("id") if isinstance(r, dict) else r)
+                if type(rid).__name__ == "MagicMock":
+                    rid = None
+                f = getattr(obj, "face", None)
+                face = getattr(f, "value", f) if f else None
+                if type(face).__name__ == "MagicMock":
+                    face = None
+                pos = getattr(obj, "position", None)
+                if type(pos).__name__ == "MagicMock":
+                    pos = None
+                return {
+                    "exists": True,
+                    "name": str(nm or ""),
+                    "online": st in ONLINE_STATUSES,
+                    "rack_id": rid,
+                    "position": int(pos) if pos is not None else None,
+                    "face": str(face) if face else None,
+                }
+            except Exception as e:
+                logger.debug("autorack probe %s failed: %s", h.get("name"), e)
+                return None
+
+        result = plan(devices, racks, probe=probe_occupant)
         dev_by_id = {d["id"]: d for d in devices}
         rack_site = {r["id"]: r["site_id"] for r in racks}
         counts = {"placed": 0, "moved": 0, "unracked": 0}

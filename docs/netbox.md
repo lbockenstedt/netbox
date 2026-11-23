@@ -245,6 +245,13 @@ backend), `TENANT` the tenant group. A trailing `R` on the RU means **rear**.
   controller is released (it sits inside the server). A controller finds its
   server by its own link, or else by the server's link to it (the controller's
   link may hold the host's agent hostname rather than its NetBox name).
+- **Same-ID Deduplication & Occupant Re-Query (Rule 6):** Devices are normalized
+  by ID before planning (deterministic placement rank: complete position >
+  partial > unracked) to eliminate pagination boundary duplicates. Before reporting
+  a conflict, `settle()` invokes a live occupant re-query (`probe(h)`): if NetBox
+  reveals the occupant was deleted, unracked, or moved elsewhere, the slot is
+  cleared and the device placed without conflict. Genuine conflicts (distinct
+  device IDs both online and named for the slot) remain reported.
 - **Half-width chassis** (two per U, e.g. Aruba CX 9004): a device type is
   half-width when its comments say `half-width` or the model is a known one
   (9004), **or** the name carries `H` after the RU (`R43H`). Devices naming the

@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 # Type hints.
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import dotenv_values
 # BaseSpoke lives at the top level when deployed, under core.src in the repo.
@@ -113,8 +113,8 @@ class NetboxSpoke(BaseSpoke):
         self.cert_agent_id = str(config.get("cert_agent_id",
             saved.get("NETBOX_CERT_AGENT_ID", os.getenv("NETBOX_CERT_AGENT_ID", ""))) or "").strip()
         self._cert_replay_tasks = {}
-        self._cert_lock = asyncio.Lock()
-        self._cert_association_lock = asyncio.Lock()
+        self._cert_lock_obj: Optional[asyncio.Lock] = None
+        self._cert_association_lock_obj: Optional[asyncio.Lock] = None
         self._cert_update_pending = False
         self._cert_store = os.getenv("LM_NETBOX_CERT_STORE",
                                      "/var/lib/lm/netbox/cert.enc")
@@ -172,6 +172,34 @@ class NetboxSpoke(BaseSpoke):
         # UPDATE_CONFIG handler (reconnect → _ensure_custom_fields), which fires
         # on every (re)connect push. Idempotent + best-effort either way: a
         # restricted token never breaks the spoke (failures DEBUG-logged).
+
+    @property
+    def _cert_lock(self) -> asyncio.Lock:
+        """Serialize certificate custody and live NetBox delivery (lazy)."""
+        # Instantiate lock within an active event loop when first accessed.
+        if getattr(self, "_cert_lock_obj", None) is None:
+            self._cert_lock_obj = asyncio.Lock()
+        return self._cert_lock_obj
+
+    @_cert_lock.setter
+    def _cert_lock(self, val: Any) -> None:
+        """Explicitly override the internal cert lock instance."""
+        # 1. Store the supplied lock or mock object.
+        self._cert_lock_obj = val
+
+    @property
+    def _cert_association_lock(self) -> asyncio.Lock:
+        """Serialize host association and reconnect projections (lazy)."""
+        # Instantiate lock within an active event loop when first accessed.
+        if getattr(self, "_cert_association_lock_obj", None) is None:
+            self._cert_association_lock_obj = asyncio.Lock()
+        return self._cert_association_lock_obj
+
+    @_cert_association_lock.setter
+    def _cert_association_lock(self, val: Any) -> None:
+        """Explicitly override the internal cert association lock instance."""
+        # 1. Store the supplied lock or mock object.
+        self._cert_association_lock_obj = val
 
     def _persist_env(self, key: str, value: str):
         """Update or insert key=value in local .env configuration file."""
