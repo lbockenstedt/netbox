@@ -1418,12 +1418,13 @@ class SyncMixin:
             if hostname and hostname.lower() != "unknown": ip_kwargs["dns_name"] = hostname
             # Reuse an existing IP object for this address or create one.
             ipobj = self._reuse_or_create_ip(f"{real_ip}/{mask}", ip_kwargs, real_ip, iface.id, tenant=tenant, hostname=hostname, mac=mac, source=source_tag)
-            # Report the IP id so the caller can drop its cached copy.
-            if touched_ips is not None:
-                touched_ips.add(ipobj.id)
-            # Journal the assignment and mark the IP as recently seen.
-            self._journal("ipam.ipaddress", ipobj.id, source_tag, note=f"IP {real_ip}/{mask} → secondary interface {iname} of device {device_id}")
-            self._stamp_last_seen(ipobj)
+            if ipobj is not None:
+                # Report the IP id so the caller can drop its cached copy.
+                if touched_ips is not None:
+                    touched_ips.add(ipobj.id)
+                # Journal the assignment and mark the IP as recently seen.
+                self._journal("ipam.ipaddress", ipobj.id, source_tag, note=f"IP {real_ip}/{mask} → secondary interface {iname} of device {device_id}")
+                self._stamp_last_seen(ipobj)
             return True
         # NetBox rejected something: log and let the caller fall back to its normal path.
         except Exception as e:
@@ -2293,14 +2294,15 @@ class SyncMixin:
         try:
             # Create/reuse the mgmt interface and IP, then make it the primary IPv4.
             ipobj, mask = self._attach_mgmt_ip(run, d, row["id"])
-            devobj = self._device_record(run, row["id"])
-            if devobj:
-                devobj.primary_ip4 = ipobj.id
-                devobj.save()
-            # Journal the adoption and mark the IP seen.
-            self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
-                          note=f"IP {d.real_ip}/{mask} → adopted")
-            self._stamp_last_seen(ipobj)
+            if ipobj is not None:
+                devobj = self._device_record(run, row["id"])
+                if devobj:
+                    devobj.primary_ip4 = ipobj.id
+                    devobj.save()
+                # Journal the adoption and mark the IP seen.
+                self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
+                              note=f"IP {d.real_ip}/{mask} → adopted")
+                self._stamp_last_seen(ipobj)
             # The device moved to a new address — it is NOT stale. Stop
             # replace-delete from reaping it for its OLD primary IP.
             if match_addr and match_addr != d.real_ip and match_addr in run.owned_ips:
@@ -2344,7 +2346,8 @@ class SyncMixin:
             tenant=run.tenant, hostname=d.hostname, mac=d.mac, source=run.source_tag)
         # A REUSED address was reassigned/tagged by its own lookup — drop any
         # cached copy (it may be another listed device's primary IP).
-        run.forget_ip(ipobj.id)
+        if ipobj is not None:
+            run.forget_ip(ipobj.id)
         return ipobj, mask
 
     def _stamp_matched_device_fields(self, run: "_DeviceSyncRun", d: "_IncomingDevice",
@@ -2526,29 +2529,18 @@ class SyncMixin:
         # With a real IP: create the mgmt interface + IP and make it primary.
         if d.real_ip:
             ipobj, mask = self._attach_mgmt_ip(run, d, devobj.id)
-            # Set primary_ip4 on a FRESH fetch so the save does not re-send the
-            # best-effort custom_fields merged onto ``devobj`` above. When the
-            # deployed NetBox hasn't attached those custom fields to
-            # dcim.device yet (a provisioning gap — _ensure_custom_fields
-            # self-heals it, but there's a first-sync window + a restricted
-            # token can't create them), re-sending them 400s ("Custom field 'X'
-            # does not exist for this object type") and used to kill the whole
-            # upsert: the device was created but primary_ip4 was never set, so
-            # the next sync couldn't match it → re-create + 400 every cycle
-            # (the persistent 100+ errors/tenant in the hub log). A fresh get
-            # carries only NetBox's actually-provisioned cfs. Best-effort: the
-            # device still counts as pushed.
-            try:
-                fresh = self.nb.dcim.devices.get(devobj.id)
-                if fresh:
-                    fresh.primary_ip4 = ipobj.id
-                    fresh.save()
-            except Exception as e:
-                logger.debug("sync_devices: set primary_ip4 %s on %s failed: %s",
-                             d.real_ip, name, e)
-            self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
-                          note=f"IP {d.real_ip}/{mask} → {name}")
-            self._stamp_last_seen(ipobj)
+            if ipobj is not None:
+                try:
+                    fresh = self.nb.dcim.devices.get(devobj.id)
+                    if fresh:
+                        fresh.primary_ip4 = ipobj.id
+                        fresh.save()
+                except Exception as e:
+                    logger.debug("sync_devices: set primary_ip4 %s on %s failed: %s",
+                                 d.real_ip, name, e)
+                self._journal("ipam.ipaddress", ipobj.id, run.source_tag,
+                              note=f"IP {d.real_ip}/{mask} → {name}")
+                self._stamp_last_seen(ipobj)
         # Count the new device as pushed.
         run.pushed += 1
 
@@ -3158,13 +3150,14 @@ class SyncMixin:
                                 f"{ip}/{mask}", ip_kwargs, ip, iface_obj.id,
                                 tenant=tenant, hostname="", mac=mac,
                                 source="nw-poll", iface_type="dcim.interface")
-                            # Device primary_ip4 from the management address.
-                            if mgmt_ip and ip == mgmt_ip and \
-                                    not getattr(devobj, "primary_ip4", None):
-                                devobj.primary_ip4 = ipobj.id
-                                devobj.save()
-                            # Mark the IP as recently seen.
-                            self._stamp_last_seen(ipobj)
+                            if ipobj is not None:
+                                # Device primary_ip4 from the management address.
+                                if mgmt_ip and ip == mgmt_ip and \
+                                        not getattr(devobj, "primary_ip4", None):
+                                    devobj.primary_ip4 = ipobj.id
+                                    devobj.save()
+                                # Mark the IP as recently seen.
+                                self._stamp_last_seen(ipobj)
                         # IP step failed: count it, keep the first error, and continue with the
                         # interface.
                         except Exception as e:
@@ -3529,13 +3522,14 @@ class SyncMixin:
             f"{ip}/{mask}", ip_kwargs, ip, nic.id,
             tenant=tenant, hostname=username, mac=mac,
             source="realtime-nac-access-tracker")
-        # Make it the device's primary IPv4.
-        devobj.primary_ip4 = ipobj.id
-        devobj.save()
-        # Journal it and stamp last_seen with the session start time.
-        self._journal("ipam.ipaddress", ipobj.id, "realtime-nac-access-tracker",
-                      note=f"framed IP {ip}/{mask} → {devobj.name}")
-        self._stamp_last_seen(ipobj, when=start_time)
+        if ipobj is not None:
+            # Make it the device's primary IPv4.
+            devobj.primary_ip4 = ipobj.id
+            devobj.save()
+            # Journal it and stamp last_seen with the session start time.
+            self._journal("ipam.ipaddress", ipobj.id, "realtime-nac-access-tracker",
+                          note=f"framed IP {ip}/{mask} → {devobj.name}")
+            self._stamp_last_seen(ipobj, when=start_time)
         return nic
 
     def sync_access_tracker(self, sessions: list, tenant_slug: str = "",
