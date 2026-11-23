@@ -794,3 +794,16 @@ def test_access_tracker_names_its_switch_freely_beside_another_tenants_device():
         tenant_slug="t1", defaults={"site": "lab"})
     assert "sw-core" in [str(d["name"]).lower() for d in f.db["devices"].values()
                          if d["tenant_id"] == 1]
+
+
+def test_lookup_devices_finds_serial_case_insensitively():
+    f = _world()
+    eng = make_engine(NetboxEngine, f)
+    _device(f, 100, "SW1", serial="tw49km0030")
+    found = eng._lookup_devices(serials=["TW49KM0030"])
+    assert len(found) == 1
+    assert found[0]["id"] == 100
+    found_lower = eng._lookup_devices(serials=["tw49km0030"])
+    assert len(found_lower) == 1
+    assert found_lower[0]["id"] == 100
+
