@@ -228,3 +228,52 @@ def test_half_name_flag_puts_lower_numbered_device_left_front_and_next_right_rea
             dict(base, id=1, name="MIPBE-SSPLM-N31-R43H-GW01")]
     to = {a["id"]: a["to"] for a in plan(devs, racks)["actions"]}
     assert to == {1: (1, 43, "front"), 2: (1, 43, "rear")}
+
+
+def test_same_id_duplicate_racked_first_is_deterministic():
+    """Racked copy before unracked copy: same-id dedup selects racked copy with 0 conflicts."""
+    d_racked = dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=1, pos=36, face="rear")
+    d_unracked = dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=None, pos=None)
+    res_racked_first = plan([d_racked, d_unracked], RACKS)
+    assert res_racked_first["report"] == []
+    assert res_racked_first["actions"] == []
+
+
+def test_same_id_duplicate_unracked_first_is_deterministic():
+    """Unracked copy before racked copy: same-id dedup selects racked copy identically."""
+    d_racked = dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=1, pos=36, face="rear")
+    d_unracked = dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=None, pos=None)
+    res_unracked_first = plan([d_unracked, d_racked], RACKS)
+    res_racked_first = plan([d_racked, d_unracked], RACKS)
+    assert res_unracked_first["report"] == []
+    assert res_unracked_first["actions"] == []
+    assert res_unracked_first == res_racked_first
+
+
+def test_same_id_duplicate_complete_placement_beats_partial():
+    """Score-3 record (rack+pos+face) beats score-2 (rack+pos only) regardless of order."""
+    d_partial = dict(dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=1, pos=36), face=None)
+    d_complete = dev(1, "MIPBE-SSPLM-N31-R36R-CRSW2", rack=1, pos=36, face="rear")
+    res_a = plan([d_partial, d_complete], RACKS)
+    res_b = plan([d_complete, d_partial], RACKS)
+    assert res_a == res_b
+    assert res_a["report"] == []
+
+
+def test_probe_re_queries_occupant_and_clears_slot_if_unracked_externally():
+    """When probe reveals slot holder was deleted or unracked externally, slot is cleared."""
+    # Initially NetBox snapshot says slot 20 is occupied by holder id=2
+    holder = dev(2, "MIPBE-SSPLM-N31-R20-B", rack=1, pos=20, online=True)
+    new_dev = dev(1, "MIPBE-SSPLM-N31-R20-A", rack=None, pos=None)
+
+    # Probe reveals holder 2 was deleted in NetBox (exists=False)
+    out = plan([new_dev, holder], RACKS, probe=lambda d: {"exists": False} if d["id"] == 2 else None)
+    assert out["report"] == []
+    assert any(a["op"] == "place" and a["id"] == 1 and a["to"] == (1, 20, "front") for a in out["actions"])
+
+    # Probe reveals holder 2 was moved to RU 30 and renamed in NetBox
+    out_moved = plan([new_dev, holder], RACKS, probe=lambda d: {
+        "exists": True, "name": "MIPBE-SSPLM-N31-R30-B", "rack_id": 1, "position": 30, "face": "front", "online": True
+    } if d["id"] == 2 else None)
+    assert out_moved["report"] == []
+    assert any(a["op"] == "place" and a["id"] == 1 and a["to"] == (1, 20, "front") for a in out_moved["actions"])
