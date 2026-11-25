@@ -141,3 +141,35 @@ def test_cert_fernet_derivation_deterministic_with_secret():
     import cryptography.fernet
     with pytest.raises(cryptography.fernet.InvalidToken):
         f3.decrypt(encrypted)
+
+
+def test_tenant_key_sanitizes_path_traversal():
+    from netbox_device_cache import tenant_key, NO_TENANT
+    assert tenant_key({"tenant": {"slug": ".."}}) == NO_TENANT
+    assert tenant_key({"tenant": {"slug": "../etc/passwd"}}) == "etc_passwd"
+    assert tenant_key({"tenant": {"slug": "....//....//etc"}}) == "etc"
+    assert tenant_key({"tenant": {"slug": "tenant-corp"}}) == "tenant-corp"
+    assert tenant_key({"tenant": {"slug": "corp.sub"}}) == "corp.sub"
+    assert tenant_key({"tenant": None}) == NO_TENANT
+
+
+def test_device_cache_path_stays_inside_dir(tmp_path):
+    from netbox_device_cache import DeviceCache, NO_TENANT
+    cache = DeviceCache(str(tmp_path))
+    p1 = cache._path("..")
+    assert os.path.dirname(p1) == str(tmp_path)
+    assert os.path.basename(p1) == f"{NO_TENANT}.json"
+
+    p2 = cache._path("../../evil")
+    assert os.path.dirname(p2) == str(tmp_path)
+    assert os.path.basename(p2) == "evil.json"
+
+
+def test_ipam_sanitize_err_redacts_credentials():
+    from netbox_ipam import IpamMixin
+    san = IpamMixin._sanitize_err
+    assert san("Error: Authorization: Bearer abc123secret") == "Error: Authorization: ***"
+    assert san("Connect failed to https://admin:supersecret@netbox.local/api") == "Connect failed to https://admin:***@netbox.local/api"
+    assert san("Failed with token=secrettoken123") == "Failed with token=***"
+    assert san("Failed with password: secretpassword") == "Failed with password: ***"
+    assert san("Clean error: Prefix 192.168.1.0/24 not found") == "Clean error: Prefix 192.168.1.0/24 not found"
