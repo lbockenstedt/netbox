@@ -1,8 +1,9 @@
 """IPAM prefix/IP methods incl. free-subnet finder + claim for NetboxEngine."""
 # ipaddress for subnet math.
 import ipaddress
-# Standard-library logging.
+# Standard-library logging and regex.
 import logging
+import re
 # Type hints.
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,36 @@ def _prefix_site(p: Dict[str, Any]) -> Dict[str, Any]:
 
 class IpamMixin:
     """IPAM prefix/IP methods incl. free-subnet finder + claim for NetboxEngine."""
+
+    _SENSITIVE_RE = re.compile(
+        r"""(?i)(?:Authorization:\s*\S+\s+\S+|(?:Bearer|Basic)\s+\S+)"""
+        r"""|://[^:\s@]+:[^@\s]+@"""
+        r"""|(["'])(?:token|password|secret|key|community|authorization|passwd)\1\s*[:=]\s*(["'])[^"']*\2"""
+        r"""|\b(?:token|password|secret|key|community|authorization|passwd)\s*[:=]\s*\S+"""
+    )
+
+    @classmethod
+    def _sanitize_err(cls, msg: Any) -> str:
+        """Strip sensitive credentials from error messages."""
+        if not msg:
+            return ""
+        s = str(msg)
+        def _mask_match(m):
+            txt = m.group(0)
+            lower = txt.lower()
+            if "authorization" in lower:
+                return "Authorization: ***"
+            if "bearer" in lower:
+                return "Bearer ***"
+            if "basic" in lower:
+                return "Basic ***"
+            if "://" in txt:
+                return re.sub(r"://([^:\s@]+):([^@\s]+)@", r"://\1:***@", txt)
+            sep = ":" if ":" in txt else "="
+            parts = txt.split(sep, 1)
+            k = parts[0].strip()
+            return f"{k}=***" if sep == "=" else f"{k}: ***"
+        return cls._SENSITIVE_RE.sub(_mask_match, s)
 
     # ─── IPAM – Prefixes / IPs ─────────────────────────────────────────────────
 
@@ -88,7 +119,9 @@ class IpamMixin:
             return {"status": "SUCCESS", "prefixes": prefixes}
         except Exception as e:
             # API failure.
-            return {"status": "ERROR", "message": str(e)}
+            clean_err = self._sanitize_err(e)
+            logger.error("get_prefixes failed: %s", clean_err)
+            return {"status": "ERROR", "message": clean_err}
 
     def allocate_prefix(
         self,
@@ -583,7 +616,9 @@ class IpamMixin:
             return {"status": "SUCCESS", "ip_addresses": ips}
         except Exception as e:
             # API failure.
-            return {"status": "ERROR", "message": str(e)}
+            clean_err = self._sanitize_err(e)
+            logger.error("get_ip_addresses failed: %s", clean_err)
+            return {"status": "ERROR", "message": clean_err}
 
     def allocate_ip(
         self,
@@ -701,7 +736,9 @@ class IpamMixin:
             return {"status": "SUCCESS"}
         except Exception as e:
             # API failure.
-            return {"status": "ERROR", "message": str(e)}
+            clean_err = self._sanitize_err(e)
+            logger.error("delete_ip_address failed: %s", clean_err)
+            return {"status": "ERROR", "message": clean_err}
 
     def update_ip_address(self, ip_id: int, dns_name: Optional[str] = None,
                           description: Optional[str] = None,
@@ -813,8 +850,9 @@ class IpamMixin:
             return result
         except Exception as e:
             # Log and return the error.
-            logger.error(f"update_prefix failed: {e}")
-            return {"status": "ERROR", "message": str(e)}
+            clean_err = self._sanitize_err(e)
+            logger.error("update_prefix failed: %s", clean_err)
+            return {"status": "ERROR", "message": clean_err}
 
     def _cascade_prefix_site(self, pfx: Any) -> int:
         """Give every prefix inside ``pfx`` (same VRF) ``pfx``'s site scope."""
@@ -846,4 +884,6 @@ class IpamMixin:
             return {"status": "SUCCESS"}
         except Exception as e:
             # API failure.
-            return {"status": "ERROR", "message": str(e)}
+            clean_err = self._sanitize_err(e)
+            logger.error("delete_prefix failed: %s", clean_err)
+            return {"status": "ERROR", "message": clean_err}

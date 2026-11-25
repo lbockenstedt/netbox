@@ -56,8 +56,16 @@ _DEVICE_PATH_RE = re.compile(r"/api/dcim/devices/(?:(\d+)/)?$")
 def tenant_key(row: dict) -> str:
     """File key of a row's tenant: its slug, or NO_TENANT."""
     t = row.get("tenant")
-    slug = t.get("slug") if isinstance(t, dict) else ""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(slug or "")) or NO_TENANT
+    slug = t.get("slug") if isinstance(t, dict) else (t if isinstance(t, str) else "")
+    # Strip any directory traversal components (e.g. '..') and path separators
+    cleaned = re.sub(r"\.\.+", "", str(slug or ""))
+    cleaned = re.sub(r"[\\/]", "_", cleaned)
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", cleaned)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", cleaned).strip("._-")
+    safe = os.path.basename(safe)
+    if not safe or safe in (".", ".."):
+        return NO_TENANT
+    return safe
 
 
 def trim_row(row: dict) -> dict:
@@ -126,7 +134,10 @@ class DeviceCache:
 
     def _path(self, key: str) -> str:
         """Path of one tenant's file."""
-        return os.path.join(self.dir, key + ".json")
+        safe = os.path.basename(key)
+        if not safe or safe in (".", ".."):
+            safe = NO_TENANT
+        return os.path.join(self.dir, safe + ".json")
 
     def _meta_path(self) -> str:
         """Path of the file holding the version, NetBox URL and reconcile times."""
