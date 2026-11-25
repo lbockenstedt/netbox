@@ -18,6 +18,7 @@ import contextlib
 import time
 # Type hints.
 from typing import Any, Dict, Optional
+import urllib.parse
 
 # requests supplies the HTTPAdapter subclassed below for default timeouts.
 import requests
@@ -329,10 +330,16 @@ class NetboxEngine(DcimMixin, IpamMixin, VmSyncMixin, ChangelogMixin, SyncMixin,
         next_url: Optional[str] = None
         # Fetch at most max_pages pages to avoid an endless loop on a bad "next" link.
         sem = _netbox_bulk_sem if path in _BULK_PATHS else _netbox_http_sem
+        parsed_base = urllib.parse.urlsplit(self.url)
         for _ in range(max_pages):
             with _background_turn(), sem:
                 # Later pages: follow NetBox's absolute "next" URL (already includes offset).
                 if next_url:
+                    parsed_next = urllib.parse.urlsplit(next_url)
+                    if parsed_next.netloc and parsed_next.netloc != parsed_base.netloc:
+                        raise ValueError(f"Cross-origin pagination link rejected: {next_url}")
+                    if parsed_base.scheme == "https" and parsed_next.scheme == "http":
+                        raise ValueError(f"HTTPS to HTTP downgrade in pagination link rejected: {next_url}")
                     resp = self.nb.http_session.get(next_url, timeout=_NETBOX_API_TIMEOUT)
                 # First page: base URL plus the caller's filters.
                 else:

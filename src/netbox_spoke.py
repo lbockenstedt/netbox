@@ -20,6 +20,7 @@ import ssl
 import tempfile
 import time
 import uuid
+import urllib.parse
 # Type hints.
 from typing import Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -325,13 +326,13 @@ class NetboxSpoke(BaseSpoke):
                 if rest and os.getenv("LM_NETBOX_AUTORACK", "1") != "0":
                     await self._run_sync(self.engine.autorack_sweep)
             except Exception as e:
-                logger.error(f"NW flush error: {e}", exc_info=True)
+                logger.error("NW flush error: %s", e)
             # Daily device-cache reconcile: at most one due tenant per tick,
             # so the tenants are spread over the day.
             try:
                 await self._run_sync(self.engine.reconcile_device_cache)
             except Exception as e:
-                logger.error(f"device cache reconcile error: {e}", exc_info=True)
+                logger.error("device cache reconcile error: %s", e)
 
     async def stop_kea_sync(self):
         """Cancel and stop the background Kea DHCP synchronization task."""
@@ -540,6 +541,8 @@ class NetboxSpoke(BaseSpoke):
             fn = functools.partial(run_as_background, fn)
         return await loop.run_in_executor(_NETBOX_POOL, functools.partial(fn, *args, **kwargs))
 
+    _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB safety cap against memory exhaustion
+
     def _fetch_upload_bytes(self, download_url: str, token: str) -> bytes:
         """HTTP-GET a hub-relayed upload file (token-gated GET endpoint) and
         return its bytes. Used by the Excel rack-import detect/commit arms —
@@ -550,14 +553,53 @@ class NetboxSpoke(BaseSpoke):
         # A download URL is required.
         if not download_url:
             raise RuntimeError("no download_url provided for relayed upload")
+        # Validate scheme and destination origin
+        parsed_dl = urllib.parse.urlsplit(download_url)
+        if parsed_dl.scheme not in ("http", "https"):
+            raise ValueError(f"Invalid upload URL scheme (must be http or https): {download_url}")
+
+        dl_host = (parsed_dl.hostname or "").lower()
+        if not dl_host:
+            raise ValueError(f"Invalid upload URL host: {download_url}")
+
+        hub_url = getattr(self.control_plane, "hub_url", "") or os.getenv("LM_HUB_URL", "")
+        if not hub_url:
+            raise ValueError(f"Cannot verify origin for download_url without configured hub_url: {download_url}")
+
+        parsed_hub = urllib.parse.urlsplit(hub_url)
+        hub_host = (parsed_hub.hostname or "").lower()
+        if not hub_host:
+            raise ValueError(f"Configured hub_url has invalid hostname: {hub_url}")
+
+        if dl_host != hub_host:
+            raise ValueError(f"Cross-origin upload download_url rejected: {download_url}")
+
+        # Port validation to prevent port-hopping SSRF
+        hub_port = parsed_hub.port or (443 if parsed_hub.scheme in ("https", "wss") else 80)
+        dl_port = parsed_dl.port or (443 if parsed_dl.scheme in ("https", "wss") else 80)
+        if dl_port != hub_port:
+            raise ValueError(f"Cross-port upload download_url rejected: {download_url} (expected port {hub_port})")
+
+        # Prevent HTTPS to HTTP downgrade
+        hub_is_tls = parsed_hub.scheme in ("https", "wss")
+        if hub_is_tls and parsed_dl.scheme == "http":
+            raise ValueError(f"HTTPS to HTTP downgrade in upload download_url rejected: {download_url}")
+
         # Bearer token header and TLS verify setting.
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        verify = str(os.getenv("LM_HUB_TLS_VERIFY", "0")) not in ("1", "true", "True")
-        # Download and return the bytes.
-        with httpx.Client(timeout=180.0, verify=verify, follow_redirects=True) as c:
-            r = c.get(download_url, headers=headers)
-            r.raise_for_status()
-            return r.content
+        verify = str(os.getenv("LM_HUB_TLS_VERIFY", "0")).lower() in ("1", "true")
+        # Download with stream read to enforce maximum size cap without follow_redirects bypass
+        with httpx.Client(timeout=180.0, verify=verify, follow_redirects=False) as c:
+            with c.stream("GET", download_url, headers=headers) as resp:
+                resp.raise_for_status()
+                chunks = []
+                total = 0
+                for chunk in resp.iter_bytes(chunk_size=65536):
+                    total += len(chunk)
+                    if total > self._MAX_UPLOAD_BYTES:
+                        raise ValueError(f"Relayed upload exceeds maximum allowable size of {self._MAX_UPLOAD_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks)
 
     def _picklist_invalidate(self):
         """Drop all cached picklist data — call after any mutation that could
@@ -653,10 +695,17 @@ class NetboxSpoke(BaseSpoke):
         """Fernet keyed off the spoke secret (stable per spoke). Encryption at
         rest for the cached private key; a secret rotation simply invalidates the
         cache (the spoke re-fetches/re-deploys), which is safe."""
-        # Key derived from the spoke secret (or the spoke id).
+        # Key derived from the spoke secret combined with spoke identity.
         from cryptography.fernet import Fernet
-        seed = (getattr(self.control_plane, "secret", "") or self.spoke_id
-                or "lm-netbox").encode()
+        secret = (
+            getattr(self.control_plane, "secret", "")
+            or getattr(self.control_plane, "hub_secret", "")
+            or os.getenv("LM_SECRET", "")
+            or os.getenv("SPOKE_SECRET", "")
+        )
+        if not secret:
+            secret = f"{self.spoke_id}:{os.getenv('HOSTNAME', 'local')}"
+        seed = f"{self.spoke_id}:{secret}".encode()
         return Fernet(base64.urlsafe_b64encode(hashlib.sha256(seed).digest()))
 
     def _persist_cert(self):
